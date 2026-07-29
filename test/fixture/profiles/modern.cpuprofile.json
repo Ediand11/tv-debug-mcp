@@ -1,0 +1,15 @@
+{
+  "_comment": "Hand-built Chromium 62+ CPU profile (tizen55 / pc shape). 100 hits over 100ms => 1ms per sample. lineNumber/columnNumber are 0-based here, startTime/endTime are microseconds. busyLoop: 40 self / 60 total. helper: 20 self. program 10, gc 10, idle 20.",
+  "nodes": [
+    {"id": 1, "callFrame": {"functionName": "(root)", "scriptId": "0", "url": "", "lineNumber": -1, "columnNumber": -1}, "hitCount": 0, "children": [2, 3, 4, 5]},
+    {"id": 2, "callFrame": {"functionName": "(program)", "scriptId": "0", "url": "", "lineNumber": -1, "columnNumber": -1}, "hitCount": 10, "children": []},
+    {"id": 3, "callFrame": {"functionName": "(idle)", "scriptId": "0", "url": "", "lineNumber": -1, "columnNumber": -1}, "hitCount": 20, "children": []},
+    {"id": 4, "callFrame": {"functionName": "(garbage collector)", "scriptId": "0", "url": "", "lineNumber": -1, "columnNumber": -1}, "hitCount": 10, "children": []},
+    {"id": 5, "callFrame": {"functionName": "busyLoop", "scriptId": "7", "url": "http://tv.local/app.js", "lineNumber": 9, "columnNumber": 4}, "hitCount": 40, "children": [6]},
+    {"id": 6, "callFrame": {"functionName": "helper", "scriptId": "7", "url": "http://tv.local/app.js", "lineNumber": 19, "columnNumber": 2}, "hitCount": 20, "children": []}
+  ],
+  "startTime": 1000000,
+  "endTime": 1100000,
+  "samples": [5, 5, 6, 5, 6, 2, 3, 4, 1, 5],
+  "timeDeltas": [1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000]
+}

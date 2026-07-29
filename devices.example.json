@@ -1,0 +1,47 @@
+{
+  "note": "Скопируйте в devices.json (cp devices.example.json devices.json) и опишите свой парк. devices.json в .gitignore — IP и appId вашего приложения остаются локальными. Путь можно переопределить переменной TV_DEBUG_CONFIG. Файл перечитывается по mtime: правка подхватывается без рестарта MCP.",
+  "defaultDevice": "pc-fixture",
+  "devices": [
+    {
+      "id": "pc-fixture",
+      "platform": "pc",
+      "name": "Chrome + встроенная фикстура (ничего ставить не надо)",
+      "app": "fixture",
+      "url": "http://127.0.0.1:8080"
+    },
+    {
+      "id": "pc-dev",
+      "platform": "pc",
+      "name": "Chrome + ваш dev-сервер",
+      "app": "myapp",
+      "url": "http://localhost:1337"
+    },
+    {
+      "id": "pc-dev-parity",
+      "platform": "pc",
+      "name": "Chrome, ТВ-идентичная инъекция клавиш (parity-прогон)",
+      "app": "myapp",
+      "url": "http://localhost:1337",
+      "inputMode": "synthetic"
+    },
+    {
+      "id": "tizen",
+      "platform": "tizen",
+      "name": "Samsung, Tizen 5.5 / Chromium 69",
+      "app": "myapp",
+      "appId": "AbCdEfGhIj.myapp",
+      "host": "192.168.1.10",
+      "sdbPort": 26101,
+      "localPort": 9955
+    },
+    {
+      "id": "webos",
+      "platform": "webos",
+      "name": "LG, webOS 7",
+      "app": "myapp",
+      "appId": "com.example.myapp",
+      "device": "webos7",
+      "host": "192.168.1.11"
+    }
+  ]
+}

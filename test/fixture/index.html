@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>tv-debug-mcp fixture</title>
+<style>
+	* { box-sizing: border-box; }
+	body { margin: 0; background: #11131a; color: #e8ecf4; font: 16px/1.35 system-ui, sans-serif; height: 100vh; display: flex; }
+	.demo-menu { width: 240px; background: #171a24; padding: 24px 0; flex: none; }
+	.demo-menu__items { display: block; }
+	.demo-menu-item { padding: 14px 24px; border-left: 4px solid transparent; }
+	.demo-menu-item._active { background: #232838; border-left-color: #6aa2ff; }
+	.demo-menu-item__title { pointer-events: none; }
+	.stage { flex: 1; padding: 32px; overflow: hidden; }
+	.demo-list { display: flex; gap: 16px; margin-bottom: 28px; }
+	.demo-tile { width: 220px; height: 150px; background: #1d2130; border-radius: 12px; padding: 12px;
+		border: 3px solid transparent; display: flex; align-items: flex-end; }
+	.demo-tile._active { border-color: #6aa2ff; background: #263050; }
+	.demo-popup { position: fixed; inset: 0; background: rgba(8, 10, 16, .82);
+		display: none; align-items: center; justify-content: center; }
+	.demo-popup._active { display: flex; }
+	.demo-popup__content { background: #1b2030; padding: 24px 40px; border-radius: 14px; }
+	.spinner { display: none; }
+	.spinner._active { display: block; }
+	h1 { font-size: 20px; font-weight: 600; margin: 0 0 20px; }
+</style>
+</head>
+<body>
+<nav class="demo-menu" data-testid="menu">
+	<div class="demo-menu__items">
+		<div class="demo-menu-item" data-testid="menu-item"><span class="demo-menu-item__title">Main</span></div>
+		<div class="demo-menu-item" data-testid="menu-item"><span class="demo-menu-item__title">Library</span></div>
+		<div class="demo-menu-item" data-testid="menu-item"><span class="demo-menu-item__title">Following</span></div>
+		<div class="demo-menu-item" data-testid="menu-item"><span class="demo-menu-item__title">Settings</span></div>
+	</div>
+</nav>
+
+<main class="stage _scene s-fixture">
+	<h1 id="title">Fixture catalog</h1>
+	<div class="demo-list" id="row"></div>
+	<div class="spinner" id="spinner">loading…</div>
+</main>
+
+<div class="demo-popup" id="ctx">
+	<div class="demo-popup__content">
+		<div>Play</div>
+		<div>Go to creator</div>
+	</div>
+</div>
+
+<script>
+// A deliberately small stand-in for a real TV app: focus chain marked with `_active`,
+// d-pad navigation read from `event.keyCode` off a `document` keydown listener, and the
+// long-press contract the real app uses (timer on keydown, keyup decides click vs hold).
+// It exists so the browser adapter and the navigation tools can be verified without a
+// running product dev server.
+(function () {
+	var TILES = [
+		'Первый ролик про котиков',
+		'Второй ролик про горы',
+		'Третий ролик про машины',
+		'Четвёртый ролик про еду',
+		'Пятый ролик про космос',
+		'Шестой ролик про музыку'
+	];
+	var row = document.getElementById('row');
+	TILES.forEach(function (name, i) {
+		var el = document.createElement('div');
+		el.className = 'demo-tile';
+		el.setAttribute('data-testid', 'tile-' + i);
+		el.textContent = name;
+		row.appendChild(el);
+	});
+
+	var tiles = Array.prototype.slice.call(document.querySelectorAll('.demo-tile'));
+	var cells = Array.prototype.slice.call(document.querySelectorAll('.demo-menu-item'));
+	var ctx = document.getElementById('ctx');
+
+	var inMenu = false;
+	var tileIndex = 0;
+	var menuIndex = 0;
+	var LONG_PRESS_MS = 800;
+	var pressTimer = null;
+	var wasLong = false;
+
+	function render() {
+		tiles.forEach(function (t, i) { t.classList.toggle('_active', !inMenu && i === tileIndex); });
+		cells.forEach(function (c, i) { c.classList.toggle('_active', inMenu && i === menuIndex); });
+	}
+
+	function openContext() {
+		wasLong = true;
+		ctx.classList.add('_active');
+	}
+
+	function activate() {
+		if (inMenu) {
+			document.getElementById('title').textContent = cells[menuIndex].textContent.trim() + ' catalog';
+			inMenu = false;
+			render();
+		}
+	}
+
+	document.addEventListener('keydown', function (e) {
+		var k = e.keyCode;
+		if (k === 13) {
+			// The real app starts a timer here and lets the keyup decide.
+			if (!pressTimer) {
+				wasLong = false;
+				pressTimer = setTimeout(openContext, LONG_PRESS_MS);
+			}
+			return;
+		}
+		if (ctx.classList.contains('_active')) {
+			if (k === 8 || k === 461 || k === 10009 || k === 27) { ctx.classList.remove('_active'); }
+			return;
+		}
+		if (k === 37) { // LEFT
+			if (!inMenu) {
+				if (tileIndex > 0) { tileIndex--; } else { inMenu = true; }
+			}
+		} else if (k === 39) { // RIGHT
+			if (inMenu) { inMenu = false; } else if (tileIndex < tiles.length - 1) { tileIndex++; }
+		} else if (k === 40) { // DOWN
+			if (inMenu && menuIndex < cells.length - 1) { menuIndex++; }
+		} else if (k === 38) { // UP
+			if (inMenu && menuIndex > 0) { menuIndex--; }
+		} else if (k === 8 || k === 461 || k === 10009 || k === 27) {
+			inMenu = true;
+		}
+		render();
+	});
+
+	document.addEventListener('keyup', function (e) {
+		if (e.keyCode !== 13) { return; }
+		clearTimeout(pressTimer);
+		pressTimer = null;
+		if (!wasLong) { activate(); }
+		wasLong = false;
+	});
+
+	render();
+}());
+</script>
+</body>
+</html>

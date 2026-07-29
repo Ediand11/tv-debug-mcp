@@ -1,0 +1,21 @@
+{
+  "id": "fixture",
+  "name": "tv-debug-mcp browser fixture",
+  "note": "Profile for test/fixture/index.html — the stand-in app used to verify the pc adapter and the navigation tools without a product dev server.",
+  "focus": ["._active"],
+  "scene": {"container": "._scene", "strip": "stage"},
+  "popup": [".demo-popup"],
+  "menu": {
+    "openKey": "LEFT",
+    "root": ".demo-menu",
+    "item": ".demo-menu-item",
+    "title": ".demo-menu-item__title"
+  },
+  "tile": ".demo-tile",
+  "bootReady": {"selector": ".demo-tile", "timeoutMs": 15000},
+  "checks": {
+    "note": "Read by the acceptance scripts (test/phase1-check.mjs) so they are not pinned to one product. homeSection — the section to come back to after a menu excursion; popup — what a tile's context menu looks like.",
+    "homeSection": "Main",
+    "popup": ".demo-popup"
+  }
+}

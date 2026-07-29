@@ -1,0 +1,28 @@
+node_modules/
+
+# Парк устройств — личный: IP, appId, порты. Заводится копией devices.example.json.
+devices.json
+
+# Знание о приложениях — тоже личное. Публичен только профиль встроенной фикстуры;
+# новый публичный профиль добавляется явным исключением.
+apps/*.json
+!apps/fixture.json
+
+# Продуктовые кейсы. Публичные — формат и прогон против фикстуры.
+cases/*.md
+!cases/README.md
+!cases/fixture-smoke.md
+
+# Заметки по конкретному приложению
+docs/
+
+# Одноразовые зонды против живого приложения
+test/*-probe.mjs
+test/localstorage-trap.mjs
+test/demo-case.mjs
+
+# Артефакты прогонов (по умолчанию пишутся в TMPDIR, но path можно задать явно)
+*.cpuprofile
+*.png
+*.log
+.DS_Store

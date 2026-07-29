@@ -1,0 +1,35 @@
+{
+  "_comment": "Hand-built Chrome 38 CPU profile (webOS 3 shape): a `head` tree with nested child objects, 1-based lineNumber, startTime/endTime in SECONDS. Same arithmetic as the modern fixture on purpose — 100 hits over 100ms — so both formats must summarise identically.",
+  "head": {
+    "functionName": "(root)",
+    "scriptId": "0",
+    "url": "",
+    "lineNumber": 0,
+    "columnNumber": 0,
+    "hitCount": 0,
+    "callUID": 1,
+    "id": 1,
+    "children": [
+      {"functionName": "(program)", "scriptId": "0", "url": "", "lineNumber": 0, "columnNumber": 0, "hitCount": 10, "callUID": 2, "id": 2, "children": []},
+      {"functionName": "(idle)", "scriptId": "0", "url": "", "lineNumber": 0, "columnNumber": 0, "hitCount": 20, "callUID": 3, "id": 3, "children": []},
+      {"functionName": "(garbage collector)", "scriptId": "0", "url": "", "lineNumber": 0, "columnNumber": 0, "hitCount": 10, "callUID": 4, "id": 4, "children": []},
+      {
+        "functionName": "busyLoop",
+        "scriptId": "7",
+        "url": "http://tv.local/app.js",
+        "lineNumber": 10,
+        "columnNumber": 5,
+        "hitCount": 40,
+        "callUID": 5,
+        "id": 5,
+        "children": [
+          {"functionName": "helper", "scriptId": "7", "url": "http://tv.local/app.js", "lineNumber": 20, "columnNumber": 3, "hitCount": 20, "callUID": 6, "id": 6, "children": []}
+        ]
+      }
+    ]
+  },
+  "startTime": 12.0,
+  "endTime": 12.1,
+  "samples": [5, 5, 6, 5, 6, 2, 3, 4, 1, 5],
+  "timestamps": [12000000, 12010000, 12020000, 12030000, 12040000, 12050000, 12060000, 12070000, 12080000, 12090000]
+}

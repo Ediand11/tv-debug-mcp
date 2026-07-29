@@ -1,0 +1,13 @@
+{
+  "_comment": "One function calling itself three levels deep, 40 hits over 40ms. Self time is the sum (40ms), but TOTAL time must be counted once — from the outermost frame only — or a recursive function reports 225% of the recording.",
+  "nodes": [
+    {"id": 1, "callFrame": {"functionName": "(root)", "scriptId": "0", "url": "", "lineNumber": -1, "columnNumber": -1}, "hitCount": 0, "children": [2]},
+    {"id": 2, "callFrame": {"functionName": "fib", "scriptId": "9", "url": "http://tv.local/app.js", "lineNumber": 4, "columnNumber": 0}, "hitCount": 10, "children": [3]},
+    {"id": 3, "callFrame": {"functionName": "fib", "scriptId": "9", "url": "http://tv.local/app.js", "lineNumber": 4, "columnNumber": 0}, "hitCount": 10, "children": [4]},
+    {"id": 4, "callFrame": {"functionName": "fib", "scriptId": "9", "url": "http://tv.local/app.js", "lineNumber": 4, "columnNumber": 0}, "hitCount": 20, "children": []}
+  ],
+  "startTime": 0,
+  "endTime": 40000,
+  "samples": [2, 3, 4, 4],
+  "timeDeltas": [10000, 10000, 10000, 10000]
+}
