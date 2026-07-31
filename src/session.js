@@ -9,6 +9,9 @@
 //                    it. It must NOT be the lifecycle lock, or an auto-reconnect inside a
 //                    sequence step would deadlock against the sequence itself.
 
+import {createWriteStream, unlinkSync} from 'node:fs';
+import {resolve} from 'node:path';
+
 import {TizenAdapter} from './adapters/tizen.js';
 import {WebosAdapter} from './adapters/webos.js';
 import {PcAdapter} from './adapters/pc.js';
@@ -22,12 +25,33 @@ import {loadAppProfile, requireMenu} from './appprofile.js';
 import {stateJs, focusSignatureJs, focusMatchesJs, menuItemsJs} from './state.js';
 import {pollUntil} from './wait.js';
 import {summarizeProfile, applySourceMap, saveProfile} from './profile.js';
+import {summarizeHeapSnapshot} from './heap.js';
 import {metricsToMap, metricsDiff, windowSecondsOf} from './metrics.js';
 
 /** A big profile off a slow TV takes far longer to serialise than a normal CDP round-trip. */
 const PROFILE_STOP_TIMEOUT_MS = 60000;
 /** A forced GC on a weak TV with a full heap is not an 8-second operation. */
 const GC_TIMEOUT_MS = 30000;
+/**
+ * A heap snapshot is a full GC plus serialising the whole heap through the socket in
+ * thousands of chunks. On a TV with a 100-300MB heap that legitimately takes a minute.
+ */
+const HEAP_SNAPSHOT_TIMEOUT_MS = 120000;
+/** Chunks can keep arriving after `takeHeapSnapshot` answers — wait out the quiet. */
+const HEAP_DRAIN_QUIET_MS = 400;
+const HEAP_DRAIN_MAX_MS = 15000;
+
+/**
+ * Flush and close a write stream, waiting for the OS to really have the bytes — the summary
+ * parser reads the file back immediately afterwards.
+ * @param {import('node:fs').WriteStream} stream
+ * @return {Promise<void>}
+ */
+function closeStream(stream) {
+	return new Promise((res, rej) => {
+		stream.end((e) => (e ? rej(e) : res()));
+	});
+}
 
 /**
  * Short human label for a sequence step, for the per-step report.
@@ -589,6 +613,183 @@ export class DeviceSession {
 			return new Error(
 				`metrics not supported on this engine (${this.cfg.engine || this.cfg.platform}): ${method} — ` +
 				`${e.message}. The Performance domain needs Chromium 60+; tv_profile start/stop still records the CPU profile.`
+			);
+		}
+		return e;
+	}
+
+	/**
+	 * Take a full heap snapshot and write it where DevTools can load it (Memory -> Load).
+	 *
+	 * `Performance.getMetrics` says WHAT grew (JSHeapUsedSize, Nodes); this says WHO — which
+	 * constructors gained objects, and how many detached DOM nodes are still being retained.
+	 *
+	 * The snapshot is streamed: the engine sends it as thousands of `addHeapSnapshotChunk`
+	 * events, which are appended to the file as they land. Buffering a 300MB heap in a string
+	 * first would be a second copy of the TV's entire heap inside this process.
+	 * @param {{path?: string, topN?: number, timeoutMs?: number}} [opts]
+	 */
+	heapSnapshot(opts = {}) {
+		// Under the operation lock: a snapshot is a long V8 pause, and a tv_sequence step
+		// landing in the middle of it would be timing the pause, not the app.
+		return this.withOperationLock(() => this._heapSnapshotLocked(opts));
+	}
+
+	async _heapSnapshotLocked(opts) {
+		if (this._profiling) {
+			throw new Error(
+				'a CPU recording is in progress — a heap snapshot forces a full GC and a long V8 pause ' +
+				'that would poison it; stop the CPU profile first (tv_profile action:stop)'
+			);
+		}
+		const cdp = await this._cdp();
+		const timeoutMs = Math.min(600000, Math.max(5000, Math.floor(opts.timeoutMs || HEAP_SNAPSHOT_TIMEOUT_MS)));
+		const outPath = opts.path
+			? resolve(opts.path)
+			: resolve(process.env.TMPDIR || '/tmp', `tv-heap-${this.cfg.id}-${Date.now()}.heapsnapshot`);
+		const startedAt = Date.now();
+		const warnings = [];
+
+		try {
+			await cdp.call('HeapProfiler.enable');
+		} catch (e) {
+			throw this._heapUnsupported(e, 'HeapProfiler.enable');
+		}
+
+		const stream = createWriteStream(outPath);
+		/** @type {?Error} */
+		let writeError = null;
+		let bytes = 0;
+		let chunks = 0;
+		let lastPercent = -1;
+		stream.on('error', (e) => {
+			writeError = e;
+		});
+
+		const offChunk = cdp.onEvent('HeapProfiler.addHeapSnapshotChunk', (p) => {
+			if (typeof p.chunk !== 'string' || writeError) {
+				return;
+			}
+			bytes += Buffer.byteLength(p.chunk);
+			chunks++;
+			stream.write(p.chunk);
+		});
+		const offProgress = cdp.onEvent('HeapProfiler.reportHeapSnapshotProgress', (p) => {
+			if (!p.total) {
+				return;
+			}
+			// Progress goes to stderr, not into the answer: it is for a human watching a
+			// snapshot that takes a minute, and it would be noise in the tool response.
+			// Deliberately not paired with the bytes written: engines report the walk as done
+			// long before the last chunk is on the wire (webOS 3 reaches 100% with the file
+			// still empty), so the two numbers together would read as a stall.
+			const percent = Math.floor((p.done / p.total) * 100);
+			if (percent >= lastPercent + 25) {
+				lastPercent = percent;
+				this._log(`heap snapshot: serialising ${percent}%`);
+			}
+		});
+
+		const abort = async (message) => {
+			offChunk();
+			offProgress();
+			await closeStream(stream).catch(() => {});
+			let removed = false;
+			try {
+				unlinkSync(outPath);
+				removed = true;
+			} catch {
+				// never written, or already gone
+			}
+			await cdp.call('HeapProfiler.disable').catch(() => {});
+			// Half a snapshot is unusable JSON that DevTools cannot open and this parser would
+			// reject — say it is gone rather than leaving 100MB of garbage behind.
+			throw new Error(`${message}${removed ? ` — the partial file ${outPath} was removed` : ''}`);
+		};
+
+		try {
+			await cdp.call('HeapProfiler.takeHeapSnapshot', {reportProgress: true}, timeoutMs);
+		} catch (e) {
+			if (isUnsupportedMethod(e)) {
+				await abort(this._heapUnsupported(e, 'HeapProfiler.takeHeapSnapshot').message);
+			}
+			await abort(`heap snapshot failed after ${Date.now() - startedAt}ms: ${e.message}`);
+		}
+
+		// Some engines answer the call before the last chunks are on the wire. Wait for the
+		// stream to go quiet instead of trusting the reply, bounded so a chatty engine cannot
+		// hold the tool call forever.
+		const drainDeadline = Date.now() + HEAP_DRAIN_MAX_MS;
+		let seen = -1;
+		while (bytes !== seen && Date.now() < drainDeadline) {
+			seen = bytes;
+			await sleep(HEAP_DRAIN_QUIET_MS);
+		}
+		if (bytes !== seen) {
+			warnings.push(`chunks were still arriving after ${HEAP_DRAIN_MAX_MS}ms — the file may be truncated`);
+		}
+
+		offChunk();
+		offProgress();
+		await closeStream(stream).catch((e) => {
+			writeError = writeError || e;
+		});
+		await cdp.call('HeapProfiler.disable').catch(() => {});
+
+		if (writeError) {
+			try {
+				unlinkSync(outPath);
+			} catch {
+				// ignore
+			}
+			throw new Error(`could not write the snapshot to ${outPath}: ${writeError.message} — the partial file was removed`);
+		}
+		if (!bytes) {
+			try {
+				unlinkSync(outPath);
+			} catch {
+				// ignore
+			}
+			throw new Error(
+				`the engine (${this.cfg.engine || this.cfg.platform}) accepted HeapProfiler.takeHeapSnapshot but streamed no data — ` +
+				'no snapshot was written'
+			);
+		}
+
+		const durationMs = Date.now() - startedAt;
+		this._log(`heap snapshot written: ${Math.round(bytes / (1024 * 1024))}MB in ${chunks} chunks, ${durationMs}ms -> ${outPath}`);
+		let summary = null;
+		try {
+			summary = summarizeHeapSnapshot(outPath, {topN: opts.topN});
+			if (summary.ok === false && summary.warning) {
+				warnings.push(summary.warning);
+			}
+		} catch (e) {
+			// The file is the deliverable; a parser that cannot read it must not throw the
+			// snapshot away with it.
+			warnings.push(`summary unavailable: ${e.message}`);
+		}
+		return {
+			ok: true,
+			path: outPath,
+			bytes,
+			chunks,
+			durationMs,
+			summary,
+			...(warnings.length ? {warning: warnings.join('; ')} : {})
+		};
+	}
+
+	/**
+	 * @param {Error} e
+	 * @param {string} method
+	 * @return {Error}
+	 */
+	_heapUnsupported(e, method) {
+		if (isUnsupportedMethod(e)) {
+			return new Error(
+				`heap snapshots not supported on this engine (${this.cfg.engine || this.cfg.platform}): ${method} — ` +
+				`${e.message}. tv_profile action:"metrics" still reports JSHeapUsedSize on Chromium 60+.`
 			);
 		}
 		return e;

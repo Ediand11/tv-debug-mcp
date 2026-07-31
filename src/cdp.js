@@ -50,6 +50,13 @@ export class CdpSession {
 		/** Entries evicted from the ring buffers, so reports can say so instead of lying. */
 		this.dropped = {console: 0, exceptions: 0, networkFailures: 0};
 		this._requests = new Map();
+		/**
+		 * Extra per-method event subscribers (see `onEvent`). The ring buffers above are for
+		 * things worth keeping for the whole session; this is for a caller that needs a
+		 * stream while it runs — a heap snapshot arriving in thousands of chunks, for one.
+		 * @type {Map<string, Set<Function>>}
+		 */
+		this._eventHandlers = new Map();
 		/** @type {?Error} set once the socket is gone; every later call fails with it. */
 		this._deadReason = null;
 	}
@@ -142,7 +149,45 @@ export class CdpSession {
 		this._onEvent(msg.method, msg.params || {});
 	}
 
+	/**
+	 * Subscribe to a raw CDP event. Returns the unsubscribe function — always call it, a
+	 * subscriber that outlives its operation keeps getting fed.
+	 * @param {string} method e.g. 'HeapProfiler.addHeapSnapshotChunk'
+	 * @param {function(object): void} handler
+	 * @return {function(): void}
+	 */
+	onEvent(method, handler) {
+		let set = this._eventHandlers.get(method);
+		if (!set) {
+			set = new Set();
+			this._eventHandlers.set(method, set);
+		}
+		set.add(handler);
+		return () => {
+			const live = this._eventHandlers.get(method);
+			if (!live) {
+				return;
+			}
+			live.delete(handler);
+			if (!live.size) {
+				this._eventHandlers.delete(method);
+			}
+		};
+	}
+
 	_onEvent(method, params) {
+		const handlers = this._eventHandlers.get(method);
+		if (handlers) {
+			// Copy: a handler is allowed to unsubscribe itself. A throwing subscriber must not
+			// take down the message pump — the operation that installed it will time out instead.
+			for (const h of [...handlers]) {
+				try {
+					h(params);
+				} catch {
+					// ignore
+				}
+			}
+		}
 		switch (method) {
 			// modern engines
 			case 'Runtime.consoleAPICalled': {

@@ -3,7 +3,7 @@
 //
 // Tools: tv_devices, tv_install, tv_launch, tv_press, tv_screenshot, tv_console,
 // tv_video_state, tv_state, tv_wait_for, tv_goto, tv_menu, tv_sequence, tv_evaluate,
-// tv_profile.
+// tv_profile, tv_heap.
 // The park is described in devices.json (or TV_DEBUG_CONFIG) and can also contain a `pc`
 // device — the same case run against a local Chrome. One persistent CDP session per device
 // is kept across calls so console/exceptions accumulate from launch. All progress goes to
@@ -22,6 +22,7 @@ import {resolve} from 'node:path';
 
 import {loadConfig, getDevice} from './config.js';
 import {DeviceSession, deviceCapabilities} from './session.js';
+import {diffHeapSummaries} from './heap.js';
 import {knownKeys} from './keymaps.js';
 import {parseSdbDevices} from './adapters/tizen.js';
 
@@ -234,6 +235,23 @@ const TOOLS = [
 			},
 			required: ['action']
 		}
+	},
+	{
+		name: 'tv_heap',
+		description: 'Take a heap snapshot on the device and/or compare two of them — the tool for "the heap grew and never came back". Leak hunt: tv_heap action:"snapshot" (before) -> do the scenario (tv_press / tv_menu / tv_sequence) -> tv_heap action:"snapshot" (after) -> tv_heap action:"diff" with the two paths. A snapshot writes a .heapsnapshot file (open it in Chrome DevTools -> Memory -> Load) and returns the Summary view in numbers: total nodes and shallow size, how many DETACHED DOM nodes are still retained, and the top-N constructors by shallow size. diff returns the deltas — which constructors gained objects and bytes (topGrowth) and which lost them (topShrink), like the DevTools Comparison view. Retainer paths ("who holds this") and retained/dominator sizes are deliberately NOT computed: load the saved files in DevTools for those. A snapshot forces a full GC and pauses V8 for a long time (it can take a minute on a TV), so it is refused while a tv_profile recording is running. Needs the HeapProfiler domain — fine on tizen55/webos7/pc, best-effort on webOS 3. diff is a pure file operation: no device needed.',
+		inputSchema: {
+			type: 'object',
+			properties: {
+				...DEVICE_PROP,
+				action: {type: 'string', enum: ['snapshot', 'diff'], description: 'snapshot: take one on the device. diff: compare two files already on disk.'},
+				path: {type: 'string', description: 'snapshot: where to write the .heapsnapshot. Defaults to a scratch path.'},
+				before: {type: 'string', description: 'diff: path to the earlier .heapsnapshot.'},
+				after: {type: 'string', description: 'diff: path to the later .heapsnapshot.'},
+				topN: {type: 'integer', minimum: 1, maximum: 200, description: 'How many constructors to report (default 20).'},
+				timeoutMs: {type: 'integer', minimum: 5000, maximum: 600000, description: 'snapshot: give up after this long (default 120000 — a full heap off a slow TV legitimately takes tens of seconds).'}
+			},
+			required: ['action']
+		}
 	}
 ];
 
@@ -398,6 +416,21 @@ async function handleCall(name, args) {
 				return textResult(await s.metricsSnapshot({collectGarbage: args.collectGarbage}));
 			}
 			return errorResult(`tv_profile needs action "start", "stop" or "metrics", got ${JSON.stringify(args.action)}`);
+		}
+		case 'tv_heap': {
+			if (args.action === 'snapshot') {
+				const s = sessionFor(args.device);
+				// Only the path and the summary: the snapshot itself is hundreds of megabytes.
+				return textResult(await s.heapSnapshot({path: args.path, topN: args.topN, timeoutMs: args.timeoutMs}));
+			}
+			if (args.action === 'diff') {
+				if (!args.before || !args.after) {
+					return errorResult('tv_heap action:"diff" needs both `before` and `after` paths to .heapsnapshot files');
+				}
+				// No device on purpose: comparing two files must work with every TV switched off.
+				return textResult(diffHeapSummaries(args.before, args.after, {topN: args.topN}));
+			}
+			return errorResult(`tv_heap needs action "snapshot" or "diff", got ${JSON.stringify(args.action)}`);
 		}
 		default:
 			return errorResult(`unknown tool ${name}`);

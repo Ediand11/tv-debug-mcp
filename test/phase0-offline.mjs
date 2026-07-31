@@ -10,6 +10,8 @@
 //      book-keeping frames out of the hot list, and does not double-count recursion
 //   6. applySourceMap de-minifies the top frames, and a broken map degrades to a warning
 //   7. the getMetrics parser keeps every metric both readings had and never invents a number
+//   8. the .heapsnapshot parser: constructor tally, detached nodes (named and flagged), the
+//      diff of two snapshots, and honest failure on a file that is not a snapshot
 //
 // Run: node test/phase0-offline.mjs
 import {spawn} from 'node:child_process';
@@ -20,6 +22,7 @@ import {dirname, join} from 'node:path';
 import {SourceMapGenerator} from 'source-map-js';
 
 import {summarizeProfile, applySourceMap} from '../src/profile.js';
+import {summarizeHeapSnapshot, diffHeapSummaries} from '../src/heap.js';
 import {metricsToMap, metricsDiff, windowSecondsOf} from '../src/metrics.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -242,9 +245,112 @@ function metricsChecks() {
 		Object.keys(metricsDiff(null, undefined)).length === 0);
 }
 
+/** 8: the heap-snapshot parser. Pure — two small fixtures, no device. */
+function heapChecks() {
+	console.log('\n--- heap snapshot parser ---');
+	const beforePath = join(__dirname, 'fixture', 'heap', 'before.heapsnapshot');
+	const afterPath = join(__dirname, 'fixture', 'heap', 'after.heapsnapshot');
+
+	const before = summarizeHeapSnapshot(beforePath);
+	const after = summarizeHeapSnapshot(afterPath, {topN: 3});
+
+	check('totals come from the nodes array', before.ok && before.totalNodes === 7 && before.totalSize === 556,
+		JSON.stringify({nodes: before.totalNodes, size: before.totalSize}));
+	check('constructors are tallied by count and shallow size',
+		before.topConstructors.find((c) => c.name === 'MovieTile')?.count === 2 &&
+		before.topConstructors.find((c) => c.name === 'MovieTile')?.shallowBytes === 200,
+		JSON.stringify(before.topConstructors));
+	check('type buckets replace the missing constructor name ((string), (array))',
+		before.topConstructors.some((c) => c.name === '(string)') && before.topConstructors.some((c) => c.name === '(array)'),
+		before.topConstructors.map((c) => c.name).join(','));
+	check('closures are grouped by function name',
+		before.topConstructors.some((c) => c.name === 'onScroll()'),
+		before.topConstructors.map((c) => c.name).join(','));
+	check('a bracket inside a string does not truncate the strings array',
+		before.topConstructors.find((c) => c.name === '(string)')?.count === 1,
+		JSON.stringify(before.topConstructors.find((c) => c.name === '(string)')));
+	check('detached nodes are counted by name prefix', before.detachedCount === 1 && before.detachedSize === 60,
+		JSON.stringify({count: before.detachedCount, size: before.detachedSize}));
+
+	check('a node flagged detachedness:2 counts as detached even when its name is not prefixed',
+		after.detachedCount === 5 && after.detachedSize === 300,
+		JSON.stringify({count: after.detachedCount, size: after.detachedSize}));
+	check('a flagged node lands in the same bucket as the named ones',
+		after.topConstructors.find((c) => c.name === 'Detached HTMLDivElement')?.count === 5,
+		JSON.stringify(after.topConstructors));
+	check('topN caps the constructor list', after.topConstructors.length === 3, String(after.topConstructors.length));
+	check('constructors are ordered by shallow size', after.topConstructors[0]?.name === 'MovieTile',
+		after.topConstructors.map((c) => c.name).join(','));
+	check('the full constructor count is reported, not just the top-N', after.constructors === 5,
+		String(after.constructors));
+
+	const diff = diffHeapSummaries(beforePath, afterPath);
+	check('diff reports the totals of both sides',
+		diff.before.totalNodes === 7 && diff.after.totalNodes === 15,
+		JSON.stringify({before: diff.before.totalNodes, after: diff.after.totalNodes}));
+	check('diff reports the deltas of the totals',
+		diff.delta.totalNodes === 8 && diff.delta.totalSize === 420 && diff.delta.detachedCount === 4,
+		JSON.stringify(diff.delta));
+	const grown = diff.topGrowth[0];
+	check('the biggest grower comes first with before/after counts',
+		grown?.name === 'MovieTile' && grown?.deltaCount === 3 && grown?.deltaBytes === 300 &&
+		grown?.countBefore === 2 && grown?.countAfter === 5,
+		JSON.stringify(grown));
+	check('detached growth is visible as its own constructor row',
+		diff.topGrowth.some((r) => r.name === 'Detached HTMLDivElement' && r.deltaCount === 4),
+		JSON.stringify(diff.topGrowth.map((r) => r.name)));
+	check('a constructor that disappeared shows up as a shrink',
+		diff.topShrink[0]?.name === 'Grid' && diff.topShrink[0]?.deltaBytes === -200 && diff.topShrink[0]?.countAfter === 0,
+		JSON.stringify(diff.topShrink));
+	check('unchanged constructors are left out of the diff', diff.constructorsChanged === 4 &&
+		!diff.topGrowth.concat(diff.topShrink).some((r) => r.name === '(array)'),
+		String(diff.constructorsChanged));
+
+	// --- broken input ---
+	const dir = mkdtempSync(join(tmpdir(), 'tv-debug-heap-'));
+	const garbage = join(dir, 'garbage.heapsnapshot');
+	writeFileSync(garbage, 'this is not JSON at all {');
+	let broke = null;
+	try {
+		summarizeHeapSnapshot(garbage);
+	} catch (e) {
+		broke = e.message;
+	}
+	check('a file that is not JSON is rejected with a clear message',
+		!!broke && /not a readable \.heapsnapshot/.test(broke), broke);
+
+	const wrongJson = join(dir, 'wrong.heapsnapshot');
+	writeFileSync(wrongJson, JSON.stringify({hello: 'world'}));
+	broke = null;
+	try {
+		summarizeHeapSnapshot(wrongJson);
+	} catch (e) {
+		broke = e.message;
+	}
+	check('valid JSON that is not a snapshot is rejected too',
+		!!broke && /not a \.heapsnapshot/.test(broke), broke);
+
+	// An engine that predates the `detachedness` column: same file without it.
+	const legacyPath = join(dir, 'legacy.heapsnapshot');
+	const raw = JSON.parse(readFileSync(afterPath, 'utf8'));
+	const fields = raw.snapshot.meta.node_fields;
+	const detachedAt = fields.indexOf('detachedness');
+	raw.snapshot.meta.node_fields = fields.filter((f) => f !== 'detachedness');
+	raw.snapshot.meta.node_types = raw.snapshot.meta.node_types.filter((_, i) => i !== detachedAt);
+	raw.nodes = raw.nodes.filter((_, i) => i % fields.length !== detachedAt);
+	writeFileSync(legacyPath, JSON.stringify(raw));
+	const legacy = summarizeHeapSnapshot(legacyPath);
+	check('a snapshot without the detachedness column still parses (field order is read, not assumed)',
+		legacy.ok && legacy.totalNodes === 15 && legacy.totalSize === 976,
+		JSON.stringify({nodes: legacy.totalNodes, size: legacy.totalSize}));
+	check('without the column only the named detached nodes are counted', legacy.detachedCount === 4,
+		String(legacy.detachedCount));
+}
+
 async function main() {
 	profileChecks();
 	metricsChecks();
+	heapChecks();
 
 	console.log('\n--- config and failure isolation ---');
 	// A PATH with node but no `sdb`/`tizen`, so tool calls have to fail gracefully.
@@ -292,6 +398,22 @@ async function main() {
 	const badAction = await s.call('tv_profile', {action: 'heap'});
 	check('tv_profile rejects an unknown action and names the real ones',
 		!!badAction.__error && /"start", "stop" or "metrics"/.test(badAction.__error), badAction.__error);
+
+	const badHeap = await s.call('tv_heap', {action: 'compare'});
+	check('tv_heap rejects an unknown action and names the real ones',
+		!!badHeap.__error && /"snapshot" or "diff"/.test(badHeap.__error), badHeap.__error);
+	const heapNoPaths = await s.call('tv_heap', {action: 'diff', before: join(__dirname, 'fixture', 'heap', 'before.heapsnapshot')});
+	check('tv_heap diff without both paths fails the call',
+		!!heapNoPaths.__error && /`before` and `after`/.test(heapNoPaths.__error), heapNoPaths.__error);
+	// The whole point of taking `device` off diff: it must work with every TV switched off.
+	const heapDiff = await s.call('tv_heap', {
+		action: 'diff',
+		before: join(__dirname, 'fixture', 'heap', 'before.heapsnapshot'),
+		after: join(__dirname, 'fixture', 'heap', 'after.heapsnapshot')
+	});
+	check('tv_heap diff needs no device and no sdb', heapDiff.delta?.totalSize === 420 && heapDiff.topGrowth?.[0]?.name === 'MovieTile',
+		JSON.stringify(heapDiff.delta || heapDiff.__error));
+	check('server survived a device-less tool call', s.alive());
 
 	s.stop();
 	console.log(`\n${passed} passed, ${failed} failed\n`);

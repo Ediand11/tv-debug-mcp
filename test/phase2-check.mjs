@@ -12,7 +12,9 @@
 //      start / orphan stop; profileStart/profileStop also work as sequence steps
 //   9. tv_profile metrics: a standalone reading, a before/after/diff around a recording that
 //      actually sees DOM growth, collectGarbage, and `metrics` as a sequence step
-//  10. dispose kills our Chrome and leaves the server alone
+//  10. tv_heap: a real snapshot on disk, a constructor summary of it, a diff that names a
+//      planted leak and its detached DOM nodes, and a refusal to snapshot mid-recording
+//  11. dispose kills our Chrome and leaves the server alone
 //
 // It runs against test/fixture/index.html on a throwaway static server, so it does not need
 // a product dev server. Point TV_DEV_URL at your own dev server and TV_DEV_APP at its profile
@@ -251,6 +253,61 @@ async function main() {
 		seqMetrics.ok && typeof seqMetrics.steps?.[0]?.result?.metrics?.Nodes === 'number' &&
 		typeof seqMetrics.steps?.[2]?.result?.metrics?.Nodes === 'number',
 		JSON.stringify((seqMetrics.steps || []).map((x) => `${x.step}=${x.ok}`)));
+
+	console.log('\n--- heap snapshots (tv_heap) ---');
+	const heapBefore = join(dir, 'before.heapsnapshot');
+	const h1 = await s.call('tv_heap', {device: 'pc-fixture', action: 'snapshot', path: heapBefore, topN: 25});
+	check('tv_heap writes a .heapsnapshot file', h1.ok === true && existsSync(heapBefore) && statSync(heapBefore).size > 100000,
+		h1.ok ? `${h1.bytes} bytes in ${h1.chunks} chunks, ${h1.durationMs}ms` : h1.__error);
+	check('the file on disk is the size the tool reported', h1.ok && statSync(heapBefore).size === h1.bytes,
+		`${statSync(heapBefore).size} vs ${h1.bytes}`);
+	check('a real snapshot parses into a constructor summary',
+		h1.summary?.ok === true && h1.summary.totalNodes > 1000 && h1.summary.topConstructors?.length === 25,
+		JSON.stringify({nodes: h1.summary?.totalNodes, top: h1.summary?.topConstructors?.length}));
+	check('the summary names DOM constructors of the page',
+		(h1.summary?.topConstructors || []).some((c) => /HTML|Window|Document|\(string\)/.test(c.name)),
+		(h1.summary?.topConstructors || []).slice(0, 5).map((c) => c.name).join(','));
+	check('the raw snapshot is NOT inlined into the response',
+		h1.nodes === undefined && h1.summary?.nodes === undefined && JSON.stringify(h1).length < 8000,
+		`${JSON.stringify(h1).length} chars`);
+
+	// A leak with a name: 2000 objects of one constructor plus a detached DOM subtree, both
+	// held from a global so the snapshot's own full GC cannot collect them.
+	await s.call('tv_evaluate', {
+		device: 'pc-fixture',
+		expression: '(function(){function TvDebugLeakItem(i){this.i=i;this.pad="x";}' +
+			'window.__tvDebugLeak=[];for(var i=0;i<2000;i++){window.__tvDebugLeak.push(new TvDebugLeakItem(i));}' +
+			'var d=document.createElement("div");' +
+			'for(var j=0;j<300;j++){d.appendChild(document.createElement("span"));}' +
+			'document.body.appendChild(d);document.body.removeChild(d);window.__tvDebugDetached=d;' +
+			'return window.__tvDebugLeak.length;})()'
+	});
+	const heapAfter = join(dir, 'after.heapsnapshot');
+	const h2 = await s.call('tv_heap', {device: 'pc-fixture', action: 'snapshot', path: heapAfter});
+	check('a second snapshot succeeds on the same connection', h2.ok === true, h2.__error);
+	check('detached DOM nodes retained from JS are counted', h2.summary?.detachedCount > h1.summary?.detachedCount,
+		`${h1.summary?.detachedCount} -> ${h2.summary?.detachedCount}`);
+
+	const heapDiff = await s.call('tv_heap', {action: 'diff', before: heapBefore, after: heapAfter, topN: 30});
+	check('diff sees the leaked constructor by name',
+		(heapDiff.topGrowth || []).some((r) => r.name === 'TvDebugLeakItem' && r.deltaCount >= 2000),
+		JSON.stringify((heapDiff.topGrowth || []).slice(0, 4)));
+	check('diff sees the detached nodes grow',
+		heapDiff.delta?.detachedCount >= 300, String(heapDiff.delta?.detachedCount));
+	check('diff reports both totals and the delta',
+		heapDiff.before?.totalNodes > 0 && heapDiff.after?.totalNodes > heapDiff.before.totalNodes &&
+		heapDiff.delta?.totalSize > 0,
+		JSON.stringify(heapDiff.delta));
+
+	// A snapshot is a full GC and a long V8 pause: taking one inside a recording would time
+	// the pause instead of the app.
+	await s.call('tv_profile', {device: 'pc-fixture', action: 'start'});
+	const heapDuringProfile = await s.call('tv_heap', {device: 'pc-fixture', action: 'snapshot', path: join(dir, 'never.heapsnapshot')});
+	check('a snapshot is refused while a CPU recording is running',
+		!!heapDuringProfile.__error && /stop the CPU profile first/.test(heapDuringProfile.__error),
+		String(heapDuringProfile.__error).slice(0, 120));
+	check('the refused snapshot left no file behind', !existsSync(join(dir, 'never.heapsnapshot')));
+	await s.call('tv_profile', {device: 'pc-fixture', action: 'stop', path: join(dir, 'after-heap.cpuprofile')});
 
 	console.log('\n--- sequence: the long-press case, in the browser ---');
 	const seq = await s.call('tv_sequence', {
