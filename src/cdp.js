@@ -19,6 +19,18 @@ import WebSocket from 'ws';
 const DEFAULT_CALL_TIMEOUT = 8000;
 const MAX_BUFFER = 500;
 const MAX_INFLIGHT_REQUESTS = 2000;
+/**
+ * The network log gets its own, bigger limit: an app fires requests far more often than it
+ * logs, and eviction costs more here — an assertion about a request that fell out of the
+ * buffer fails silently. `dropped.network` is reported with every list so it cannot lie.
+ */
+const MAX_NETWORK_BUFFER = 1000;
+/** Per record, per direction. Enough for real headers, bounded for 1000 of them. */
+export const MAX_HEADERS_BYTES = 8 * 1024;
+/** Full POST body kept for curl/HAR; the list view cuts it much shorter (see network.js). */
+export const MAX_POSTDATA_BYTES = 64 * 1024;
+/** ExtraInfo events can arrive before the request they belong to — bounded stash for those. */
+const MAX_PENDING_EXTRA_INFO = 200;
 
 /**
  * A protocol error that means "this engine does not know this method" — expected on old
@@ -47,9 +59,20 @@ export class CdpSession {
 		this.exceptions = [];
 		/** @type {Array<object>} */
 		this.networkFailures = [];
+		/**
+		 * Full request log since launch — url, method, status, headers, POST body. The records
+		 * are mutated in place as `responseReceived`/`loadingFinished` land, so what is in this
+		 * array and what is in `_requests` is the same object.
+		 * @type {Array<object>}
+		 */
+		this.network = [];
 		/** Entries evicted from the ring buffers, so reports can say so instead of lying. */
-		this.dropped = {console: 0, exceptions: 0, networkFailures: 0};
+		this.dropped = {console: 0, exceptions: 0, networkFailures: 0, network: 0};
 		this._requests = new Map();
+		/** Monotonic id: `requestId` is reused across redirect hops, this one never is. */
+		this._netSeq = 0;
+		/** @type {Map<string, {request?: object, response?: object}>} */
+		this._pendingExtraInfo = new Map();
 		/**
 		 * Extra per-method event subscribers (see `onEvent`). The ring buffers above are for
 		 * things worth keeping for the whole session; this is for a caller that needs a
@@ -123,7 +146,10 @@ export class CdpSession {
 			reject(err);
 		}
 		this._pending.clear();
+		// The in-flight map goes, the `network` log does NOT: tv_network must still answer for a
+		// session whose TV has just died — that log is often the reason it died.
 		this._requests.clear();
+		this._pendingExtraInfo.clear();
 	}
 
 	_onMessage(raw) {
@@ -218,35 +244,184 @@ export class CdpSession {
 				break;
 			}
 			case 'Network.requestWillBeSent':
-				if (this._requests.size >= MAX_INFLIGHT_REQUESTS) {
-					// A page that never finishes its requests must not grow this map forever.
-					this._requests.delete(this._requests.keys().next().value);
-				}
-				this._requests.set(params.requestId, {url: params.request && params.request.url});
+				this._onRequestWillBeSent(params);
 				break;
-			case 'Network.loadingFailed': {
-				const req = this._requests.get(params.requestId) || {};
-				this._requests.delete(params.requestId);
-				this._push('networkFailures', {url: req.url, errorText: params.errorText, blocked: params.blockedReason || null});
+			case 'Network.requestWillBeSentExtraInfo':
+				this._onExtraInfo(params.requestId, 'request', params);
+				break;
+			case 'Network.responseReceived': {
+				const rec = this._requests.get(params.requestId);
+				const r = params.response || {};
+				if (rec) {
+					rec.status = typeof r.status === 'number' ? r.status : rec.status;
+					rec.statusText = r.statusText || rec.statusText || '';
+					rec.mimeType = r.mimeType || rec.mimeType || null;
+					rec.protocol = r.protocol || rec.protocol || null;
+					rec.responseHeaders = capHeaders(r.headers) || rec.responseHeaders;
+					rec.timing = r.timing || rec.timing || null;
+					rec.fromCache = rec.fromCache || !!r.fromDiskCache;
+					if (!rec.resourceType && params.type) {
+						rec.resourceType = params.type;
+					}
+				}
 				break;
 			}
-			case 'Network.loadingFinished':
-				this._requests.delete(params.requestId);
+			case 'Network.responseReceivedExtraInfo':
+				this._onExtraInfo(params.requestId, 'response', params);
 				break;
+			case 'Network.requestServedFromCache': {
+				const rec = this._requests.get(params.requestId);
+				if (rec) {
+					rec.fromCache = true;
+				}
+				break;
+			}
+			case 'Network.loadingFailed': {
+				const rec = this._requests.get(params.requestId);
+				this._requests.delete(params.requestId);
+				if (rec) {
+					rec.failed = true;
+					rec.errorText = params.errorText || 'failed';
+					rec.blockedReason = params.blockedReason || null;
+					rec.finished = true;
+					rec.finishedAt = Date.now();
+				}
+				// The failure bucket predates the full log and stays as it was: tv_console's
+				// contract must not change under a caller that only ever wanted the failures.
+				this._push('networkFailures', {
+					url: rec ? rec.url : undefined,
+					errorText: params.errorText,
+					blocked: params.blockedReason || null
+				});
+				break;
+			}
+			case 'Network.loadingFinished': {
+				const rec = this._requests.get(params.requestId);
+				this._requests.delete(params.requestId);
+				if (rec) {
+					rec.finished = true;
+					rec.finishedAt = Date.now();
+					if (typeof params.encodedDataLength === 'number') {
+						rec.encodedDataLength = params.encodedDataLength;
+					}
+				}
+				break;
+			}
 			default:
 				break;
 		}
 	}
 
 	/**
-	 * @param {'console'|'exceptions'|'networkFailures'} bucket
+	 * Start a record for a request, and close the previous hop when this event is a redirect.
+	 *
+	 * A redirect reuses the SAME requestId with a `redirectResponse` — so each hop is written as
+	 * its own record (`redirectFrom`/`redirectedTo`) instead of overwriting the first one, and
+	 * `_netSeq` keeps them apart where the requestId cannot.
+	 * @param {object} params
+	 */
+	_onRequestWillBeSent(params) {
+		const req = params.request || {};
+		const prev = this._requests.get(params.requestId);
+		if (params.redirectResponse && prev) {
+			const r = params.redirectResponse;
+			prev.status = typeof r.status === 'number' ? r.status : prev.status;
+			prev.statusText = r.statusText || prev.statusText || '';
+			prev.responseHeaders = capHeaders(r.headers) || prev.responseHeaders;
+			prev.mimeType = r.mimeType || prev.mimeType || null;
+			prev.timing = r.timing || prev.timing || null;
+			prev.redirectedTo = req.url || null;
+			prev.finished = true;
+			prev.finishedAt = Date.now();
+		}
+		if (this._requests.size >= MAX_INFLIGHT_REQUESTS) {
+			// A page that never finishes its requests must not grow this map forever.
+			this._requests.delete(this._requests.keys().next().value);
+		}
+		const post = capPostData(req.postData);
+		const rec = {
+			seq: ++this._netSeq,
+			requestId: params.requestId,
+			// Host clock on purpose: the monotonic engine clocks of two TV generations are not
+			// comparable with each other or with this process, and Chrome 38 has no `wallTime`.
+			// The host-side receive skew does not matter at QA-assertion resolution.
+			receivedAt: Date.now(),
+			method: String(req.method || 'GET').toUpperCase(),
+			url: req.url || '',
+			resourceType: params.type || null,
+			requestHeaders: capHeaders(req.headers) || {},
+			/** Set once real wire headers arrive (Chromium 63+); curl warns when they never do. */
+			headersFromWire: false,
+			postData: post.data,
+			postDataTruncated: post.truncated,
+			postDataPending: post.data == null && !!req.hasPostData,
+			status: null,
+			statusText: '',
+			mimeType: null,
+			protocol: null,
+			responseHeaders: null,
+			timing: null,
+			encodedDataLength: 0,
+			fromCache: false,
+			failed: false,
+			errorText: null,
+			blockedReason: null,
+			finished: false,
+			finishedAt: null,
+			redirectFrom: params.redirectResponse && prev ? prev.url : null
+		};
+		const stashed = this._pendingExtraInfo.get(params.requestId);
+		if (stashed) {
+			this._pendingExtraInfo.delete(params.requestId);
+			if (stashed.request) {
+				applyRequestExtraInfo(rec, stashed.request);
+			}
+			if (stashed.response) {
+				applyResponseExtraInfo(rec, stashed.response);
+			}
+		}
+		this._requests.set(params.requestId, rec);
+		this._push('network', rec);
+	}
+
+	/**
+	 * `*ExtraInfo` carries the headers that really went on the wire — Cookie and User-Agent
+	 * included — and is allowed to arrive before the request event it belongs to.
+	 * @param {string} requestId
+	 * @param {'request'|'response'} kind
+	 * @param {object} params
+	 */
+	_onExtraInfo(requestId, kind, params) {
+		const rec = this._requests.get(requestId);
+		if (rec) {
+			if (kind === 'request') {
+				applyRequestExtraInfo(rec, params);
+			} else {
+				applyResponseExtraInfo(rec, params);
+			}
+			return;
+		}
+		let slot = this._pendingExtraInfo.get(requestId);
+		if (!slot) {
+			if (this._pendingExtraInfo.size >= MAX_PENDING_EXTRA_INFO) {
+				this._pendingExtraInfo.delete(this._pendingExtraInfo.keys().next().value);
+			}
+			slot = {};
+			this._pendingExtraInfo.set(requestId, slot);
+		}
+		slot[kind] = params;
+	}
+
+	/**
+	 * @param {'console'|'exceptions'|'networkFailures'|'network'} bucket
 	 * @param {object} item
 	 */
 	_push(bucket, item) {
 		const arr = this[bucket];
+		const limit = bucket === 'network' ? MAX_NETWORK_BUFFER : MAX_BUFFER;
 		arr.push(item);
-		if (arr.length > MAX_BUFFER) {
-			const cut = arr.length - MAX_BUFFER;
+		if (arr.length > limit) {
+			const cut = arr.length - limit;
 			arr.splice(0, cut);
 			this.dropped[bucket] += cut;
 		}
@@ -403,6 +578,73 @@ export async function resolvePageWs(httpBase, opts = {}) {
 		await sleep(500);
 	}
 	throw new Error(`no inspectable page at ${httpBase}${lastErr ? ' (' + lastErr.message + ')' : ''}`);
+}
+
+/**
+ * Copy headers under a byte cap: 1000 records × unbounded headers is the one place this buffer
+ * could really cost memory. Names are kept as the engine sent them.
+ * @param {?object} headers
+ * @return {?object}
+ */
+function capHeaders(headers) {
+	if (!headers || typeof headers !== 'object') {
+		return null;
+	}
+	const out = {};
+	let bytes = 0;
+	for (const [name, value] of Object.entries(headers)) {
+		const v = String(value);
+		bytes += name.length + v.length + 4;
+		if (bytes > MAX_HEADERS_BYTES) {
+			out['x-tv-debug-headers-truncated'] = 'true';
+			break;
+		}
+		out[name] = v;
+	}
+	return out;
+}
+
+/**
+ * @param {*} postData
+ * @return {{data: ?string, truncated: boolean}}
+ */
+function capPostData(postData) {
+	if (typeof postData !== 'string' || postData === '') {
+		return {data: postData === '' ? '' : null, truncated: false};
+	}
+	if (Buffer.byteLength(postData) <= MAX_POSTDATA_BYTES) {
+		return {data: postData, truncated: false};
+	}
+	return {data: Buffer.from(postData, 'utf8').slice(0, MAX_POSTDATA_BYTES).toString('utf8'), truncated: true};
+}
+
+/**
+ * @param {object} rec
+ * @param {object} params `Network.requestWillBeSentExtraInfo`
+ */
+function applyRequestExtraInfo(rec, params) {
+	const wire = capHeaders(params.headers);
+	if (!wire) {
+		return;
+	}
+	// The wire headers are a superset of what the app set — merged, not replaced, so a header
+	// the engine reports only in the request event survives.
+	rec.requestHeaders = {...(rec.requestHeaders || {}), ...wire};
+	rec.headersFromWire = true;
+}
+
+/**
+ * @param {object} rec
+ * @param {object} params `Network.responseReceivedExtraInfo`
+ */
+function applyResponseExtraInfo(rec, params) {
+	const wire = capHeaders(params.headers);
+	if (wire) {
+		rec.responseHeaders = {...(rec.responseHeaders || {}), ...wire};
+	}
+	if (typeof params.statusCode === 'number' && rec.status == null) {
+		rec.status = params.statusCode;
+	}
 }
 
 function argsToText(args = []) {

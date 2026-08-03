@@ -12,6 +12,7 @@
 //   {text: 'Нет интернета'}   the page's visible text contains this
 //   {expression: '...'}       an ES5 expression that must evaluate truthy
 //   {videoAdvancing: true}    <video> currentTime is moving
+//   {request: {...}}          a request matching the filter was sent (see pollRequests)
 //
 // `stableMs` additionally requires the condition to keep holding for that long, which is
 // what stops a case from acting on a half-rendered frame.
@@ -25,7 +26,7 @@ import {stateHelpersJs} from './state.js';
  * @return {?string}
  */
 export function conditionJs(profile, cond) {
-	if (cond.videoAdvancing) {
+	if (cond.videoAdvancing || cond.request) {
 		return null;
 	}
 	let body;
@@ -61,7 +62,8 @@ export function conditionJs(profile, cond) {
 		})()`;
 	} else {
 		throw new Error(
-			'wait condition must be one of: focusText, selector, selectorGone, scene, text, expression, videoAdvancing'
+			'wait condition must be one of: focusText, selector, selectorGone, scene, text, expression, ' +
+			'videoAdvancing, request'
 		);
 	}
 
@@ -135,5 +137,74 @@ export async function pollUntil(io, profile, cond, opts = {}) {
 		detail: last ? last.detail : null,
 		polls,
 		timedOut: true
+	};
+}
+
+/**
+ * Wait for the network log to satisfy a request filter. This is the assertion the console
+ * buffer could never make: "the analytics call went out, and it carried event_id".
+ *
+ * The buffer is on this side of the wire, so a poll costs nothing on the TV — no CDP call, no
+ * page evaluation. Two shapes have to wait out the whole timeout instead of returning early,
+ * because "not yet" and "never" are only distinguishable at the end of the window:
+ *   - `absent: true` — succeeds when nothing matched;
+ *   - `count.max` — a duplicate that arrives late is exactly the regression being hunted.
+ *
+ * @param {{networkMatches: function(object): (Promise<{count: number, samples: Array<object>}>|
+ *          {count: number, samples: Array<object>})}} io
+ * @param {{urlPattern?: string, method?: string, bodyContains?: string, status?: *,
+ *          statusMin?: number, statusMax?: number, since?: number, absent?: boolean,
+ *          count?: {min?: number, max?: number}}} cond
+ * @param {{timeoutMs?: number, intervalMs?: number}} [opts]
+ * @return {Promise<{ok: boolean, condition: string, elapsedMs: number, matched: number,
+ *                   samples: Array<object>, polls: number, timedOut?: boolean, reason?: string}>}
+ */
+export async function pollRequests(io, cond, opts = {}) {
+	const timeoutMs = opts.timeoutMs != null ? opts.timeoutMs : 8000;
+	const intervalMs = opts.intervalMs != null ? opts.intervalMs : 200;
+	const absent = !!cond.absent;
+	const count = cond.count || {};
+	const min = absent ? 0 : (count.min != null ? Math.floor(count.min) : 1);
+	const max = count.max != null ? Math.floor(count.max) : null;
+	const waitWholeWindow = absent || max !== null;
+	const started = Date.now();
+	const deadline = started + timeoutMs;
+
+	let polls = 0;
+	let last = {count: 0, samples: []};
+	for (;;) {
+		polls++;
+		last = (await io.networkMatches(cond)) || {count: 0, samples: []};
+		const enough = !waitWholeWindow && last.count >= min;
+		const left = deadline - Date.now();
+		if (enough || left <= 0) {
+			break;
+		}
+		await new Promise((r) => setTimeout(r, Math.min(intervalMs, left)));
+	}
+
+	const ok = absent
+		? last.count === 0
+		: last.count >= min && (max === null || last.count <= max);
+	let reason = null;
+	if (!ok) {
+		if (absent) {
+			reason = `expected no matching request, got ${last.count}`;
+		} else if (last.count < min) {
+			reason = `expected at least ${min} matching request(s), got ${last.count}`;
+		} else {
+			reason = `expected at most ${max} matching request(s), got ${last.count}`;
+		}
+	}
+	return {
+		ok,
+		condition: `request=${JSON.stringify(cond)}`.slice(0, 200),
+		elapsedMs: Date.now() - started,
+		matched: last.count,
+		// A few matches, already cut to list shape: enough to see WHICH request answered.
+		samples: (last.samples || []).slice(0, 5),
+		polls,
+		...(ok ? {} : {reason}),
+		...(!ok && !absent && last.count < min ? {timedOut: true} : {})
 	};
 }

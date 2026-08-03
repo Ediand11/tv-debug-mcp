@@ -22,6 +22,8 @@
 	.demo-popup__content { background: #1b2030; padding: 24px 40px; border-radius: 14px; }
 	.spinner { display: none; }
 	.spinner._active { display: block; }
+	.demo-stat { margin-top: 20px; padding: 10px 18px; border-radius: 8px; border: 0;
+		background: #263050; color: #e8ecf4; font: inherit; }
 	h1 { font-size: 20px; font-weight: 600; margin: 0 0 20px; }
 </style>
 </head>
@@ -39,6 +41,7 @@
 	<h1 id="title">Fixture catalog</h1>
 	<div class="demo-list" id="row"></div>
 	<div class="spinner" id="spinner">loading…</div>
+	<button class="demo-stat" id="stat" data-testid="stat">Send stat</button>
 </main>
 
 <div class="demo-popup" id="ctx">
@@ -140,6 +143,43 @@
 	});
 
 	render();
+}());
+
+// The network side of the fixture: an analytics-shaped POST with a marker in its body, and a
+// request to a port nobody listens on. Between them they cover what tv_network has to see —
+// a successful request whose BODY is the thing under test, and a failed one. ES5 on purpose,
+// like everything else here: the fixture stands in for a Chrome 38 TV.
+(function () {
+	var STAT_URL = '/stat?src=fixture';
+
+	function fireStat(marker) {
+		var xhr = new XMLHttpRequest();
+		xhr.open('POST', STAT_URL, true);
+		xhr.setRequestHeader('Content-Type', 'application/json');
+		// A credential header, so the curl builder has something to redact.
+		xhr.setRequestHeader('Authorization', 'Bearer fixture-secret-token');
+		xhr.setRequestHeader('X-Fixture', 'yes');
+		xhr.send(JSON.stringify({event: 'nav', event_id: marker || 'tvDebugMarker', ts: 1}));
+		return STAT_URL;
+	}
+
+	function fireFailing() {
+		var xhr = new XMLHttpRequest();
+		// Port 1: nothing listens there, so the engine reports loadingFailed.
+		xhr.open('GET', 'http://127.0.0.1:1/tv-debug-nowhere', true);
+		try {
+			xhr.send();
+		} catch (e) {
+			// Some engines throw synchronously; the failure event is what matters.
+		}
+		return 'sent';
+	}
+
+	document.getElementById('stat').addEventListener('click', function () {
+		fireStat();
+	});
+	window.__tvDebugStat = fireStat;
+	window.__tvDebugFail = fireFailing;
 }());
 </script>
 </body>

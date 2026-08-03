@@ -9,7 +9,7 @@
 //                    it. It must NOT be the lifecycle lock, or an auto-reconnect inside a
 //                    sequence step would deadlock against the sequence itself.
 
-import {createWriteStream, unlinkSync} from 'node:fs';
+import {createWriteStream, unlinkSync, writeFileSync} from 'node:fs';
 import {resolve} from 'node:path';
 
 import {TizenAdapter} from './adapters/tizen.js';
@@ -17,13 +17,14 @@ import {WebosAdapter} from './adapters/webos.js';
 import {PcAdapter} from './adapters/pc.js';
 import {SyntheticInput} from './input/synthetic.js';
 import {TrustedInput} from './input/trusted.js';
-import {CdpSession, resolvePageWs, sleep, isUnsupportedMethod} from './cdp.js';
+import {CdpSession, resolvePageWs, sleep, isUnsupportedMethod, MAX_POSTDATA_BYTES} from './cdp.js';
 import {resolveKey} from './keymaps.js';
 import {focusSnapshotJs, videoStateJs} from './inject.js';
 import {freePort} from './ports.js';
 import {loadAppProfile, requireMenu} from './appprofile.js';
 import {stateJs, focusSignatureJs, focusMatchesJs, menuItemsJs} from './state.js';
-import {pollUntil} from './wait.js';
+import {pollUntil, pollRequests} from './wait.js';
+import {selectRequests, toListEntry, buildCurl, buildHar, capBody, HAR_BODY_TOTAL_LIMIT} from './network.js';
 import {summarizeProfile, applySourceMap, saveProfile} from './profile.js';
 import {summarizeHeapSnapshot} from './heap.js';
 import {metricsToMap, metricsDiff, windowSecondsOf} from './metrics.js';
@@ -144,6 +145,12 @@ export class DeviceSession {
 		 * @type {?CdpSession}
 		 */
 		this._metricsEnabledFor = null;
+		/**
+		 * Start of the network assertion window, set by a `networkMark` step / `action:"mark"`.
+		 * Null means "each expectRequest looks at its own step only".
+		 * @type {?number}
+		 */
+		this._networkMarkAt = null;
 		this._lifecycleLock = Promise.resolve();
 		this._opLock = Promise.resolve();
 	}
@@ -796,17 +803,258 @@ export class DeviceSession {
 	}
 
 	/**
+	 * The connection for a network read. Deliberately NOT `_cdp()`: the request log lives in
+	 * this process and outlives the page, so `list` has to answer for an app that has just
+	 * died — which is usually when it is most wanted.
+	 * @return {CdpSession}
+	 */
+	_networkCdp() {
+		if (!this.cdp) {
+			throw new Error(`device "${this.cfg.id}" is not launched — call tv_launch first`);
+		}
+		return this.cdp;
+	}
+
+	/**
+	 * The buffered record for a requestId, newest first: a redirect chain reuses one requestId
+	 * across hops, and the last hop is the one that has a body.
+	 * @param {string} requestId
+	 * @return {{record: ?object, hops: number}}
+	 */
+	_findRequest(requestId) {
+		const all = this._networkCdp().network.filter((r) => r.requestId === requestId);
+		return {record: all.length ? all[all.length - 1] : null, hops: all.length};
+	}
+
+	/**
+	 * @param {object} filter
+	 * @param {?number} since
+	 * @return {{count: number, samples: Array<object>}}
+	 */
+	_networkMatches(filter, since) {
+		const matched = selectRequests(this._networkCdp().network, {...filter, since});
+		return {count: matched.length, samples: matched.slice(-5).map(toListEntry)};
+	}
+
+	/**
+	 * Window start for an assertion: an explicit mark wins over the step's own start time —
+	 * that is what `networkMark` is for, "match from here, not from this step".
+	 * @param {number} startedAt
+	 * @return {number}
+	 */
+	_networkSince(startedAt) {
+		return this._networkMarkAt != null ? this._networkMarkAt : startedAt;
+	}
+
+	/** Move the assertion window to now. */
+	networkMark() {
+		this._networkMarkAt = Date.now();
+		return {ok: true, markedAt: this._networkMarkAt};
+	}
+
+	/**
+	 * The request log since launch, newest first.
+	 * @param {{urlPattern?: string, method?: string, status?: *, since?: number, limit?: number}} [opts]
+	 */
+	networkList(opts = {}) {
+		const cdp = this._networkCdp();
+		const limit = Math.max(1, Math.floor(opts.limit || 50));
+		const matched = selectRequests(cdp.network, {
+			urlPattern: opts.urlPattern, method: opts.method, status: opts.status, since: opts.since
+		});
+		return {
+			requests: matched.slice(-limit).reverse().map(toListEntry),
+			matched: matched.length,
+			buffered: cdp.network.length,
+			// Eviction is the one way an assertion can be wrong without anybody noticing, so the
+			// count travels with every answer.
+			dropped: cdp.dropped.network,
+			...(this._networkMarkAt != null ? {markedAt: this._networkMarkAt} : {})
+		};
+	}
+
+	/**
+	 * Read a response body back out of the engine.
+	 *
+	 * Bodies are NOT buffered on this side: they live in the engine's own buffer and are gone
+	 * after a navigation or a relaunch. That is a property of the protocol, not a limitation to
+	 * work around — the honest answer is "catch it with an expectRequest at the moment of the
+	 * case", not a copy of every response body of the session.
+	 * @param {string} requestId
+	 */
+	async networkBody(requestId) {
+		if (!requestId) {
+			throw new Error('tv_network action:"body" needs a `requestId` from action:"list"');
+		}
+		const id = String(requestId);
+		const {record, hops} = this._findRequest(id);
+		const cdp = await this._cdp();
+		let res;
+		try {
+			res = await cdp.call('Network.getResponseBody', {requestId: id});
+		} catch (e) {
+			if (isUnsupportedMethod(e)) {
+				throw new Error(
+					`reading response bodies is not supported on this engine (${this.cfg.engine || this.platform}): ` +
+					`Network.getResponseBody — ${e.message}`
+				);
+			}
+			throw new Error(
+				`the engine has no body for ${id} any more (${e.message}) — response bodies live in the engine ` +
+				'buffer only until the page navigates or the app is relaunched, so they cannot be re-read later. ' +
+				'Assert the body at the moment of the case with an expectRequest step instead.'
+			);
+		}
+		const capped = capBody(res.body, !!res.base64Encoded);
+		return {
+			requestId: id,
+			url: record ? record.url : null,
+			status: record ? record.status : null,
+			mimeType: record ? record.mimeType : null,
+			base64Encoded: !!res.base64Encoded,
+			bytes: capped.bytes,
+			...(capped.truncated ? {truncated: true} : {}),
+			...(hops > 1 ? {note: `${hops} redirect hops share this requestId — this is the body of the last one`} : {}),
+			body: capped.body
+		};
+	}
+
+	/**
+	 * A runnable curl for one recorded request.
+	 * @param {string} requestId
+	 * @param {{raw?: boolean}} [opts]
+	 */
+	async networkCurl(requestId, opts = {}) {
+		if (!requestId) {
+			throw new Error('tv_network action:"curl" needs a `requestId` from action:"list"');
+		}
+		const id = String(requestId);
+		const cdp = this._networkCdp();
+		const {record, hops} = this._findRequest(id);
+		if (!record) {
+			throw new Error(
+				`no request ${id} in the buffer (${cdp.dropped.network} evicted since launch) — take a fresh action:"list"`
+			);
+		}
+		if (record.postDataPending && cdp.isOpen) {
+			// Chromium 62+ keeps a large body out of the event and hands it back on demand.
+			const got = await cdp.call('Network.getRequestPostData', {requestId: id}).catch(() => null);
+			if (got && typeof got.postData === 'string') {
+				record.postData = got.postData.slice(0, MAX_POSTDATA_BYTES);
+				record.postDataTruncated = got.postData.length > record.postData.length;
+				record.postDataPending = false;
+			}
+		}
+		const built = buildCurl(record, {raw: !!opts.raw, postDataLimit: MAX_POSTDATA_BYTES});
+		const warnings = [...built.warnings];
+		if (hops > 1) {
+			warnings.push(`${hops} redirect hops share this requestId — this is the last one; curl follows redirects itself with -L`);
+		}
+		return {requestId: id, url: record.url, method: record.method, command: built.command, warnings};
+	}
+
+	/**
+	 * Write the filtered log as a HAR 1.2 file — importable into DevTools → Network, Charles or
+	 * Insomnia, and the ready proof attachment for a bug report.
+	 *
+	 * Bodies are best-effort and only "now": `getResponseBody` reads the engine buffer, so a HAR
+	 * taken at the end of the case has them and one taken after a relaunch does not. Entries
+	 * without a body carry a comment saying so, and `bodiesMissing` counts them.
+	 * @param {{path?: string, urlPattern?: string, method?: string, status?: *, since?: number,
+	 *          withBodies?: boolean}} [opts]
+	 */
+	async networkHar(opts = {}) {
+		const cdp = this._networkCdp();
+		const matched = selectRequests(cdp.network, {
+			urlPattern: opts.urlPattern, method: opts.method, status: opts.status, since: opts.since
+		});
+		if (!matched.length) {
+			throw new Error('no buffered request matched the filter — nothing to write; check with action:"list" first');
+		}
+		const warnings = [];
+		const bodies = new Map();
+		let included = 0;
+		let missing = 0;
+		let bodyBytes = 0;
+		if (opts.withBodies !== false) {
+			if (!cdp.isOpen) {
+				warnings.push('the connection is gone, so the HAR has metadata only — bodies can only be read from a live engine');
+			} else {
+				for (const rec of matched) {
+					// Nothing to ask for: a failed request, a redirect hop and an unanswered
+					// request have no response body by definition.
+					if (rec.failed || rec.redirectedTo || rec.status == null) {
+						continue;
+					}
+					if (bodyBytes >= HAR_BODY_TOTAL_LIMIT) {
+						warnings.push(`stopped reading bodies at ${Math.round(HAR_BODY_TOTAL_LIMIT / (1024 * 1024))}MB — the rest of the entries are metadata only`);
+						break;
+					}
+					const res = await cdp.call('Network.getResponseBody', {requestId: rec.requestId})
+						.catch((e) => ({__error: e.message}));
+					if (!res || res.__error || typeof res.body !== 'string') {
+						missing++;
+						bodies.set(rec.seq, {error: res && res.__error ? res.__error : 'no body returned'});
+						continue;
+					}
+					const capped = capBody(res.body, !!res.base64Encoded);
+					bodyBytes += capped.body.length;
+					bodies.set(rec.seq, {
+						body: capped.body, base64Encoded: !!res.base64Encoded, truncated: capped.truncated
+					});
+					included++;
+				}
+			}
+		}
+		const har = buildHar(matched, {bodies, version: '0.2.0', withBodies: opts.withBodies !== false});
+		const outPath = opts.path
+			? resolve(opts.path)
+			: resolve(process.env.TMPDIR || '/tmp', `tv-network-${this.cfg.id}-${Date.now()}.har`);
+		const json = JSON.stringify(har);
+		writeFileSync(outPath, json);
+		return {
+			ok: true,
+			path: outPath,
+			bytes: Buffer.byteLength(json),
+			entries: har.log.entries.length,
+			bodiesIncluded: included,
+			bodiesMissing: missing,
+			...(warnings.length ? {warning: warnings.join('; ')} : {})
+		};
+	}
+
+	/**
 	 * Wait until a condition holds. See wait.js for the condition shapes.
 	 * @param {object} condition
-	 * @param {{timeoutMs?: number, intervalMs?: number, stableMs?: number}} [opts]
+	 * @param {{timeoutMs?: number, intervalMs?: number, stableMs?: number, startedAt?: number}} [opts]
 	 */
 	async waitFor(condition, opts = {}) {
+		if (condition && condition.request) {
+			return this.waitForRequest(condition.request, opts);
+		}
 		const io = {
 			evaluate: (js) => this.evaluate(js, true),
 			videoState: (gap) => this.videoState(gap)
 		};
 		const res = await pollUntil(io, this.profile, condition, opts);
 		return {...res, state: await this.state().catch(() => null)};
+	}
+
+	/**
+	 * Assert on the network log. No state snapshot rides along on purpose: this answer is about
+	 * what went over the wire, and it has to stay readable when the page is already gone.
+	 * @param {object} cond see pollRequests
+	 * @param {{timeoutMs?: number, intervalMs?: number, startedAt?: number}} [opts]
+	 */
+	async waitForRequest(cond, opts = {}) {
+		const startedAt = opts.startedAt != null ? opts.startedAt : Date.now();
+		const since = cond.since != null ? Number(cond.since) : this._networkSince(startedAt);
+		const io = {networkMatches: (c) => this._networkMatches(c, since)};
+		const res = await pollRequests(io, cond, {
+			timeoutMs: cond.timeoutMs != null ? cond.timeoutMs : opts.timeoutMs,
+			intervalMs: opts.intervalMs
+		});
+		return {...res, since, dropped: this._networkCdp().dropped.network};
 	}
 
 	/**
@@ -967,7 +1215,7 @@ export class DeviceSession {
 				let ok = true;
 				let result;
 				try {
-					result = await this._runStep(step);
+					result = await this._runStep(step, t0);
 					if (result && result.ok === false) {
 						ok = false;
 					}
@@ -994,8 +1242,11 @@ export class DeviceSession {
 		});
 	}
 
-	/** @param {object} step */
-	async _runStep(step) {
+	/**
+	 * @param {object} step
+	 * @param {number} [startedAt] when this step began — the default network assertion window
+	 */
+	async _runStep(step, startedAt = Date.now()) {
 		if (step.launch) {
 			// A case that assumes "we are on the catalog" fails the moment the previous run
 			// left the app in the player. Letting a sequence establish its own precondition is
@@ -1020,7 +1271,19 @@ export class DeviceSession {
 			return this.waitFor(step.wait, {timeoutMs: step.timeoutMs, stableMs: step.stableMs, intervalMs: step.intervalMs});
 		}
 		if (step.expect) {
-			return this.waitFor(step.expect, {timeoutMs: step.timeoutMs != null ? step.timeoutMs : 5000, stableMs: step.stableMs});
+			return this.waitFor(step.expect, {
+				timeoutMs: step.timeoutMs != null ? step.timeoutMs : 5000, stableMs: step.stableMs, startedAt
+			});
+		}
+		if (step.expectRequest) {
+			// The assertion the console buffer could never make: "the request went out, and it
+			// carried the field". Window = this step, unless a networkMark moved it earlier.
+			return this.waitForRequest(step.expectRequest, {
+				timeoutMs: step.timeoutMs, intervalMs: step.intervalMs, startedAt
+			});
+		}
+		if (step.networkMark !== undefined) {
+			return this.networkMark();
 		}
 		if (step.eval != null) {
 			return {ok: true, value: await this.evaluate(step.eval, true)};
@@ -1053,8 +1316,8 @@ export class DeviceSession {
 		}
 		throw new Error(
 			`unknown step ${JSON.stringify(step).slice(0, 120)} — expected one of: ` +
-			'launch, press, longpress, goto, menu, wait, expect, eval, sleep, videoState, state, ' +
-			'profileStart, profileStop, metrics'
+			'launch, press, longpress, goto, menu, wait, expect, expectRequest, networkMark, eval, ' +
+			'sleep, videoState, state, profileStart, profileStop, metrics'
 		);
 	}
 
@@ -1094,7 +1357,10 @@ export class DeviceSession {
 			totals: {
 				console: cdp.console.length,
 				exceptions: cdp.exceptions.length,
-				networkFailures: cdp.networkFailures.length
+				networkFailures: cdp.networkFailures.length,
+				// Failures are what this tool has always reported; the full log (successful
+				// requests, bodies, assertions) is tv_network's job.
+				networkRequests: cdp.network.length
 			},
 			droppedFromBuffer: cdp.dropped
 		};

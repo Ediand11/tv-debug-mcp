@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // tv-debug-mcp — MCP server for semi-manual QA runs on real Smart TVs over CDP.
 //
-// Tools: tv_devices, tv_install, tv_launch, tv_press, tv_screenshot, tv_console,
+// Tools: tv_devices, tv_install, tv_launch, tv_press, tv_screenshot, tv_console, tv_network,
 // tv_video_state, tv_state, tv_wait_for, tv_goto, tv_menu, tv_sequence, tv_evaluate,
 // tv_profile, tv_heap.
 // The park is described in devices.json (or TV_DEBUG_CONFIG) and can also contain a `pc`
@@ -128,6 +128,25 @@ const TOOLS = [
 		}
 	},
 	{
+		name: 'tv_network',
+		description: 'The full request log since launch — the tool for "the request went out, but not the right one" (analytics that lost a field, an API call with a parameter dropped, a stat event fired twice). action:"list" (default) returns url, method, status, mime type, size and the POST body of each request, newest first, filtered by urlPattern (substring, or /regex/), method and status ("failed" | a number | {min,max}). action:"body" reads one response body back by requestId — bodies live in the ENGINE buffer only until the page navigates or the app is relaunched, so this answers "why is the catalog empty" right now and cannot be used to re-read history; assert bodies at the moment of the case with a tv_sequence expectRequest step. action:"curl" turns one request into a runnable command for a terminal or a ticket (Cookie/Authorization redacted unless raw:true). action:"har" writes a HAR 1.2 file of the filtered log — importable into DevTools -> Network -> Import or Charles, and a ready proof attachment; it contains cookies and auth headers as they were, so do not put it in a public ticket. action:"mark" moves the assertion window used by expectRequest to now. POST bodies carry tokens: the list cuts them to 1000 characters and full bodies never go into reports. Reading the log needs no live connection — it survives the app dying.',
+		inputSchema: {
+			type: 'object',
+			properties: {
+				...DEVICE_PROP,
+				action: {type: 'string', enum: ['list', 'body', 'curl', 'har', 'mark'], description: 'list (default): the log. body/curl: one request by requestId. har: write a .har file. mark: move the expectRequest window to now.'},
+				urlPattern: {type: 'string', description: 'list/har: case-insensitive substring of the URL, or /regex/flags.'},
+				method: {type: 'string', description: 'list/har: HTTP method (GET, POST, …).'},
+				status: {description: 'list/har: "failed", an exact status number, or {"min":200,"max":299}.'},
+				limit: {type: 'integer', minimum: 1, maximum: 500, description: 'list: how many requests to return, newest first (default 50).'},
+				requestId: {type: 'string', description: 'body/curl: the requestId of a request from action:"list".'},
+				raw: {type: 'boolean', description: 'curl: keep Cookie/Authorization values instead of REDACTED (default false).'},
+				path: {type: 'string', description: 'har: where to write the .har file. Defaults to a scratch path.'},
+				withBodies: {type: 'boolean', description: 'har: read response bodies into the file (default true). They are best-effort: only what the engine still has.'}
+			}
+		}
+	},
+	{
 		name: 'tv_video_state',
 		description: 'Programmatic <video> snapshot: whether currentTime is advancing (two samples), readyState, size, muted, src and MediaError code. The reliable way to confirm playback when a screenshot would be black.',
 		inputSchema: {
@@ -157,7 +176,11 @@ const TOOLS = [
 				text: {type: 'string', description: "The page's visible text contains this."},
 				expression: {type: 'string', description: 'ES5 expression that must evaluate truthy.'},
 				videoAdvancing: {type: 'boolean', description: 'Wait until <video> currentTime is actually moving.'},
-				timeoutMs: {type: 'integer', minimum: 100, maximum: 300000, description: 'Give up after this long (default 15000).'},
+				request: {
+					type: 'object',
+					description: 'Wait until a matching request has been sent: {"urlPattern":"track","method":"POST","bodyContains":"event_id","statusMax":399}. Matches requests received since this call (or since the last tv_network action:"mark"). "absent":true inverts it — succeeds only if nothing matched by the timeout, which is how a duplicated stat event is caught; it waits out the whole timeout by definition. "count":{"min":1,"max":1} bounds how many matched.'
+				},
+				timeoutMs: {type: 'integer', minimum: 100, maximum: 300000, description: 'Give up after this long (default 15000; 8000 for a request condition).'},
 				intervalMs: {type: 'integer', minimum: 50, maximum: 5000, description: 'Poll interval (default 250).'},
 				stableMs: {type: 'integer', minimum: 0, maximum: 10000, description: 'Require the condition to hold this long before succeeding (default 0).'}
 			}
@@ -195,7 +218,7 @@ const TOOLS = [
 	},
 	{
 		name: 'tv_sequence',
-		description: 'Run a whole case body in ONE call, with a verdict, elapsed time and result per step. Steps are objects, one key each: {"launch":{"relaunch":true}} (start from a known state) | {"press":"RIGHT","repeat":2} | {"longpress":"ENTER","durationMs":1500} | {"goto":{"direction":"DOWN","text":"..."}} | {"menu":"Settings"} | {"wait":{"scene":"player"},"timeoutMs":30000} | {"expect":{"selector":"[class*=popup]"}} | {"eval":"ES5 expression"} | {"sleep":1000} | {"videoState":true} | {"state":true} | {"profileStart":true} | {"profileStop":{"path":"…"}} | {"metrics":true}. `expect` and `wait` take the same conditions as tv_wait_for; a failing one fails the step. Runs under the device lock so nothing interleaves.',
+		description: 'Run a whole case body in ONE call, with a verdict, elapsed time and result per step. Steps are objects, one key each: {"launch":{"relaunch":true}} (start from a known state) | {"press":"RIGHT","repeat":2} | {"longpress":"ENTER","durationMs":1500} | {"goto":{"direction":"DOWN","text":"..."}} | {"menu":"Settings"} | {"wait":{"scene":"player"},"timeoutMs":30000} | {"expect":{"selector":"[class*=popup]"}} | {"expectRequest":{"urlPattern":"track","method":"POST","bodyContains":"event_id","timeoutMs":8000}} | {"networkMark":true} | {"eval":"ES5 expression"} | {"sleep":1000} | {"videoState":true} | {"state":true} | {"profileStart":true} | {"profileStop":{"path":"…"}} | {"metrics":true}. `expect` and `wait` take the same conditions as tv_wait_for; a failing one fails the step. `expectRequest` asserts on the network log (see tv_network) and matches requests sent since the step began — put {"networkMark":true} before the action to widen the window, use "absent":true or "count":{"max":1} to catch a duplicate (both wait out the whole timeout). Runs under the device lock so nothing interleaves.',
 		inputSchema: {
 			type: 'object',
 			properties: {
@@ -301,7 +324,7 @@ async function reachability(cfg) {
 	}
 }
 
-const CONDITION_KEYS = ['focusText', 'selector', 'selectorGone', 'scene', 'text', 'expression', 'videoAdvancing'];
+const CONDITION_KEYS = ['focusText', 'selector', 'selectorGone', 'scene', 'text', 'expression', 'videoAdvancing', 'request'];
 
 /**
  * tv_wait_for takes its condition as flat arguments (easier for a model than a nested
@@ -362,6 +385,32 @@ async function handleCall(name, args) {
 		case 'tv_console': {
 			const s = sessionFor(args.device);
 			return textResult(s.consoleReport({filter: args.filter, levels: args.levels, limit: args.limit}));
+		}
+		case 'tv_network': {
+			const s = sessionFor(args.device);
+			const action = args.action || 'list';
+			if (action === 'list') {
+				return textResult(s.networkList({
+					urlPattern: args.urlPattern, method: args.method, status: args.status, limit: args.limit
+				}));
+			}
+			if (action === 'body') {
+				return textResult(await s.networkBody(args.requestId));
+			}
+			if (action === 'curl') {
+				return textResult(await s.networkCurl(args.requestId, {raw: !!args.raw}));
+			}
+			if (action === 'har') {
+				// Only the path and the counts: a HAR with bodies is megabytes and belongs on disk.
+				return textResult(await s.networkHar({
+					path: args.path, urlPattern: args.urlPattern, method: args.method, status: args.status,
+					withBodies: args.withBodies
+				}));
+			}
+			if (action === 'mark') {
+				return textResult(s.networkMark());
+			}
+			return errorResult(`tv_network needs action "list", "body", "curl", "har" or "mark", got ${JSON.stringify(args.action)}`);
 		}
 		case 'tv_video_state': {
 			const s = sessionFor(args.device);

@@ -36,7 +36,7 @@ Node ≥ 18. Зависимости: `@modelcontextprotocol/sdk`, `ws`, `source-
 - **playwriter / Playwright connectOverCDP** требует свежий Chromium — не заведётся на webOS 3/4 (Chrome 38/53).
 - **Этот MCP** говорит с инспектором по «голому» CDP. Один кодовый путь от Chrome 38 до 120+, ноль зависимостей на устройстве. Тот же набор тулов работает и против браузера на ноуте.
 
-## Инструменты (15)
+## Инструменты (16)
 
 | Тул | Что делает |
 |---|---|
@@ -51,6 +51,7 @@ Node ≥ 18. Зависимости: `@modelcontextprotocol/sdk`, `ws`, `source-
 | `tv_sequence` | Весь кейс одним вызовом: вердикт, время и результат по каждому шагу, под device-lock |
 | `tv_screenshot` | PNG кадра. В браузере работает всегда; на Tizen деградирует с пометкой (secure/overlay plane) |
 | `tv_console` | Консоль / исключения / упавшие запросы с момента launch. Все уровни, фильтр, счётчик отброшенного буфером |
+| `tv_network` | Полный лог запросов с момента launch: url, метод, статус, тело POST. Чтение тела ответа по `requestId`, экспорт в `curl` и HAR 1.2, ассерт `expectRequest` шагом кейса |
 | `tv_video_state` | Программный снимок `<video>`: тикает ли `currentTime` (два замера), readyState, размеры, MediaError |
 | `tv_evaluate` | Произвольный JS в странице (escape hatch). На старых ТВ — только ES5 |
 | `tv_profile` | Запись JS CPU-профиля (`start` → действия → `stop`): файл `.cpuprofile` для DevTools + топ функций и файлов по self time. `sourceMap` деминифицирует топ на прод-сборке. Плюс метрики `Performance.getMetrics` (heap, DOM-узлы, слушатели, layout) — снимок на `start` и на `stop`, в ответе diff; `action:"metrics"` снимает их отдельно, без записи профиля |
@@ -66,6 +67,8 @@ Node ≥ 18. Зависимости: `@modelcontextprotocol/sdk`, `ws`, `source-
 {"menu": "Settings"}
 {"wait": {"scene": "player"}, "timeoutMs": 30000}
 {"expect": {"selector": "[class*=context-menu]"}}
+{"networkMark": true}                     // «считать запросы с этого места»
+{"expectRequest": {"urlPattern": "track", "method": "POST", "bodyContains": "event_id"}}
 {"eval": "document.title"}
 {"sleep": 1500}
 {"videoState": true, "expectAdvancing": true}
@@ -82,6 +85,49 @@ Node ≥ 18. Зависимости: `@modelcontextprotocol/sdk`, `ws`, `source-
 `UP DOWN LEFT RIGHT ENTER BACK MENU INFO GUIDE SEARCH TOOLS CAPTION RED GREEN YELLOW BLUE PLAY PAUSE PLAY_PAUSE STOP REWIND FAST_FORWARD TRACK_NEXT TRACK_PREV RECORD CHANNEL_UP CHANNEL_DOWN PAGE_UP PAGE_DOWN VOLUME_UP VOLUME_DOWN VOLUME_MUTE EXIT DIGIT_0..9` (регистр не важен, можно сырой числовой keyCode). Коды взяты из платформенных input-слоёв Tizen (`TvKeyCode`) и webOS.
 
 Лонгтап: `{"key":"ENTER","durationMs":1600}` — keydown, hold, keyup. Механика `LongPressService`: таймер стартует на keydown, keyup решает «клик или лонгтап». LG SSAP-пульт hold не выражает — поэтому синтетика, а не пульт.
+
+### tv_network — лог сети, тела, curl/HAR и ассерты
+
+`tv_console` показывает только **упавшие** запросы. Успешный запрос с неправильным телом невидим ни одному кейсу — а это целый класс регрессов: аналитика потеряла поле, из параметров API выпал один, стат-событие ушло дважды. `tv_network` — про это.
+
+```
+tv_network {"action": "list", "urlPattern": "track", "method": "POST"}   # action по умолчанию
+tv_network {"action": "body", "requestId": "1234.5"}                     # тело ответа
+tv_network {"action": "curl", "requestId": "1234.5"}                     # команда для терминала/тикета
+tv_network {"action": "har",  "path": "/tmp/case.har", "urlPattern": "api."}
+tv_network {"action": "mark"}                                            # сдвинуть окно ассертов
+```
+
+**`list`** — фильтры `urlPattern` (подстрока или `/regex/`), `method`, `status` (`"failed"` \| число \| `{"min":200,"max":299}`), `limit` (по умолчанию 50, новейшие первыми). Запись: `requestId`, `receivedAt`, `method`, `url` (обрезан до 500), `status`, `mimeType`, `resourceType`, `encodedDataLength`, `postData` (обрезан до 1000, флаг `postDataTruncated`), `failed` + `errorText`, `fromCache`, `redirectFrom` / `redirectedTo`, `inFlight`. Плюс `dropped` — сколько вытеснено из кольцевого буфера: ассерт по вытесненному запросу провалился бы молча, поэтому счётчик едет в каждом ответе.
+
+**Ассерт в кейсе** — шаг `expectRequest` (и условие `{"request": {...}}` в `tv_wait_for`):
+
+```json
+{"networkMark": true}
+{"menu": "Настройки"}
+{"expectRequest": {"urlPattern": "track", "method": "POST",
+                   "bodyContains": "event_id", "statusMax": 399, "timeoutMs": 8000}}
+{"expectRequest": {"urlPattern": "stat.gif", "count": {"max": 1}, "timeoutMs": 3000}}
+{"expectRequest": {"urlPattern": "ads", "absent": true, "timeoutMs": 3000}}
+```
+
+**Окно матчинга — начало своего шага**, как у остальных wait-условий. Но запрос — событие мгновенное, и тот, что улетел на предыдущем шаге, в окно уже не попадает: перед действием ставится `{"networkMark": true}`, и все `expectRequest` дальше считают от метки. Это главный практический момент тула.
+
+`absent: true` и `count.max` **ждут весь `timeoutMs`** по определению: «ещё не пришло» и «не придёт» различимы только в конце окна, а дубль, прилетевший последним, — это ровно то, что ищут. Остальные формы возвращаются, как только матч есть.
+
+Границы, каждая — свойство протокола, а не недоделка:
+
+- **тела ответов не буферизуются на нашей стороне.** `getResponseBody` читает буфер движка, и после навигации или релонча тела там нет. Поэтому `action:"body"` отвечает на «почему каталог пустой» **сейчас** и честно падает потом; повторить историю нельзя — ловить надо ассертом в момент кейса;
+- **POST-тела несут токены и куки.** В `list` тело режется до 1000 символов, целиком (до 64 КБ) хранится только ради curl/HAR и в отчёты не попадает. Гард на тело ответа — 256 КБ, на весь HAR — 50 МБ;
+- **`receivedAt` — часы хоста**, момент приёма события, а не CDP `timestamp`: монотонные часы движков разных поколений несравнимы ни между собой, ни с хостом, а `wallTime` в Chrome 38 нет. Для QA-ассертов скью приёма несуществен;
+- буфер сети — **1000 записей** (у консоли 500): апп стреляет сетью на порядок чаще;
+- редирект переиспользует один `requestId`, поэтому каждый хоп пишется отдельной записью (`redirectFrom` / `redirectedTo`), а `action:"body"`/`"curl"` берут последний.
+
+**`curl`**: `Cookie`, `Authorization` и `*token*`-заголовки заменяются на `REDACTED`, полный вариант — явным `"raw": true`. На движке без `requestWillBeSentExtraInfo` (Chromium <63 — весь парк старше tizen55) заголовки берутся из `requestWillBeSent.request.headers`, то есть это то, что знал **апп**, до того как движок навесил Cookie и UA; репро авторизованного запроса может не совпасть — приходит `warning`, а не тихое расхождение.
+
+**`har`**: HAR 1.2 (creator `tv-debug-mcp`), открывается в DevTools → **Network → Import**, Charles, Insomnia — готовое вложение-пруф к багу. Заголовки пишутся **как есть**, без редактирования: HAR без Cookie ничего не воспроизводит. Отсюда правило — **в публичный тикет такой файл не класть**. Тела — best-effort и только «сейчас»: HAR в конце кейса будет с телами, снятый позже — метаданные, у таких entries `comment: "body evicted"`, счётчик `bodiesMissing` в ответе. Тайминги — из `response.timing`; чего движок не дал, то `-1` по спеке, а не выдуманное число.
+
+**Платформы**: домен `Network` жив на всём парке (он и так включается на connect, cdp.js), `getResponseBody` — тоже. `requestWillBeSentExtraInfo`/`responseReceivedExtraInfo` (реальные wire-заголовки) — Chromium 63+, ниже curl предупреждает про куки.
 
 ### tv_profile — CPU-профиль и метрики
 
@@ -282,6 +328,7 @@ Claude Code ── stdio ── server.js
                          ├── inject.js      page-side ES5: key dispatch, focus, video-state
                          ├── state.js       page-side ES5: снимок состояния и фокуса
                          ├── wait.js        поллинг условий (общий для wait/goto/sequence)
+                         ├── network.js     лог запросов: фильтры, curl, HAR
                          ├── profile.js     CPU-профиль: оба формата, саммари, sourcemap
                          ├── heap.js        .heapsnapshot: свод по конструкторам и diff
                          ├── ports.js       свободный локальный порт под forward
@@ -294,13 +341,16 @@ Claude Code ── stdio ── server.js
 
 | Прогон | Что |
 |---|---|
-| `npm run check:offline` | 78/78 — честный статус офлайн-устройства, перечитка конфига без рестарта, отказ при дублях id, выживание без `sdb`; парсер CPU-профиля на фикстурах обоих форматов (совпадающие числа, спец-узлы отдельно, рекурсия не удваивается) и деминификация топа с деградацией до `warning`; парсер `.heapsnapshot` (свод по конструкторам, detached по имени и по колонке `detachedness`, diff роста/убыли, движок без `detachedness`, битый файл) и `tv_heap action:"diff"` вообще без устройства |
+| `npm run check:offline` | 138/138 — честный статус офлайн-устройства, перечитка конфига без рестарта, отказ при дублях id, выживание без `sdb`; парсер CPU-профиля на фикстурах обоих форматов (совпадающие числа, спец-узлы отдельно, рекурсия не удваивается) и деминификация топа с деградацией до `warning`; парсер `.heapsnapshot` (свод по конструкторам, detached по имени и по колонке `detachedness`, diff роста/убыли, движок без `detachedness`, битый файл) и `tv_heap action:"diff"` вообще без устройства; сетевой лог — жизненный цикл записи на событиях, скормленных сессии без сокета (редирект двумя хопами, отказ, ранний extra-info, вытеснение из буфера со счётчиком), фильтры, генератор curl (секреты, экранирование, warning'и) и сборка HAR, плюс семантика `expectRequest` (`absent` и `count.max` ждут всё окно) |
 | `node test/phase0-check.mjs` | 18/18 на Samsung UE50TU8510 — launch, движение фокуса, ES5-проба видео, `limit:1`, attach из другого процесса с сохранением состояния, выживание при обрыве сокета |
 | `node test/phase1-check.mjs` | 12/12 на ТВ — `wait_for` вместо сна, структурный фокус, `goto` до цели и его границы, заход в раздел меню и возврат обратно, кейс лонгтапа целиком. Селекторы берутся из app-профиля устройства, поэтому прогон не привязан к конкретному приложению |
-| `npm run check:browser` | 56/56 в Chrome — capabilities, отказ `tv_install`, свой Chrome на порту 0, навигация, реальный скриншот, кейс лонгтапа в trusted и synthetic, CPU-профиль (именованная busy-функция видна в топе, двойной `start` и сиротский `stop` отвергнуты, профилирование шагами сценария), `tv_heap` (файл на диске, подсаженная утечка `TvDebugLeakItem` видна в diff по имени вместе с detached-нодами, снапшот во время записи профиля отвергнут), уборка за собой |
+| `npm run check:browser` | 75/75 в Chrome — capabilities, отказ `tv_install`, свой Chrome на порту 0, навигация, реальный скриншот, кейс лонгтапа в trusted и synthetic, CPU-профиль (именованная busy-функция видна в топе, двойной `start` и сиротский `stop` отвергнуты, профилирование шагами сценария), `tv_heap` (файл на диске, подсаженная утечка `TvDebugLeakItem` видна в diff по имени вместе с detached-нодами, снапшот во время записи профиля отвергнут), `tv_network` (`expectRequest` по телу реального XHR, негативный ассерт, упавший запрос с `errorText`, чтение тела ответа, сгенерированный curl **исполняется шеллом** и доносит тело до сервера, HAR парсится как 1.2), уборка за собой |
 | `tv_heap` on-device | LG 49UJ639V (webOS 3.9 / Chrome 38): снапшот 37 МБ / 406k нод / 1271 detached за 13 с; после сценария diff показал +8.3 МБ, +170k нод, +1859 detached с разбивкой по конструкторам. Целевой webos7 на момент прогона был недоступен |
+| `tv_network` on-device | LG 49UJ639V (webOS 3.9 / Chrome 38): `expectRequest` по телу реального стат-запроса зелёный на живой навигации, красная ветка падает по таймауту с причиной, `absent` выжидает всё окно; `body` читает ответ, сгенерированный curl воспроизводится в терминале (200), HAR на 361 запись собрался с 360 телами и настоящими таймингами |
 
-webOS-адаптер переписан (close → launch → inspect, честный `freshLaunch`), но **on-device не прогонялся**: LG из `ares-setup-device --list` сейчас недоступны (connection timed out).
+Что этот движок умеет и чего нет, видно по прогону выше: `postData` приходит прямо в `requestWillBeSent`, редиректы и `getResponseBody` работают, а `*ExtraInfo` нет (Chromium <63) — заголовки в логе до-движковые, без `Cookie`, о чём curl предупреждает. `resourceType` на Chrome 38 врёт (главный документ пришёл как `Image`), фильтровать надо по URL.
+
+webOS-адаптер (close → launch → inspect, честный `freshLaunch`) прогнан on-device на LG 49UJ639V; остальные LG из `ares-setup-device --list` бывают недоступны (connection timed out) — это про сеть, не про адаптер.
 
 `test/smoke.mjs` — ad-hoc прогон произвольного списка вызовов; `test/harness.mjs` — общий stdio-клиент для всех проверок и хелпер `appTargets`, который вытаскивает селекторы из app-профиля.
 
@@ -318,6 +368,7 @@ TV_DEV_URL=http://localhost:1337 TV_DEV_APP=myapp npm run check:browser
 
 - webOS on-device прогон (в т.ч. webOS 3 = Chrome 38: ES5-инъекция, работоспособность скриншота и **легаси-формат CPU-профиля** — парсер написан по спецификации Chrome 38 и проверен на фикстуре, но не на живом LG).
 - Прогон `tv_profile` на ТВ с `sourceMap` от прод-сборки (карта Closure парсится и позиции разрешаются — проверено офлайн).
+- `tv_network` on-device: приёмка «инструмент отвечает на исходный вопрос» — переход по разделам и зелёный `expectRequest` по аналитике на здоровой сборке; на webOS 3 (Chrome 38) факт-чек протокола: `postData` в `requestWillBeSent`, `getResponseBody`, поведение по редиректам. Пока прогонялось только в браузере.
 - Остальные перф-инструменты (FPS, `Tracing`) — отдельным заходом, они не покрывают весь парк.
 - Sampling heap profiler (`HeapProfiler.startSampling`/`stopSampling`) — кто **аллоцирует**; `tv_heap` отвечает на другой вопрос (кто держит уже живую память).
 - Авто-повтор удержанной d-pad-клавиши (`holdRepeatMs`): сейчас `durationMs` шлёт один `keydown`, что верно для лонгтапа, но не воспроизводит скролл ленты зажатой стрелкой. Обход списков закрывает `tv_goto`.

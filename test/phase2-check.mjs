@@ -14,7 +14,10 @@
 //      actually sees DOM growth, collectGarbage, and `metrics` as a sequence step
 //  10. tv_heap: a real snapshot on disk, a constructor summary of it, a diff that names a
 //      planted leak and its detached DOM nodes, and a refusal to snapshot mid-recording
-//  11. dispose kills our Chrome and leaves the server alone
+//  11. tv_network: the log sees a real XHR with its POST body, an assertion on that body as a
+//      sequence step, a failed request, a response body read back, a curl that a shell really
+//      runs, and a HAR file that parses
+//  12. dispose kills our Chrome and leaves the server alone
 //
 // It runs against test/fixture/index.html on a throwaway static server, so it does not need
 // a product dev server. Point TV_DEV_URL at your own dev server and TV_DEV_APP at its profile
@@ -22,7 +25,7 @@
 //
 // Run: node test/phase2-check.mjs
 import {spawn} from 'node:child_process';
-import {writeFileSync, mkdtempSync, existsSync, statSync} from 'node:fs';
+import {writeFileSync, readFileSync, mkdtempSync, existsSync, statSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join, dirname} from 'node:path';
 import {fileURLToPath} from 'node:url';
@@ -52,6 +55,22 @@ async function urlUp(url) {
 	} catch {
 		return false;
 	}
+}
+
+/**
+ * Run a command in a shell and return its stdout — used to prove the generated curl is not
+ * just a plausible-looking string.
+ * @param {string} cmd
+ * @return {Promise<string>}
+ */
+function shell(cmd) {
+	return new Promise((res) => {
+		const p = spawn('bash', ['-lc', cmd]);
+		let out = '';
+		p.stdout.on('data', (c) => (out += c));
+		p.stderr.resume();
+		p.on('exit', () => res(out));
+	});
 }
 
 function chromeCount() {
@@ -308,6 +327,102 @@ async function main() {
 		String(heapDuringProfile.__error).slice(0, 120));
 	check('the refused snapshot left no file behind', !existsSync(join(dir, 'never.heapsnapshot')));
 	await s.call('tv_profile', {device: 'pc-fixture', action: 'stop', path: join(dir, 'after-heap.cpuprofile')});
+
+	console.log('\n--- network log (tv_network) ---');
+	// The motivating shape, in miniature: an analytics-style POST whose BODY is the thing under
+	// test. The mark is what makes the window cover the step that fires the request — an
+	// expectRequest on its own only sees what happens after it starts.
+	const netSeq = await s.call('tv_sequence', {
+		device: 'pc-fixture',
+		steps: [
+			{networkMark: true},
+			{eval: "window.__tvDebugStat('tvDebugMarker')"},
+			{expectRequest: {urlPattern: '/stat', method: 'POST', bodyContains: 'tvDebugMarker'}, timeoutMs: 6000}
+		]
+	});
+	check('expectRequest asserts on the body of a request the case just fired', netSeq.ok,
+		JSON.stringify((netSeq.steps || []).map((x) => `${x.step}=${x.ok}`)));
+	check('the assertion reports what it matched',
+		netSeq.steps?.[2]?.result?.matched >= 1 && /\/stat/.test(netSeq.steps?.[2]?.result?.samples?.[0]?.url || ''),
+		JSON.stringify(netSeq.steps?.[2]?.result?.samples?.[0]?.url));
+
+	// The assertion above matched on the BODY, which is known the moment the request goes out —
+	// the status arrives later, so waiting for it is a second condition, not a re-read.
+	const statSettled = await s.call('tv_wait_for', {
+		device: 'pc-fixture', request: {urlPattern: '/stat', method: 'POST', status: 501}, timeoutMs: 5000
+	});
+	check('the record picks up the status the server answered (501 from python http.server)',
+		statSettled.ok, JSON.stringify(statSettled.reason || statSettled.matched));
+
+	const statList = await s.call('tv_network', {device: 'pc-fixture', urlPattern: '/stat', limit: 10});
+	const statReq = (statList.requests || [])[0];
+	check('the log keeps the POST body of a successful request',
+		/tvDebugMarker/.test(statReq?.postData || ''), JSON.stringify(statReq?.postData));
+	check('the answer says how much was evicted from the buffer', typeof statList.dropped === 'number',
+		String(statList.dropped));
+
+	const absentSeq = await s.call('tv_sequence', {
+		device: 'pc-fixture',
+		steps: [{networkMark: true}, {expectRequest: {urlPattern: '/never-requested', absent: true, timeoutMs: 1200}}]
+	});
+	check('a negative assertion passes when nothing matched', absentSeq.ok && absentSeq.steps?.[1]?.result?.matched === 0,
+		JSON.stringify(absentSeq.steps?.[1]?.result));
+
+	await s.call('tv_network', {device: 'pc-fixture', action: 'mark'});
+	await s.call('tv_evaluate', {device: 'pc-fixture', expression: 'window.__tvDebugFail()'});
+	const failWait = await s.call('tv_wait_for', {
+		device: 'pc-fixture', request: {urlPattern: 'tv-debug-nowhere', status: 'failed'}, timeoutMs: 8000
+	});
+	check('a request to a port nobody listens on is logged as failed with the engine error text',
+		failWait.ok && /ERR_/.test(failWait.samples?.[0]?.errorText || ''),
+		JSON.stringify(failWait.samples?.[0] || failWait.reason));
+
+	await s.call('tv_network', {device: 'pc-fixture', action: 'mark'});
+	await s.call('tv_evaluate', {
+		device: 'pc-fixture',
+		expression: '(function(){var x=new XMLHttpRequest();x.open("GET","/index.html?probe=1",true);x.send();return 1;})()'
+	});
+	const probeWait = await s.call('tv_wait_for', {
+		device: 'pc-fixture', request: {urlPattern: 'probe=1', statusMax: 399}, timeoutMs: 8000
+	});
+	check('a GET is matched by status range too', probeWait.ok, JSON.stringify(probeWait.reason || probeWait.matched));
+	const probeId = probeWait.samples?.[0]?.requestId;
+	const body = await s.call('tv_network', {device: 'pc-fixture', action: 'body', requestId: probeId});
+	check('action:"body" reads the response back out of the engine',
+		/<!DOCTYPE html/i.test(body.body || ''), body.__error || String(body.body || '').slice(0, 60));
+	check('the body answer reports its size and encoding', body.bytes > 100 && body.base64Encoded === false,
+		JSON.stringify({bytes: body.bytes, b64: body.base64Encoded}));
+	const goneBody = await s.call('tv_network', {device: 'pc-fixture', action: 'body', requestId: 'no-such-request'});
+	check('a body the engine does not have is an honest error, not an empty string',
+		!!goneBody.__error && /engine has no body/.test(goneBody.__error), String(goneBody.__error).slice(0, 120));
+
+	const curl = await s.call('tv_network', {device: 'pc-fixture', action: 'curl', requestId: statReq?.requestId});
+	check('action:"curl" rebuilds the request as a command',
+		/^curl -X POST /.test(curl.command || '') && /tvDebugMarker/.test(curl.command || ''),
+		curl.__error || String(curl.command).slice(0, 120));
+	check('the credential header is redacted by default',
+		/Authorization: REDACTED/.test(curl.command || '') && !/fixture-secret-token/.test(curl.command || ''),
+		String(curl.command).slice(0, 200));
+	const ran = await shell(`${curl.command} -s -o /dev/null -w '%{http_code}'`);
+	check('the generated command really runs and reaches the server', ran.trim() === '501', ran.trim());
+	const curlRaw = await s.call('tv_network', {device: 'pc-fixture', action: 'curl', requestId: statReq?.requestId, raw: true});
+	check('raw:true hands back the real credential', /fixture-secret-token/.test(curlRaw.command || ''),
+		String(curlRaw.command).slice(0, 160));
+
+	const harPath = join(dir, 'fixture.har');
+	const har = await s.call('tv_network', {device: 'pc-fixture', action: 'har', path: harPath, urlPattern: '127.0.0.1'});
+	check('action:"har" writes a file and says what went into it',
+		har.ok === true && existsSync(harPath) && har.entries > 0,
+		har.__error || JSON.stringify({entries: har.entries, bodies: har.bodiesIncluded, missing: har.bodiesMissing}));
+	const parsed = har.ok ? JSON.parse(readFileSync(harPath, 'utf8')) : null;
+	check('the HAR parses as 1.2 with entries DevTools can import',
+		parsed?.log?.version === '1.2' && parsed.log.entries.length === har.entries &&
+		typeof parsed.log.entries[0]?.request?.url === 'string' && !!parsed.log.entries[0]?.timings,
+		JSON.stringify({v: parsed?.log?.version, n: parsed?.log?.entries?.length}));
+	check('at least one entry carries a real response body', har.bodiesIncluded > 0,
+		`${har.bodiesIncluded} bodies, ${har.bodiesMissing} missing`);
+	check('the HAR file is NOT inlined into the response', JSON.stringify(har).length < 2000,
+		`${JSON.stringify(har).length} chars`);
 
 	console.log('\n--- sequence: the long-press case, in the browser ---');
 	const seq = await s.call('tv_sequence', {
