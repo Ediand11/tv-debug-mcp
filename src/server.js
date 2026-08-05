@@ -100,7 +100,7 @@ const TOOLS = [
 	},
 	{
 		name: 'tv_screenshot',
-		description: 'Capture the app frame via CDP and save a PNG. NOTE: on Samsung/Tizen the secure video/overlay plane often makes captureScreenshot hang or return black — for playback verdicts prefer tv_video_state and a human glance at the physical TV. UI screens (menus, focus, tiles) usually capture fine.',
+		description: 'Capture the app frame via CDP and save a PNG. NOTE: on Samsung/Tizen the secure video/overlay plane often makes captureScreenshot hang or return black — for playback verdicts prefer tv_video_state and a human glance at the physical TV. UI screens (menus, focus, tiles) usually capture fine. On an engine that renders no capturable frame at all (old Tizen) the first call times out and every later call in the session refuses instantly instead of hanging again; tv_launch relaunch:true retries.',
 		inputSchema: {
 			type: 'object',
 			properties: {
@@ -148,7 +148,7 @@ const TOOLS = [
 	},
 	{
 		name: 'tv_video_state',
-		description: 'Programmatic <video> snapshot: whether currentTime is advancing (two samples), readyState, size, muted, src and MediaError code. The reliable way to confirm playback when a screenshot would be black.',
+		description: 'Programmatic <video> snapshot: whether currentTime is advancing (two samples), readyState, size, muted, src and MediaError code. The reliable way to confirm playback when a screenshot would be black. On a page with no <video> at all it reads the Tizen object player instead (webapis.avplay) and answers with the same advancing/paused/currentTime/duration fields plus source:"avplay", the AVPlay state, codec, bitrate and the available bitrate ladder.',
 		inputSchema: {
 			type: 'object',
 			properties: {
@@ -244,7 +244,7 @@ const TOOLS = [
 	},
 	{
 		name: 'tv_profile',
-		description: 'Record a JS CPU profile on the device, and/or read memory & layout metrics. action:"start" begins sampling, then do the thing you want to measure (tv_press / tv_goto / a scroll), then action:"stop" writes a .cpuprofile file (open it in Chrome DevTools -> Performance -> Load profile) and returns a top-N summary of self time by function and by file. start and stop each also take a Performance.getMetrics reading, so stop reports before/after/diff per metric (JSHeapUsedSize, Nodes, JSEventListeners, LayoutCount, RecalcStyleCount, cumulative Duration counters) — that is how you catch growth the CPU profile cannot see. action:"metrics" is just that reading, with no recording. On a minified production build pass sourceMap (the app.js.map of THAT build) to get readable names. The CPU profile works on the whole park (Profiler exists down to Chrome 38); metrics need Chromium 60+ (tizen55, pc) — on webOS 3 action:"metrics" fails with a clear message, while start/stop still return the profile with metrics:null and a warning.',
+		description: 'Record a JS CPU profile on the device, and/or read memory & layout metrics. action:"start" begins sampling, then do the thing you want to measure (tv_press / tv_goto / a scroll), then action:"stop" writes a .cpuprofile file (open it in Chrome DevTools -> Performance -> Load profile) and returns a top-N summary of self time by function and by file. start and stop each also take a Performance.getMetrics reading, so stop reports before/after/diff per metric (JSHeapUsedSize, Nodes, JSEventListeners, LayoutCount, RecalcStyleCount, cumulative Duration counters) — that is how you catch growth the CPU profile cannot see. action:"metrics" is just that reading, with no recording. On a minified production build pass sourceMap (the app.js.map of THAT build) to get readable names. The CPU profile works on the whole park (Profiler exists down to Chrome 38); the full metric set needs Chromium 60+ (tizen55, pc). An older engine with no Performance domain falls back to Memory.getDOMCounters — Nodes, Documents, JSEventListeners and Timestamp, enough to catch a DOM/listener leak, with a warning saying so and no faked heap or layout numbers; where even that is missing, action:"metrics" fails with a clear message while start/stop still return the profile with metrics:null.',
 		inputSchema: {
 			type: 'object',
 			properties: {

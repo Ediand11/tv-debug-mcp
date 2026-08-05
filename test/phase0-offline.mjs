@@ -17,9 +17,14 @@
 //      filters, the curl builder (secrets redacted, quotes escaped) and the HAR builder
 //  10. the expectRequest poller: early success, and the two shapes that must wait out the
 //      whole window (`absent`, `count.max`)
+//  11. the legacy evaluate path (engines with no `awaitPromise`): a sync expression still costs
+//      one round-trip, a promise is settled host-side, a statement falls back unwrapped
+//  12. the AVPlay branch of the video probes, against a fake `webapis.avplay` — including the
+//      negative control that a stream which failed to open is "found, not advancing"
 //
 // Run: node test/phase0-offline.mjs
 import {spawn} from 'node:child_process';
+import {createContext, runInContext} from 'node:vm';
 import {writeFileSync, readFileSync, mkdtempSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {fileURLToPath} from 'node:url';
@@ -32,6 +37,13 @@ import {metricsToMap, metricsDiff, windowSecondsOf} from '../src/metrics.js';
 import {CdpSession} from '../src/cdp.js';
 import {selectRequests, toListEntry, buildCurl, buildHar, capBody, compileUrlPattern} from '../src/network.js';
 import {pollRequests} from '../src/wait.js';
+import {videoStateJs, videoSampleStartJs, videoSampleFinishJs} from '../src/inject.js';
+
+/**
+ * Anything page-side must stay ES5 — see the header of src/inject.js. Cheap syntactic guard,
+ * not a parser: it catches the constructs that actually get reached for.
+ */
+const ES6_IN_PAGE_JS = /=>|\blet\b|\bconst\b|`|\.\.\.|\bclass\b|Object\.assign|\.find\(/;
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const serverPath = join(__dirname, '..', 'src', 'server.js');
@@ -611,12 +623,171 @@ async function requestWaitChecks() {
 	check('a single event inside count.max passes', within.ok === true && within.matched === 1, JSON.stringify(within.matched));
 }
 
+/**
+ * 11: the legacy `awaitPromise` fallback. `_evaluateRaw` is stubbed, so the whole two-step
+ * path — kick, poll, unwrap, clean up — runs with no TV and no socket.
+ */
+async function legacyEvaluateChecks() {
+	console.log('\n--- legacy evaluate (no awaitPromise) ---');
+	const stub = (session, impl) => {
+		const seen = [];
+		session._evaluateRaw = async (expression, opts) => {
+			seen.push({expression, opts});
+			return impl(expression, seen.length);
+		};
+		return seen;
+	};
+	/** The kick expression is the one that sniffs for a thenable. */
+	const isKick = (expr) => expr.includes('typeof r.then');
+
+	const sync = new CdpSession('ws://offline');
+	sync.legacyEvalDialect = true;
+	const syncSeen = stub(sync, () => ({value: 42}));
+	const syncValue = await sync.evaluate('2*21');
+	check('a sync expression still costs one round-trip on the legacy dialect',
+		syncValue === 42 && syncSeen.length === 1, `${syncValue} / ${syncSeen.length} calls`);
+	check('the injected wrapper is ES5', !ES6_IN_PAGE_JS.test(syncSeen[0].expression),
+		(syncSeen[0].expression.match(ES6_IN_PAGE_JS) || [])[0]);
+	let wrapperParses = true;
+	try {
+		new Function(syncSeen[0].expression);
+	} catch (e) {
+		wrapperParses = false;
+		check('the injected wrapper parses', false, e.message);
+	}
+	if (wrapperParses) {
+		check('the injected wrapper parses', true);
+	}
+
+	const prom = new CdpSession('ws://offline');
+	prom.legacyEvalDialect = true;
+	let polls = 0;
+	stub(prom, (expr) => {
+		if (isKick(expr)) {
+			return {pending: 1};
+		}
+		polls++;
+		// The page has not settled it yet on the first two reads.
+		return polls < 3 ? null : JSON.stringify({v: {a: 1}});
+	});
+	const promValue = await prom.evaluate('new Promise(function(r){r({a:1})})');
+	check('a promise is settled host-side instead of coming back as an object',
+		JSON.stringify(promValue) === '{"a":1}' && polls === 3, `${JSON.stringify(promValue)} after ${polls} polls`);
+
+	const rej = new CdpSession('ws://offline');
+	rej.legacyEvalDialect = true;
+	stub(rej, (expr) => (isKick(expr) ? {pending: 1} : JSON.stringify({e: 'boom'})));
+	const rejMsg = await rej.evaluate('Promise.reject(new Error("boom"))').then(() => '', (e) => e.message);
+	check('a rejected promise throws with the page-side message', /boom/.test(rejMsg), rejMsg);
+
+	// A statement is not an expression: parenthesising it is a SyntaxError of the wrapper's
+	// own making, and the original text has to get its say (webos2-check asserts exactly this).
+	const stmt = new CdpSession('ws://offline');
+	stmt.legacyEvalDialect = true;
+	const stmtSeen = stub(stmt, (expr) => {
+		throw new Error(isKick(expr)
+			? 'page eval error: SyntaxError: Unexpected token throw'
+			: 'page eval error: Error: boom');
+	});
+	const stmtMsg = await stmt.evaluate('throw new Error("boom")').then(() => '', (e) => e.message);
+	check('a statement falls back to the unwrapped path and reports the page error',
+		/boom/.test(stmtMsg) && !/SyntaxError/.test(stmtMsg), stmtMsg);
+	check('the fallback sends the original text, not the wrapper',
+		stmtSeen[1]?.expression === 'throw new Error("boom")', stmtSeen[1]?.expression);
+
+	const stuck = new CdpSession('ws://offline');
+	stuck.legacyEvalDialect = true;
+	const stuckSeen = stub(stuck, (expr) => (isKick(expr) ? {pending: 1} : null));
+	const stuckMsg = await stuck.evaluate('never()', {timeoutMs: 300}).then(() => '', (e) => e.message);
+	check('a promise that never settles times out honestly', /did not settle within 300ms/.test(stuckMsg), stuckMsg);
+	check('and the page-side slot is deleted on the way out',
+		/delete window/.test(stuckSeen[stuckSeen.length - 1].expression),
+		stuckSeen[stuckSeen.length - 1].expression.slice(0, 60));
+
+	const modern = new CdpSession('ws://offline');
+	const modernSeen = stub(modern, () => 7);
+	const modernValue = await modern.evaluate('7');
+	check('a modern engine keeps the plain path untouched',
+		modernValue === 7 && modernSeen.length === 1 && modernSeen[0].expression === '7',
+		JSON.stringify(modernSeen[0]));
+}
+
+/**
+ * 12: the AVPlay branch of the video probes — the object player on old Tizen, run in a vm
+ * against a fake `webapis.avplay` because there is no <video> to read there.
+ */
+function avplayProbeChecks() {
+	console.log('\n--- AVPlay video probe ---');
+	for (const [name, js] of [
+		['videoStateJs', videoStateJs(400)],
+		['videoSampleStartJs', videoSampleStartJs(7)],
+		['videoSampleFinishJs', videoSampleFinishJs(7)]
+	]) {
+		check(`${name} is ES5`, !ES6_IN_PAGE_JS.test(js), (js.match(ES6_IN_PAGE_JS) || [])[0]);
+		try {
+			new Function(js);
+			check(`${name} parses`, true);
+		} catch (e) {
+			check(`${name} parses`, false, e.message);
+		}
+	}
+
+	/** Two AVPlay samples, `state` throughout, currentTime moving from t0 to t1 (ms). */
+	const sample = (state, t0, t1) => {
+		const sandbox = {console, setTimeout, JSON, isFinite, parseInt, isNaN};
+		sandbox.window = sandbox;
+		sandbox.document = {querySelectorAll: () => []};
+		let now = t0;
+		sandbox.webapis = {avplay: {
+			getState: () => state,
+			getCurrentTime: () => now,
+			getDuration: () => 3206692,
+			// Strings on purpose: that is what real firmware puts in extra_info (verified on
+			// Tizen 3.0), and the probe has to hand back numbers anyway.
+			getCurrentStreamInfo: () => ([
+				{index: 0, type: 'VIDEO', extra_info: JSON.stringify({fourCC: 'h264', Width: '1280', Height: '720', Bit_rate: '2986443'})},
+				{index: 1, type: 'AUDIO', extra_info: JSON.stringify({language: 'ru', channels: '2'})}
+			]),
+			getStreamingProperty: (k) => (k === 'AVAILABLE_BITRATE' ? '957881:1594741:2986443' : '')
+		}};
+		createContext(sandbox);
+		const first = runInContext(videoSampleStartJs(1), sandbox);
+		now = t1;
+		return {first, out: runInContext(videoSampleFinishJs(1), sandbox)};
+	};
+
+	const playing = sample('PLAYING', 6127, 10158);
+	check('a playing AVPlay stream reports as found and advancing',
+		playing.first.found === 1 && playing.out.advancing === true && playing.out.paused === false,
+		JSON.stringify(playing.out));
+	check('and carries what only AVPlay knows (codec, size, bitrate ladder) as NUMBERS',
+		playing.out.source === 'avplay' && playing.out.codec === 'h264' &&
+		playing.out.videoWidth === 1280 && playing.out.videoHeight === 720 &&
+		playing.out.bitrate === 2986443 && String(playing.out.availableBitrates) === '957881,1594741,2986443',
+		JSON.stringify(playing.out));
+	check('milliseconds are converted to seconds',
+		playing.out.currentTime === 10.158 && playing.out.duration === 3206.692,
+		JSON.stringify({t: playing.out.currentTime, d: playing.out.duration}));
+
+	// The negative control from the on-device run: a manifest that failed to open leaves the
+	// player in IDLE at 0. "found, not advancing" is the whole verdict — {} was not.
+	const dead = sample('IDLE', 0, 0);
+	check('a stream that failed to open is found but not advancing',
+		dead.out.found === 1 && dead.out.advancing === false && dead.out.avplayState === 'IDLE',
+		JSON.stringify(dead.out));
+
+	const none = sample('NONE', 0, 0);
+	check('no player instance reads as no video at all', none.first.found === 0, JSON.stringify(none.first));
+}
+
 async function main() {
 	profileChecks();
 	metricsChecks();
 	heapChecks();
 	networkChecks();
 	await requestWaitChecks();
+	await legacyEvaluateChecks();
+	avplayProbeChecks();
 
 	console.log('\n--- config and failure isolation ---');
 	// A PATH with node but no `sdb`/`tizen`, so tool calls have to fail gracefully.

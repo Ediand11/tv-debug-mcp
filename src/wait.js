@@ -11,7 +11,7 @@
 //   {scene: 'player'}         a visible scene's class contains this
 //   {text: 'Нет интернета'}   the page's visible text contains this
 //   {expression: '...'}       an ES5 expression that must evaluate truthy
-//   {videoAdvancing: true}    <video> currentTime is moving
+//   {videoAdvancing: true}    playback position is moving (<video>, or AVPlay on old Tizen)
 //   {request: {...}}          a request matching the filter was sent (see pollRequests)
 //
 // `stableMs` additionally requires the condition to keep holding for that long, which is

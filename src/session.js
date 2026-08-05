@@ -146,6 +146,13 @@ export class DeviceSession {
 		 */
 		this._metricsEnabledFor = null;
 		/**
+		 * The CdpSession found to have no `Performance` domain, i.e. the one reading metrics off
+		 * `Memory.getDOMCounters` instead. Same instance-comparison trick as above: a reattach
+		 * re-probes the engine rather than inheriting a verdict about a connection that is gone.
+		 * @type {?CdpSession}
+		 */
+		this._metricsFallbackFor = null;
+		/**
 		 * Start of the network assertion window, set by a `networkMark` step / `action:"mark"`.
 		 * Null means "each expectRequest looks at its own step only".
 		 * @type {?number}
@@ -576,9 +583,9 @@ export class DeviceSession {
 	 * style recalc counters, cumulative Duration counters.
 	 *
 	 * Standalone this is a snapshot; two of them around a scenario are what turn "the app feels
-	 * heavier after browsing" into a number. Needs Chromium 60+ — on Chrome 38 (webos3) the whole
-	 * Performance domain is missing and this throws, deliberately: `performance.memory` is
-	 * quantized there and would answer with a fake steady number instead of an honest refusal.
+	 * heavier after browsing" into a number. The full set needs Chromium 60+; an engine without
+	 * the Performance domain (Chromium 47 and down) falls back to DOM counters and says so in a
+	 * warning. Heap bytes are never faked from the quantized `performance.memory`.
 	 * @param {{collectGarbage?: boolean}} [opts]
 	 */
 	async metricsSnapshot(opts = {}) {
@@ -594,7 +601,7 @@ export class DeviceSession {
 	 */
 	async _metricsOn(cdp, opts = {}) {
 		const warnings = [];
-		await this._enableMetrics(cdp);
+		const fallback = await this._enableMetrics(cdp);
 		if (opts.collectGarbage) {
 			// Default off on purpose: a forced GC is a pause, and a pause inside a CPU recording
 			// on a weak TV distorts both the profile and what the app does next. Worth it only
@@ -605,11 +612,19 @@ export class DeviceSession {
 				warnings.push(`collectGarbage failed (${e.message}) — the numbers still include garbage not yet collected`);
 			}
 		}
+		if (fallback) {
+			return this._domCounterMetrics(cdp, warnings);
+		}
 		let res;
 		try {
 			res = await cdp.call('Performance.getMetrics');
 		} catch (e) {
-			throw this._metricsUnsupported(e, 'Performance.getMetrics');
+			if (!isUnsupportedMethod(e)) {
+				throw e;
+			}
+			// `enable` passed and `getMetrics` did not: still an engine without the domain.
+			this._metricsFallbackFor = cdp;
+			return this._domCounterMetrics(cdp, warnings);
 		}
 		const metrics = metricsToMap(res && res.metrics);
 		if (!Object.keys(metrics).length) {
@@ -619,20 +634,78 @@ export class DeviceSession {
 	}
 
 	/**
+	 * The metrics an engine without the `Performance` domain can still answer honestly.
+	 *
+	 * `Memory.getDOMCounters` exists far below Chromium 60 and gives the two numbers the leak
+	 * scenario actually runs on — DOM nodes and event listeners. The names are the ones
+	 * `Performance.getMetrics` uses, so a reading from this path and one from a modern TV go
+	 * through the same `metricsDiff` and read the same in a report.
+	 *
+	 * What is deliberately NOT here: `JSHeapUsedSize`. The only source on these engines is
+	 * page-side `performance.memory`, quantized to 100 KB — a fake steady number is worse than
+	 * a missing one. Layout/style counters would have to come out of `Tracing` event counts,
+	 * which is a different measurement wearing the same name.
+	 * @param {CdpSession} cdp
+	 * @param {Array<string>} warnings
+	 * @return {Promise<{at: number, metrics: Object<string, *>, warnings: Array<string>}>}
+	 */
+	async _domCounterMetrics(cdp, warnings = []) {
+		let res;
+		try {
+			res = await cdp.call('Memory.getDOMCounters');
+		} catch (e) {
+			throw this._metricsUnsupported(e, 'Performance.enable and Memory.getDOMCounters');
+		}
+		const metrics = {};
+		const put = (name, value) => {
+			if (typeof value === 'number' && Number.isFinite(value)) {
+				metrics[name] = value;
+			}
+		};
+		put('Nodes', res && res.nodes);
+		put('Documents', res && res.documents);
+		put('JSEventListeners', res && res.jsEventListeners);
+		// `Timestamp` is what turns two readings into a rate (metrics.js windowSecondsOf). The
+		// engine's own clock, in seconds, like the real metric — `performance.now()` counts from
+		// navigation rather than engine start, which changes the absolute value and not the diff.
+		const now = await cdp
+			.evaluate('(function(){ try { return (window.performance && performance.now) ? performance.now() / 1000 : null; } catch (err) { return null; } })()',
+				{awaitPromise: false})
+			.catch(() => null);
+		put('Timestamp', now);
+		warnings.push(
+			'Performance domain unavailable; DOM counters via Memory.getDOMCounters — ' +
+			'Nodes/Documents/JSEventListeners and Timestamp only. No JSHeapUsedSize (the only source ' +
+			'here is performance.memory, quantized to 100 KB) and no layout/style counters.'
+		);
+		return {at: Date.now(), metrics, warnings};
+	}
+
+	/**
 	 * `Performance.enable` once per connection — getMetrics on a disabled domain answers with
 	 * nothing on some engines instead of failing.
 	 * @param {CdpSession} cdp
+	 * @return {Promise<boolean>} true when this connection has no Performance domain and metrics
+	 *   have to come from DOM counters instead
 	 */
 	async _enableMetrics(cdp) {
+		if (this._metricsFallbackFor === cdp) {
+			return true;
+		}
 		if (this._metricsEnabledFor === cdp) {
-			return;
+			return false;
 		}
 		try {
 			await cdp.call('Performance.enable');
 		} catch (e) {
-			throw this._metricsUnsupported(e, 'Performance.enable');
+			if (!isUnsupportedMethod(e)) {
+				throw this._metricsUnsupported(e, 'Performance.enable');
+			}
+			this._metricsFallbackFor = cdp;
+			return true;
 		}
 		this._metricsEnabledFor = cdp;
+		return false;
 	}
 
 	/**
@@ -644,7 +717,8 @@ export class DeviceSession {
 		if (isUnsupportedMethod(e)) {
 			return new Error(
 				`metrics not supported on this engine (${this.cfg.engine || this.cfg.platform}): ${method} — ` +
-				`${e.message}. The Performance domain needs Chromium 60+; tv_profile start/stop still records the CPU profile.`
+				`${e.message}. The Performance domain needs Chromium 60+ and this engine has neither that nor ` +
+				`Memory.getDOMCounters; tv_profile start/stop still records the CPU profile.`
 			);
 		}
 		return e;

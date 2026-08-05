@@ -94,6 +94,101 @@ export function focusSnapshotJs(focusSelectors) {
 }
 
 /**
+ * Page-side helpers for the Tizen object player (`webapis.avplay`).
+ *
+ * Old Samsung sets have no usable HTML5 `<video>` for adaptive streams: the app plays through
+ * `<object type="application/avplayer">` driven by `webapis.avplay`, so every `<video>` probe
+ * below finds nothing and reports `{found: 0}` on a TV that is visibly playing. Verified on
+ * Tizen 3.0 / Chromium 47 (UE49MU6103).
+ *
+ * Every call is wrapped: the AVPlay surface differs between firmwares, and a missing getter
+ * must cost one field, not the whole probe.
+ *
+ * Leaves `tvdAv()` (the live player or null) and `tvdAvState(player, t0)` in scope.
+ */
+const avplayJs = `
+	function tvdAvTry(fn, dflt){ try { var v = fn(); return v === undefined ? dflt : v; } catch (err) { return dflt; } }
+	function tvdAv(){
+		var p = tvdAvTry(function(){ return window.webapis && webapis.avplay; }, null);
+		if (!p || typeof p.getState !== 'function') { return null; }
+		var st = tvdAvTry(function(){ return p.getState(); }, null);
+		// 'NONE' means no player instance was ever opened — the AVPlay equivalent of "no <video>
+		// in the DOM". IDLE/READY do count as found: a stream that failed to open sits in IDLE,
+		// and reporting that as "no player" would hide exactly the failure worth catching.
+		if (!st || st === 'NONE') { return null; }
+		return p;
+	}
+	function tvdAvNum(x){
+		// extra_info arrives with STRING values on real firmware ("1280", "2986443") — verified
+		// on Tizen 3.0. Numbers must leave this probe as numbers: the <video> branch reports
+		// them that way, and a caller comparing bitrate to a threshold would silently compare
+		// strings otherwise.
+		if (typeof x === 'number') { return isFinite(x) ? x : null; }
+		if (typeof x !== 'string' || !x) { return null; }
+		var n = parseFloat(x);
+		return isFinite(n) ? n : null;
+	}
+	function tvdAvTime(p){
+		var ms = tvdAvNum(tvdAvTry(function(){ return p.getCurrentTime(); }, null));
+		return ms === null ? null : ms / 1000;
+	}
+	function tvdAvVideoInfo(p){
+		var out = {};
+		var tracks = tvdAvTry(function(){ return p.getCurrentStreamInfo(); }, null);
+		if (!tracks || !tracks.length) { return out; }
+		for (var i = 0; i < tracks.length; i++) {
+			var t = tracks[i];
+			if (!t || String(t.type).toUpperCase() !== 'VIDEO') { continue; }
+			// extra_info is a JSON STRING on every firmware seen so far; the object form is
+			// tolerated in case a newer one stops stringifying it.
+			var x = t.extra_info;
+			if (typeof x === 'string') { x = tvdAvTry(function(){ return JSON.parse(t.extra_info); }, null); }
+			if (!x) { continue; }
+			out.codec = x.fourCC || null;
+			out.videoWidth = tvdAvNum(x.Width);
+			out.videoHeight = tvdAvNum(x.Height);
+			out.bitrate = tvdAvNum(x.Bit_rate);
+		}
+		return out;
+	}
+	function tvdAvBitrates(p){
+		// "957881:1594741:2986443" — the whole ABR ladder the player was given.
+		var raw = tvdAvTry(function(){ return p.getStreamingProperty('AVAILABLE_BITRATE'); }, null);
+		if (typeof raw !== 'string' || !raw) { return null; }
+		var parts = raw.split(':');
+		var out = [];
+		for (var i = 0; i < parts.length; i++) {
+			var n = parseInt(parts[i], 10);
+			if (!isNaN(n)) { out.push(n); }
+		}
+		return out.length ? out : null;
+	}
+	function tvdAvState(p, t0){
+		var st = tvdAvTry(function(){ return p.getState(); }, null);
+		var t = tvdAvTime(p);
+		var durMs = tvdAvNum(tvdAvTry(function(){ return p.getDuration(); }, null));
+		var info = tvdAvVideoInfo(p);
+		var moved = (typeof t === 'number' && typeof t0 === 'number') ? +(t - t0).toFixed(3) : null;
+		return {
+			found: 1,
+			// Same field names as the <video> branch — wait.js and tv_sequence read advancing
+			// and must not care which player answered — plus what only AVPlay knows.
+			source: 'avplay',
+			avplayState: st,
+			paused: st !== 'PLAYING',
+			currentTime: t,
+			advancedBy: moved,
+			advancing: moved !== null && moved > 0.01,
+			duration: (durMs !== null && durMs > 0) ? durMs / 1000 : null,
+			videoWidth: info.videoWidth || null,
+			videoHeight: info.videoHeight || null,
+			codec: info.codec || null,
+			bitrate: info.bitrate || null,
+			availableBitrates: tvdAvBitrates(p)
+		};
+	}`;
+
+/**
  * Shared picker: the most likely active player — largest, preferring one that is playing.
  * Leaves `vids` (all candidates) and `v` (the pick, or null) in scope.
  */
@@ -108,15 +203,25 @@ const pickVideoJs = `
 
 /**
  * Page-side expression returning the state of the primary <video> element: whether it is
- * actually advancing (two currentTime samples), readyState, size and error.
+ * actually advancing (two currentTime samples), readyState, size and error. Falls back to
+ * `webapis.avplay` when the page has no <video> at all (old Tizen).
  * @param {number} sampleGapMs
  * @return {string}
  */
 export function videoStateJs(sampleGapMs) {
 	return `(function(){
+		${avplayJs}
 		return new Promise(function(resolve){
 			${pickVideoJs}
-			if(!v){ resolve({found: vids.length}); return; }
+			if(!v){
+				var p = tvdAv();
+				if (p) {
+					var a0 = tvdAvTime(p);
+					setTimeout(function(){ resolve(tvdAvState(p, a0)); }, ${Number(sampleGapMs) || 600});
+					return;
+				}
+				resolve({found: vids.length}); return;
+			}
 			var t0 = v.currentTime;
 			setTimeout(function(){
 				var errCode = v.error ? v.error.code : null;
@@ -172,8 +277,17 @@ function sampleSlot(token) {
 export function videoSampleStartJs(token) {
 	const slot = JSON.stringify(sampleSlot(token));
 	return `(function(){
+		${avplayJs}
 		${pickVideoJs}
-		if(!v){ return {found: vids.length}; }
+		if(!v){
+			// No <video>: the object player is the only thing that can be playing here. Only the
+			// timestamp is stashed — AVPlay is a singleton, so there is no element to pin.
+			var p = tvdAv();
+			if (!p) { return {found: vids.length}; }
+			window[${slot}] = {av: 1, t0: tvdAvTime(p), n: 1};
+			setTimeout(function(){ try { delete window[${slot}]; } catch (err) {} }, ${SAMPLE_SLOT_TTL_MS});
+			return {found: 1};
+		}
 		window[${slot}] = {v: v, t0: v.currentTime, n: vids.length};
 		// Self-expiring: if the finish never runs (eval error, socket drop, timeout) the
 		// stashed <video> would stay strongly reachable from window and show up as a false
@@ -191,12 +305,20 @@ export function videoSampleStartJs(token) {
 export function videoSampleFinishJs(token) {
 	const slot = JSON.stringify(sampleSlot(token));
 	return `(function(){
+		${avplayJs}
 		var s = window[${slot}];
 		delete window[${slot}];
 		// The stash is gone: the page navigated during the gap, the context was recreated, or
 		// a concurrent sample consumed it. Say so — a caller that stamped a count over this
 		// would turn a lost sample into a confident "not advancing".
 		if(!s){ return {found: 0, sampleLost: true}; }
+		if (s.av) {
+			var p = tvdAv();
+			// The player was torn down between the samples: no verdict, and saying "not
+			// advancing" here would read as a playback failure that did not happen.
+			if (!p) { return {found: 0, sampleLost: true}; }
+			return tvdAvState(p, s.t0);
+		}
 		var v = s.v;
 		var errCode = v.error ? v.error.code : null;
 		return {

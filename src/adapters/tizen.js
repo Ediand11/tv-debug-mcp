@@ -177,26 +177,36 @@ export class TizenAdapter {
 	 * @return {Promise<number>} device port
 	 */
 	async launchDebug(appId, waitMs = 15000) {
-		this._log(`sdb -s ${this.serial} shell 0 debug ${appId}`);
-		const {value, child} = await spawnUntilMatch(
-			'sdb',
-			this._args(['shell', '0', 'debug', appId]),
-			{
-				what: `sdb debug ${appId}`,
-				timeoutMs: waitMs,
-				match: (buf) => {
-					const m = buf.match(/port:\s*(\d+)/);
-					return m ? parseInt(m[1], 10) : null;
-				},
-				fail: (buf) => /\bclosed\b/.test(buf)
-					? 'debug launch returned "closed" — the app is already running in debug. ' +
-					  'Use tv_launch {attach: true} to reuse it, or {relaunch: true} for a fresh start.'
-					: null
+		// Two argument forms, tried in order. Older firmware (seen on Tizen 3.0, UE49MU6103)
+		// answers a bare `debug <appId>` with "closed" even on a freshly killed app, and only
+		// launches when a trailing timeout argument is present — app_launcher rejects the
+		// option it turns into ("unrecognized option '--timeout=300'") and starts the app
+		// anyway. Newer firmware takes the bare form, so that stays the first attempt.
+		const forms = [['shell', '0', 'debug', appId], ['shell', '0', 'debug', appId, '300']];
+		let lastError = null;
+		for (const argv of forms) {
+			this._log(`sdb -s ${this.serial} ${argv.join(' ')}`);
+			try {
+				const {value, child} = await spawnUntilMatch('sdb', this._args(argv), {
+					what: `sdb debug ${appId}`,
+					timeoutMs: waitMs,
+					match: (buf) => {
+						const m = buf.match(/port:\s*(\d+)/);
+						return m ? parseInt(m[1], 10) : null;
+					},
+					fail: (buf) => /\bclosed\b/.test(buf)
+						? 'debug launch returned "closed" — the app is already running in debug. ' +
+						  'Use tv_launch {attach: true} to reuse it, or {relaunch: true} for a fresh start.'
+						: null
+				});
+				await stopChild(child);
+				this._lastDevicePort = value;
+				return value;
+			} catch (e) {
+				lastError = e;
 			}
-		);
-		await stopChild(child);
-		this._lastDevicePort = value;
-		return value;
+		}
+		throw lastError;
 	}
 
 	/**

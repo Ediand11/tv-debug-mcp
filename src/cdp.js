@@ -12,11 +12,20 @@
 // listener keeps `ws` from raising an unhandled EventEmitter error.
 //
 // `Page.captureScreenshot` is wrapped in a timeout because on some Samsung sets it hangs
-// forever (secure/overlay framebuffer).
+// forever (secure/overlay framebuffer) — and the first hang is remembered, so the second call
+// refuses instead of burning the timeout again.
+//
+// Pre-M54 engines have no `awaitPromise`: a page expression that returns a promise comes back
+// as the pending promise, serialized. `evaluate` settles those host-side instead (see
+// `_evaluateAwaited`), so callers can return promises everywhere without knowing the engine.
 
 import WebSocket from 'ws';
 
 const DEFAULT_CALL_TIMEOUT = 8000;
+/** How often the legacy promise-settling path re-reads the page-side result slot. */
+const EVAL_POLL_MS = 50;
+/** Leak insurance for a slot whose promise never settles (see `_evaluateAwaited`). */
+const EVAL_SLOT_TTL_MS = 60000;
 const MAX_BUFFER = 500;
 const MAX_INFLIGHT_REQUESTS = 2000;
 /**
@@ -95,6 +104,16 @@ export class CdpSession {
 		 * behaviour on the UA instead. Detected from the probe evaluate in connect().
 		 */
 		this.legacyEvalDialect = false;
+		/** Separates concurrent promise-settling slots on the legacy dialect (see evaluate). */
+		this._evalSeq = 0;
+		/**
+		 * Set once `Page.captureScreenshot` has timed out on THIS connection: some engines
+		 * render no capturable frame at all and every later call would burn the same timeout.
+		 * Reason string, not a boolean, so the refusal explains itself. A reattach builds a new
+		 * CdpSession and therefore retries — this is a per-connection fact, not a platform one.
+		 * @type {?string}
+		 */
+		this.screenshotDead = null;
 	}
 
 	/** @return {boolean} */
@@ -463,7 +482,11 @@ export class CdpSession {
 		return new Promise((resolve, reject) => {
 			const timer = setTimeout(() => {
 				this._pending.delete(id);
-				reject(new Error(`CDP call ${method} timed out after ${timeoutMs}ms`));
+				const err = new Error(`CDP call ${method} timed out after ${timeoutMs}ms`);
+				// Flagged, not string-matched by callers: "the engine never answered" and "the
+				// engine refused" lead to different decisions (see screenshot()).
+				err.timedOut = true;
+				reject(err);
 			}, timeoutMs);
 			this._pending.set(id, {resolve, reject, timer});
 			this._ws.send(JSON.stringify({id, method, params}), (err) => {
@@ -480,11 +503,27 @@ export class CdpSession {
 	/**
 	 * Evaluate an expression in the page. Returns the value (by value) or throws on
 	 * a page-side exception.
+	 *
+	 * On the legacy dialect a returned promise is settled host-side (see `_evaluateAwaited`),
+	 * because those engines have no `awaitPromise` and hand back the pending promise object.
 	 * @param {string} expression
 	 * @param {{awaitPromise?: boolean, timeoutMs?: number}} [opts]
 	 * @return {Promise<*>}
 	 */
 	async evaluate(expression, opts = {}) {
+		if (opts.awaitPromise !== false && this.legacyEvalDialect) {
+			return this._evaluateAwaited(expression, opts);
+		}
+		return this._evaluateRaw(expression, opts);
+	}
+
+	/**
+	 * One plain `Runtime.evaluate` round-trip — the whole of `evaluate` on a modern engine.
+	 * @param {string} expression
+	 * @param {{awaitPromise?: boolean, timeoutMs?: number}} [opts]
+	 * @return {Promise<*>}
+	 */
+	async _evaluateRaw(expression, opts = {}) {
 		const r = await this.call('Runtime.evaluate', {
 			expression,
 			returnByValue: true,
@@ -507,6 +546,92 @@ export class CdpSession {
 			throw new Error('page eval error: ' + ((ex && (ex.description || ex.value)) || 'exception (wasThrown)'));
 		}
 		return r.result ? r.result.value : undefined;
+	}
+
+	/**
+	 * Settle a page-side promise on an engine whose protocol has no `awaitPromise` (pre-M54:
+	 * Chrome 38/47/53 and WebKit 538). Those engines silently serialize the PENDING promise —
+	 * `{j,l,g,ta}` from a polyfill, `{}` from a native one — so a probe that returns a promise
+	 * comes back as a value-shaped object that means nothing. Verified on Tizen 3 / Chromium 47.
+	 *
+	 * One round-trip for a synchronous expression (the common case: every condition and state
+	 * snapshot); a promise costs the kick plus one short poll per 50ms until it settles.
+	 *
+	 * The result travels as a JSON string in a per-call window slot: the same trick as the
+	 * two-call video sample, for the same reason — the value has to survive between two
+	 * independent evaluates, and a shared slot would let concurrent calls eat each other.
+	 * @param {string} expression
+	 * @param {{timeoutMs?: number}} [opts]
+	 * @return {Promise<*>}
+	 */
+	async _evaluateAwaited(expression, opts = {}) {
+		const timeoutMs = opts.timeoutMs || DEFAULT_CALL_TIMEOUT;
+		const slot = JSON.stringify('__tvDebugEval_' + (++this._evalSeq));
+		// Strict ES5 from here down — this is injected into the same old engines as inject.js.
+		const kickJs = `(function(){
+			var slot = ${slot};
+			function settle(key, x){
+				var box = {};
+				if (key === 'e') { box.e = String((x && x.message) || x); } else { box.v = x; }
+				try { window[slot] = JSON.stringify(box); }
+				catch (err) { window[slot] = JSON.stringify({e: 'promise value is not serializable: ' + err.message}); }
+			}
+			var r = (${expression});
+			if (!r || typeof r.then !== 'function') { return {value: r}; }
+			window[slot] = null;
+			// Self-expiring, like the video sample slot: a promise that never settles must not
+			// leave a string on window forever and turn up as a retainer in a tv_heap diff.
+			setTimeout(function(){ try { delete window[slot]; } catch (err) {} }, ${EVAL_SLOT_TTL_MS});
+			r.then(function(v){ settle('v', v); }, function(e){ settle('e', e); });
+			return {pending: 1};
+		})()`;
+
+		let kicked;
+		try {
+			kicked = await this._evaluateRaw(kickJs, {awaitPromise: false, timeoutMs});
+		} catch (e) {
+			// The wrapper can only hold an EXPRESSION, and callers are allowed to send a
+			// statement — `throw new Error(...)` is one of the acceptance checks. Parenthesising
+			// that is a SyntaxError of OUR making, not the page's answer: run the original text
+			// unwrapped and let it speak for itself.
+			if (/SyntaxError/i.test(e.message || '')) {
+				return this._evaluateRaw(expression, {awaitPromise: false, timeoutMs});
+			}
+			throw e;
+		}
+		if (!kicked || !kicked.pending) {
+			return kicked ? kicked.value : undefined;
+		}
+
+		const readJs = `(function(){
+			var s = window[${slot}];
+			if (s === null || s === undefined) { return null; }
+			delete window[${slot}];
+			return s;
+		})()`;
+		const deadline = Date.now() + timeoutMs;
+		while (Date.now() < deadline) {
+			await sleep(EVAL_POLL_MS);
+			const left = deadline - Date.now();
+			const raw = await this._evaluateRaw(readJs, {awaitPromise: false, timeoutMs: Math.max(1000, left)});
+			if (typeof raw !== 'string') {
+				continue;
+			}
+			let box;
+			try {
+				box = JSON.parse(raw);
+			} catch {
+				throw new Error('page eval error: promise settled with an unreadable value');
+			}
+			if (box && box.e !== undefined) {
+				throw new Error('page eval error: ' + box.e);
+			}
+			return box ? box.v : undefined;
+		}
+		// Give up, but do not leave the slot behind for the TTL to find.
+		await this._evaluateRaw(`(function(){ try { delete window[${slot}]; } catch (err) {} return 1; })()`,
+			{awaitPromise: false, timeoutMs: 2000}).catch(() => {});
+		throw new Error(`page promise did not settle within ${timeoutMs}ms (this engine has no awaitPromise)`);
 	}
 
 	/**
@@ -555,12 +680,33 @@ export class CdpSession {
 	}
 
 	/**
+	 * Capture the frame, and remember a hang.
+	 *
+	 * Some engines answer `Page.captureScreenshot` with silence forever — Tizen 3 renders no
+	 * capturable frame at all, screencast included, so every call burns the full timeout for a
+	 * verdict that will never come. The first hang is therefore recorded on the connection and
+	 * later calls refuse immediately. Only a TIMEOUT counts: a protocol error or a dead socket
+	 * says nothing about whether this engine can capture, and gating on the platform would be
+	 * wrong too — webOS 3 is just as old and screenshots fine.
 	 * @param {number} [timeoutMs]
 	 * @return {Promise<Buffer>}
 	 */
 	async screenshot(timeoutMs = 6000) {
-		const r = await this.call('Page.captureScreenshot', {format: 'png'}, timeoutMs);
-		return Buffer.from(r.data, 'base64');
+		if (this.screenshotDead) {
+			throw new Error(this.screenshotDead);
+		}
+		try {
+			const r = await this.call('Page.captureScreenshot', {format: 'png'}, timeoutMs);
+			return Buffer.from(r.data, 'base64');
+		} catch (e) {
+			if (e.timedOut) {
+				this.screenshotDead = `screenshot timed out after ${timeoutMs}ms earlier in this session ` +
+					'(this engine renders no capturable frame) — refusing instantly instead of hanging again; ' +
+					'take the verdict from tv_state / tv_video_state, and the picture from the physical TV. ' +
+					'A tv_launch relaunch:true retries on a fresh connection.';
+			}
+			throw e;
+		}
 	}
 
 	close() {
