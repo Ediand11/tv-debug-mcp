@@ -19,7 +19,7 @@ import {SyntheticInput} from './input/synthetic.js';
 import {TrustedInput} from './input/trusted.js';
 import {CdpSession, resolvePageWs, sleep, isUnsupportedMethod, MAX_POSTDATA_BYTES} from './cdp.js';
 import {resolveKey} from './keymaps.js';
-import {focusSnapshotJs, videoStateJs} from './inject.js';
+import {focusSnapshotJs, videoStateJs, videoSampleStartJs, videoSampleFinishJs} from './inject.js';
 import {freePort} from './ports.js';
 import {loadAppProfile, requireMenu} from './appprofile.js';
 import {stateJs, focusSignatureJs, focusMatchesJs, menuItemsJs} from './state.js';
@@ -153,6 +153,8 @@ export class DeviceSession {
 		this._networkMarkAt = null;
 		this._lifecycleLock = Promise.resolve();
 		this._opLock = Promise.resolve();
+		/** Separates concurrent two-call video samples on the legacy eval dialect. */
+		this._videoSampleSeq = 0;
 	}
 
 	get platform() {
@@ -377,6 +379,29 @@ export class DeviceSession {
 	async videoState(sampleGapMs = 600) {
 		const cdp = await this._cdp();
 		const gap = Number(sampleGapMs) || 600;
+		if (cdp.legacyEvalDialect) {
+			// The legacy protocol ignores awaitPromise, so the promise-based expression would
+			// come back as an unresolved, empty object. Same sampling — the gap just runs
+			// host-side, and the second read reuses the element stashed by the first.
+			//
+			// The pair is stateful on the page, but this must NOT take the operation lock:
+			// tv_sequence already holds it while running a {videoState:true} step, and the
+			// lock is not reentrant. Concurrent samples are separated by a per-call token.
+			const token = ++this._videoSampleSeq;
+			const first = await cdp.evaluate(videoSampleStartJs(token), {awaitPromise: false});
+			if (!first || !first.found) {
+				return {found: (first && first.found) || 0};
+			}
+			await sleep(gap);
+			const out = await cdp.evaluate(videoSampleFinishJs(token), {awaitPromise: false});
+			// Never stamp `found` over the finish result: a lost sample reports found 0, and
+			// overwriting it would hand back a video-shaped object with every field undefined
+			// — which wait.js reads as a confident "not advancing".
+			if (!out || out.sampleLost || !out.found) {
+				return {found: first.found, sampleLost: true};
+			}
+			return out;
+		}
 		return cdp.evaluate(videoStateJs(gap), {awaitPromise: true, timeoutMs: gap + 5000});
 	}
 

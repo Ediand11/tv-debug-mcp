@@ -42,6 +42,15 @@
       "appId": "com.example.myapp",
       "device": "webos7",
       "host": "192.168.1.11"
+    },
+    {
+      "id": "webos2",
+      "platform": "webos",
+      "name": "LG, webOS 2 / WebKit 538 — legacy inspector, no CDP",
+      "app": "myapp",
+      "appId": "com.example.myapp",
+      "device": "webos2",
+      "host": "192.168.1.12"
     }
   ]
 }

@@ -82,6 +82,19 @@ export class CdpSession {
 		this._eventHandlers = new Map();
 		/** @type {?Error} set once the socket is gone; every later call fails with it. */
 		this._deadReason = null;
+		/**
+		 * True on the pre-M54 `Runtime.evaluate` dialect: the reply carries `wasThrown` instead
+		 * of `exceptionDetails`, and the `awaitPromise` flag does not exist — a promise-based
+		 * page expression comes back as an unresolved object, so those need a two-call path
+		 * (session.js videoState).
+		 *
+		 * This is a PROTOCOL fact, not an engine one. It covers WebKit 538 (webOS 2) *and*
+		 * pre-V8-inspector Blink — Chrome 38/47/53, i.e. webos3/tizen3/webos4 — because
+		 * `awaitPromise` and `exceptionDetails` landed in the same protocol generation that
+		 * retired `wasThrown`. Do not read this flag as "is WebKit": gate engine-specific
+		 * behaviour on the UA instead. Detected from the probe evaluate in connect().
+		 */
+		this.legacyEvalDialect = false;
 	}
 
 	/** @return {boolean} */
@@ -126,6 +139,12 @@ export class CdpSession {
 				}
 			}
 		}
+		// Dialect probe — sets `legacyEvalDialect` before the first real caller needs it.
+		// A failure here is not fatal: `evaluate()` re-runs the detection on every call.
+		await this.evaluate('1', {awaitPromise: false, timeoutMs: 4000}).catch(() => {});
+		// Last, so a socket that died during setup — including during the probe, whose own
+		// rejection is swallowed above — fails the connect instead of handing back a session
+		// that reports itself attached.
 		if (!this.isOpen) {
 			throw this._deadReason || new Error('CDP socket closed during setup');
 		}
@@ -471,9 +490,21 @@ export class CdpSession {
 			returnByValue: true,
 			awaitPromise: opts.awaitPromise !== false
 		}, opts.timeoutMs || DEFAULT_CALL_TIMEOUT);
+		// Pre-M54 engines set `wasThrown` on every reply, thrown or not; M54+ omit the field
+		// entirely and use `exceptionDetails`. Presence alone is therefore the dialect test.
+		if (r.wasThrown !== undefined) {
+			this.legacyEvalDialect = true;
+		}
 		if (r.exceptionDetails) {
 			const ex = r.exceptionDetails.exception;
 			throw new Error('page eval error: ' + ((ex && (ex.description || ex.value)) || r.exceptionDetails.text));
+		}
+		if (r.wasThrown) {
+			// Legacy WebKit engines (webOS 2, WebKit 538) have no exceptionDetails — the thrown
+			// error IS the result object. Without this check a page-side throw comes back as a
+			// silent `undefined` and e.g. a failed key dispatch looks like success.
+			const ex = r.result;
+			throw new Error('page eval error: ' + ((ex && (ex.description || ex.value)) || 'exception (wasThrown)'));
 		}
 		return r.result ? r.result.value : undefined;
 	}
@@ -546,6 +577,11 @@ export class CdpSession {
  * Resolve the page target's webSocketDebuggerUrl from a CDP HTTP base
  * (e.g. http://127.0.0.1:9955). Bounded: each attempt has its own timeout and the whole
  * loop has one deadline, so a black-holing TV can't hang a tool call for minutes.
+ *
+ * Two discovery protocols per attempt: Chromium's `/json/list`, then the legacy WebKit
+ * inspector's `/pagelist.json` (webOS 1/2, QtWebKit — no `/json/list` at all). The legacy
+ * list has no webSocketDebuggerUrl, but its WS endpoint follows the same
+ * `/devtools/page/<id>` shape, so the URL is derived from the id.
  * @param {string} httpBase
  * @param {{attempts?: number, perAttemptMs?: number, deadlineMs?: number}} [opts]
  * @return {Promise<string>}
@@ -555,15 +591,13 @@ export async function resolvePageWs(httpBase, opts = {}) {
 	const perAttemptMs = opts.perAttemptMs || 3000;
 	const deadline = Date.now() + (opts.deadlineMs || 20000);
 	let lastErr;
+	let legacyErr;
 	for (let i = 0; i < attempts && Date.now() < deadline; i++) {
-		const ac = new AbortController();
-		const t = setTimeout(() => ac.abort(), perAttemptMs);
+		// Each fetch is clamped to what is left of the overall budget: two protocols per
+		// attempt would otherwise let one round overshoot the deadline by 2×perAttemptMs.
+		const budget = () => Math.max(1, Math.min(perAttemptMs, deadline - Date.now()));
 		try {
-			const res = await fetch(httpBase + '/json/list', {signal: ac.signal});
-			if (!res.ok) {
-				throw new Error(`HTTP ${res.status} from ${httpBase}/json/list`);
-			}
-			const list = await res.json();
+			const list = await fetchJson(httpBase + '/json/list', budget());
 			const page = list.find((t2) => t2.type === 'page' && t2.webSocketDebuggerUrl) ||
 				list.find((t2) => t2.webSocketDebuggerUrl);
 			if (page) {
@@ -572,12 +606,48 @@ export async function resolvePageWs(httpBase, opts = {}) {
 			lastErr = new Error('no inspectable target in /json/list');
 		} catch (e) {
 			lastErr = e;
-		} finally {
-			clearTimeout(t);
+		}
+		// Tried unconditionally, even when /json/list answered 200 with nothing usable: the
+		// one device this branch exists for cannot be re-tested cheaply, so an extra request
+		// is the right price for not depending on a guess about what its inspector serves.
+		try {
+			const pages = await fetchJson(httpBase + '/pagelist.json', budget());
+			if (!Array.isArray(pages)) {
+				throw new Error('/pagelist.json is not an array');
+			}
+			// Legacy entries carry no `type`; skip the inspector's own scaffolding pages.
+			const real = pages.filter((p) => p.id != null);
+			const page = real.find((p) => p.url && !/^(about:|inspector:)/.test(p.url)) || real[0];
+			if (page) {
+				return httpBase.replace(/^http/, 'ws') + '/devtools/page/' + page.id;
+			}
+			legacyErr = new Error('no inspectable target in /pagelist.json');
+		} catch (e) {
+			legacyErr = e;
 		}
 		await sleep(500);
 	}
-	throw new Error(`no inspectable page at ${httpBase}${lastErr ? ' (' + lastErr.message + ')' : ''}`);
+	const why = [lastErr && lastErr.message, legacyErr && legacyErr.message].filter(Boolean).join('; ');
+	throw new Error(`no inspectable page at ${httpBase}${why ? ' (' + why + ')' : ''}`);
+}
+
+/**
+ * @param {string} url
+ * @param {number} timeoutMs
+ * @return {Promise<*>}
+ */
+async function fetchJson(url, timeoutMs) {
+	const ac = new AbortController();
+	const t = setTimeout(() => ac.abort(), timeoutMs);
+	try {
+		const res = await fetch(url, {signal: ac.signal});
+		if (!res.ok) {
+			throw new Error(`HTTP ${res.status} from ${url}`);
+		}
+		return await res.json();
+	} finally {
+		clearTimeout(t);
+	}
 }
 
 /**

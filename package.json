@@ -16,7 +16,8 @@
     "start": "node src/server.js",
     "check:offline": "node test/phase0-offline.mjs",
     "check:browser": "node test/phase2-check.mjs",
-    "check:tv": "node test/phase0-check.mjs && node test/phase1-check.mjs"
+    "check:tv": "node test/phase0-check.mjs && node test/phase1-check.mjs",
+    "check:webos2": "node test/webos2-check.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",

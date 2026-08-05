@@ -9,6 +9,8 @@
 // relaunched first, so a run always starts from a known state. Mechanics mirror the proven
 // webos-install skill (inspect-check.mjs). webOS 3 (Chrome 38) only speaks a CDP subset:
 // key injection via Runtime.evaluate works, Page.captureScreenshot support varies.
+// webOS 2 (WebKit 538, legacy inspector) prints the bare `http://localhost:<port>` form;
+// discovery there goes through /pagelist.json in resolvePageWs, not /json/list.
 
 import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
