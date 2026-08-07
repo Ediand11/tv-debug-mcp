@@ -137,10 +137,19 @@ async function main() {
 	// render its own rows as menu cells (one of them named like a top-level section), so a
 	// text-only match used to select a nested row and report success while the app never left.
 	// Needs `checks.homeSection` in the app profile — the name of the section to come back to.
-	if (target.homeSection) {
-		const back = await s.call('tv_menu', {item: target.homeSection});
+	if (target.homeSection.length) {
+		// Try each candidate: the park runs more than one locale, and "the section is called
+		// something else on this set" is not the regression this check is about.
+		let back = null;
+		for (const name of target.homeSection) {
+			back = await s.call('tv_menu', {item: name});
+			if (back.ok) {
+				break;
+			}
+		}
 		const backOnCatalog = await s.call('tv_wait_for', {selector: target.tile, timeoutMs: 30000});
-		check('tv_menu returns from a section to the catalog', back.ok && backOnCatalog.ok,
+		check(`tv_menu returns from a section to the catalog (${target.homeSection.join(' / ')})`,
+			back.ok && backOnCatalog.ok,
 			back.reason || `presses=${back.presses} scene=${JSON.stringify(back.state?.scenes)}`);
 	} else {
 		console.log(`  SKIP  tv_menu round-trip — add "checks": {"homeSection": "…"} to apps/${target.app}.json`);
