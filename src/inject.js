@@ -249,10 +249,13 @@ export function videoStateJs(sampleGapMs) {
 }
 
 /**
- * How long an unclaimed sample slot survives on the page before it deletes itself. Well past
- * any real sample gap — this is leak insurance, not a deadline.
+ * How long ANYTHING this MCP stashes on `window` survives before deleting itself: an unclaimed
+ * video sample slot, the snapshot's ref map. Well past any real sample gap — this is leak
+ * insurance, not a deadline. One number because it is one reason: a page-side stash the host
+ * failed to claim is a false retainer in a tv_heap diff, and this repo has already chased one.
  */
-const SAMPLE_SLOT_TTL_MS = 60000;
+export const PAGE_SLOT_TTL_MS = 60000;
+const SAMPLE_SLOT_TTL_MS = PAGE_SLOT_TTL_MS;
 
 /**
  * Page-side property name holding one in-flight sample. Keyed per call: the two-call sequence

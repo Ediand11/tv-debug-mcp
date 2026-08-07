@@ -95,6 +95,34 @@ async function main() {
 		console.log(`  SKIP  named targets — add an "elements" block to apps/${target.app}.json`);
 	}
 
+	console.log('\n--- snapshot ---');
+	const layout = await s.call('tv_snapshot', {});
+	check('tv_snapshot derives rows on a real TV', layout.ok && (layout.rows || []).length > 0,
+		layout.warning || layout.__error || `tier=${layout.tier}`);
+	console.log(`        tier=${layout.tier} rows=${layout.rows?.length} items=${layout.counts?.items} bytes=${layout.bytes}`);
+	check('and the answer stays small enough to plan with', layout.bytes > 0 && layout.bytes < 6000,
+		`bytes=${layout.bytes}`);
+	// Take the move `neighbours` claims is one press away — that is exactly what it is for, and
+	// picking an arbitrary item of the row instead is how you land on a node a virtualised list
+	// has already recycled (a real TV app does that between two calls).
+	const nb = layout.neighbours || {};
+	const dir = ['RIGHT', 'DOWN', 'LEFT', 'UP'].find((d) => nb[d]);
+	if (dir) {
+		const byRef = await s.call('tv_goto', {direction: dir, ref: nb[dir], maxSteps: 4});
+		check(`tv_goto {ref} lands on the element neighbours.${dir} named`, byRef.ok && byRef.presses <= 2,
+			byRef.reason || `${byRef.presses} presses`);
+		// The guarantee that makes refs safe at all: a ref from a previous generation is
+		// refused, never re-resolved onto whatever now sits in that slot.
+		await s.call('tv_snapshot', {});
+		const stale = await s.call('tv_goto', {direction: dir, ref: nb[dir], maxSteps: 3});
+		check('a ref from the previous snapshot is refused, not re-resolved',
+			stale.ok === false && stale.presses === 0 && /snapshot/.test(String(stale.reason)),
+			String(stale.reason).slice(0, 120));
+	} else {
+		console.log('  SKIP  tv_goto {ref} — the snapshot found no neighbour of the focus');
+	}
+	await s.call('tv_snapshot', {release: true});
+
 	console.log('\n--- menu ---');
 	const opened = await s.call('tv_menu', {select: false});
 	check('tv_menu opens the sidebar', opened.ok && (opened.items || []).length > 0,

@@ -216,6 +216,72 @@ async function main() {
 		goneWithText.ok === false && goneWithText.resolvedFrom?.withText === 'Settings',
 		JSON.stringify(goneWithText.resolvedFrom));
 
+	console.log('\n--- tv_snapshot: one round-trip instead of press-look-press-look ---');
+	// Back to the first tile, so the assertions below have a known focus.
+	await s.call('tv_goto', {device: 'pc-fixture', direction: 'LEFT', element: 'catalog.tile', text: 'котиков', maxSteps: 8});
+	const layout = await s.call('tv_snapshot', {device: 'pc-fixture'});
+	check('tv_snapshot derives rows from the profile', layout.ok && layout.tier === 'profile',
+		JSON.stringify({tier: layout.tier, warning: layout.warning}));
+	const tileRow = (layout.rows || []).find((r) => r.items.some((it) => /котик/.test(it.t)));
+	const menuRow = (layout.rows || []).find((r) => r.items.some((it) => /Settings/.test(it.t)));
+	check('the catalog row carries all six tiles', tileRow?.items?.length === 6,
+		JSON.stringify(tileRow?.items?.map((x) => x.t)));
+	check('the menu row carries all four sections', menuRow?.items?.length === 4,
+		JSON.stringify(menuRow?.items?.map((x) => x.t)));
+	check('the focused item is marked, and the focus carries its own ref',
+		!!layout.focus?.ref && tileRow?.items?.[0]?.focused === true && tileRow.items[0].ref === layout.focus.ref,
+		JSON.stringify({focusRef: layout.focus?.ref, first: tileRow?.items?.[0]}));
+	// Layout geometry, not the app's navigation graph — but it does have to be right.
+	check('neighbours names the tile to the RIGHT of the focus',
+		layout.neighbours?.RIGHT === tileRow?.items?.[1]?.ref,
+		JSON.stringify({nb: layout.neighbours, second: tileRow?.items?.[1]}));
+	// A hard, checkable budget: the whole point is that this is cheaper than probing.
+	check('the answer stays inside the context budget (bytes < 2000)', layout.bytes > 0 && layout.bytes < 2000,
+		`bytes=${layout.bytes}`);
+	check('and bytes really is the size of this answer',
+		Math.abs(JSON.stringify(layout).length - layout.bytes) <= 2,
+		`${JSON.stringify(layout).length} vs ${layout.bytes}`);
+
+	const fourth = tileRow.items[3];
+	const byRef = await s.call('tv_goto', {device: 'pc-fixture', direction: 'RIGHT', ref: fourth.ref, maxSteps: 6});
+	check('tv_goto {ref} lands on the exact element the snapshot named',
+		byRef.ok && byRef.presses === 3, byRef.reason || `${byRef.presses} presses`);
+
+	const staleRef = fourth.ref;
+	const layout2 = await s.call('tv_snapshot', {device: 'pc-fixture'});
+	check('a second snapshot is a new generation with fresh refs',
+		layout2.g === layout.g + 1 && !JSON.stringify(layout2.rows).includes(`"${staleRef}"`),
+		JSON.stringify({g1: layout.g, g2: layout2.g}));
+	const stale = await s.call('tv_goto', {device: 'pc-fixture', direction: 'RIGHT', ref: staleRef, maxSteps: 4});
+	check('a ref from the previous snapshot is refused, not re-resolved',
+		stale.ok === false && stale.presses === 0 && /earlier snapshot/.test(String(stale.reason)),
+		String(stale.reason).slice(0, 140));
+
+	const focusOnly = await s.call('tv_snapshot', {device: 'pc-fixture', detail: 'focus'});
+	check('detail:"focus" is the cheap read: no rows, still a ref',
+		focusOnly.ok && focusOnly.rows.length === 0 && !!focusOnly.focus?.ref && focusOnly.bytes < layout.bytes,
+		`bytes ${focusOnly.bytes} vs ${layout.bytes}`);
+	const capped = await s.call('tv_snapshot', {device: 'pc-fixture', maxItemsPerRow: 3});
+	const cappedTiles = (capped.rows || []).find((r) => r.items.some((it) => /котик|горах|горы|машин/.test(it.t)));
+	check('maxItemsPerRow caps the row and counts what it dropped',
+		cappedTiles?.items?.length === 3 && cappedTiles?.more === 3,
+		JSON.stringify({n: cappedTiles?.items?.length, more: cappedTiles?.more}));
+
+	const released = await s.call('tv_snapshot', {device: 'pc-fixture', release: true});
+	check('release drops the ref store on the page', released.released === true, JSON.stringify(released));
+	const afterRelease = await s.call('tv_goto', {device: 'pc-fixture', direction: 'RIGHT', ref: 'e1', maxSteps: 2});
+	check('and a ref afterwards is refused with an actionable reason',
+		afterRelease.ok === false && /no snapshot on the page/.test(String(afterRelease.reason)),
+		String(afterRelease.reason).slice(0, 120));
+
+	const inSeq = await s.call('tv_sequence', {
+		device: 'pc-fixture',
+		steps: [{snapshot: {detail: 'focus'}}]
+	});
+	check('a sequence can take a snapshot at a checkpoint',
+		inSeq.ok && !!inSeq.steps?.[0]?.result?.focus?.ref,
+		JSON.stringify(inSeq.steps?.[0]?.result?.focus));
+
 	const menu = await s.call('tv_menu', {device: 'pc-fixture', item: 'Settings'});
 	check('tv_menu selects a section', menu.ok, menu.reason || JSON.stringify(menu.items));
 

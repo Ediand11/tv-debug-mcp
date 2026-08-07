@@ -38,6 +38,8 @@ import {CdpSession} from '../src/cdp.js';
 import {selectRequests, toListEntry, buildCurl, buildHar, capBody, compileUrlPattern} from '../src/network.js';
 import {pollRequests, conditionJs} from '../src/wait.js';
 import {loadAppProfile, resolveElement, resolveScene, resolveTarget, resolveCondition} from '../src/appprofile.js';
+import {snapshotJs, focusIsRefJs, snapshotReleaseJs} from '../src/snapshot.js';
+import {stateJs, focusSignatureJs, focusMatchesJs} from '../src/state.js';
 import {videoStateJs, videoSampleStartJs, videoSampleFinishJs} from '../src/inject.js';
 
 /**
@@ -895,6 +897,97 @@ function namedTargetChecks() {
 	check('and it really filters on the text', js.includes('WITH_TEXT') && js.includes('"settings"'));
 }
 
+/**
+ * 14: the snapshot builders. Layout derivation needs a real DOM and lives in phase2; what is
+ * testable here is what MUST hold on the oldest engine in the park — the generated JS is ES5
+ * and parses — plus the ref lifecycle, which is the part that can silently answer with the
+ * WRONG element if it is got wrong.
+ *
+ * ⚠️ Build the guard on the FIXTURE profile, never on a product one: `\bclass\b` matches
+ * inside a selector like `[class*=popup]` and reports a false ES6 hit.
+ */
+function snapshotChecks() {
+	console.log('\n--- snapshot builders ---');
+	const fx = loadAppProfile('fixture');
+	for (const [name, js] of [
+		['snapshotJs(rows)', snapshotJs(fx, {detail: 'rows', ttlMs: 60000})],
+		['snapshotJs(full)', snapshotJs(fx, {detail: 'full', maxRows: 3, maxItemsPerRow: 4, ttlMs: 60000})],
+		['focusIsRefJs', focusIsRefJs(fx, 'e12')],
+		['snapshotReleaseJs', snapshotReleaseJs()],
+		['stateJs', stateJs(fx)],
+		['focusSignatureJs', focusSignatureJs(fx)],
+		['focusMatchesJs', focusMatchesJs(fx, {text: 'x', selector: '.demo-tile'})]
+	]) {
+		check(`${name} is ES5`, !ES6_IN_PAGE_JS.test(js), (js.match(ES6_IN_PAGE_JS) || [])[0]);
+		try {
+			new Function(js);
+			check(`${name} parses`, true);
+		} catch (e) {
+			check(`${name} parses`, false, e.message);
+		}
+	}
+
+	// A DOM small enough to hand-build, big enough for focusLeaf/focusInfo to run.
+	const makeSandbox = (snapStore) => {
+		const leaf = {
+			nodeType: 1, tagName: 'DIV', className: 'demo-tile _active', innerText: 'Tile',
+			offsetHeight: 10, children: [],
+			querySelector: () => null,
+			getAttribute: () => null,
+			getBoundingClientRect: () => ({left: 0, top: 0, width: 10, height: 10})
+		};
+		leaf.parentNode = {nodeType: 1, tagName: 'DIV', className: 'demo-list', children: [leaf], parentNode: null};
+		const sandbox = {
+			console, JSON, Math, setTimeout, clearTimeout, parseInt, isFinite, String, Number,
+			RegExp, getComputedStyle: () => ({display: 'block', visibility: 'visible'}),
+			document: {querySelectorAll: () => [leaf], body: {innerText: ''}},
+			location: {href: 'http://fixture/'}
+		};
+		sandbox.window = sandbox;
+		if (snapStore) {
+			sandbox.__tvDebugSnap = snapStore;
+			sandbox.window.__tvDebugSnap = snapStore;
+		}
+		createContext(sandbox);
+		return {sandbox, leaf};
+	};
+
+	const noStore = makeSandbox(null);
+	const r0 = runInContext(focusIsRefJs(fx, 'e12'), noStore.sandbox);
+	check('a ref with no snapshot on the page is refused, not resolved',
+		r0.ok === false && r0.refMissing === true && /take a fresh tv_snapshot/.test(r0.reason), JSON.stringify(r0));
+
+	const live = makeSandbox(null);
+	const store = {g: 3, min: 41, next: 45, refs: {e41: live.leaf}};
+	live.sandbox.window.__tvDebugSnap = store;
+	const r1 = runInContext(focusIsRefJs(fx, 'e41'), live.sandbox);
+	check('a live ref matches the focused element by identity', r1.ok === true, JSON.stringify(r1));
+
+	// The whole reason ref numbers are monotonic across snapshots: e12 from generation 2 must
+	// never land on generation 3's twelfth element.
+	const r2 = runInContext(focusIsRefJs(fx, 'e12'), live.sandbox);
+	check('a ref from an earlier snapshot is refused by number, not silently re-resolved',
+		r2.ok === false && r2.refMissing === true && /earlier snapshot/.test(r2.reason), JSON.stringify(r2));
+	const r3 = runInContext(focusIsRefJs(fx, 'e99'), live.sandbox);
+	check('a ref that was never handed out says which range this snapshot covers',
+		r3.ok === false && /not in snapshot #3/.test(r3.reason), JSON.stringify(r3));
+
+	const detached = makeSandbox(null);
+	const gone = {...detached.leaf, parentNode: null};
+	detached.sandbox.window.__tvDebugSnap = {g: 1, min: 1, next: 3, refs: {e1: gone}};
+	const r4 = runInContext(focusIsRefJs(fx, 'e1'), detached.sandbox);
+	check('a ref whose element left the DOM is refused',
+		r4.ok === false && /left the DOM/.test(r4.reason), JSON.stringify(r4));
+
+	const rel = makeSandbox(null);
+	rel.sandbox.window.__tvDebugSnap = {g: 5, min: 1, next: 9, refs: {}, timer: 0};
+	const r5 = runInContext(snapshotReleaseJs(), rel.sandbox);
+	check('release drops the store and says which generation went',
+		r5.released === true && r5.g === 5 && !rel.sandbox.window.__tvDebugSnap, JSON.stringify(r5));
+	const r6 = runInContext(snapshotReleaseJs(), rel.sandbox);
+	check('releasing twice is honest about there being nothing to release', r6.released === false);
+}
+
 async function main() {
 	profileChecks();
 	metricsChecks();
@@ -904,6 +997,7 @@ async function main() {
 	await legacyEvaluateChecks();
 	avplayProbeChecks();
 	namedTargetChecks();
+	snapshotChecks();
 
 	console.log('\n--- config and failure isolation ---');
 	// A PATH with node but no `sdb`/`tizen`, so tool calls have to fail gracefully.

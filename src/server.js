@@ -2,8 +2,8 @@
 // tv-debug-mcp — MCP server for semi-manual QA runs on real Smart TVs over CDP.
 //
 // Tools: tv_devices, tv_install, tv_launch, tv_press, tv_screenshot, tv_console, tv_network,
-// tv_video_state, tv_state, tv_wait_for, tv_goto, tv_menu, tv_sequence, tv_evaluate,
-// tv_profile, tv_heap.
+// tv_video_state, tv_state, tv_snapshot, tv_wait_for, tv_goto, tv_menu, tv_sequence,
+// tv_evaluate, tv_profile, tv_heap.
 // The park is described in devices.json (or TV_DEBUG_CONFIG) and can also contain a `pc`
 // device — the same case run against a local Chrome. One persistent CDP session per device
 // is kept across calls so console/exceptions accumulate from launch. All progress goes to
@@ -164,6 +164,23 @@ const TOOLS = [
 		inputSchema: {type: 'object', properties: {...DEVICE_PROP}}
 	},
 	{
+		name: 'tv_snapshot',
+		description: 'One structural read of the screen: the rows around the focus, their items, and where the focus sits among them — so the next three to five moves are arithmetic instead of press-look-press-look. Every item carries a `ref` (e1, e2, …) that tv_goto takes directly, and `neighbours` names the nearest ref in each direction. IMPORTANT: neighbours is LAYOUT GEOMETRY (nearest centre among the collected elements), not the app\'s navigation graph — it proves a move is one press away, it does not know what the app does on that press. Rows come either from the app profile\'s "snapshot" block (named, precise) or, with no app knowledge at all, from the focused element\'s siblings; the answer says which in `tier`, and returns rows:[] with a warning rather than inventing structure. Off-screen rows and items are dropped (counted in `more`/`moreRows`), text is cut to 32 characters, and `bytes` reports what this answer cost you. Refs expire: they are dropped by the next snapshot, by a navigation, and by a 60s TTL — a stale one is REFUSED, never silently re-resolved.',
+		inputSchema: {
+			type: 'object',
+			properties: {
+				...DEVICE_PROP,
+				detail: {
+					type: 'string', enum: ['focus', 'rows', 'full'],
+					description: 'focus: just the focused element, scenes and popups (cheapest). rows (default): the visible rows around the focus. full: no viewport filter — everything the selectors match, still capped.'
+				},
+				maxRows: {type: 'integer', minimum: 1, maximum: 40, description: 'Rows to keep, centred on the focused row (default 6, or the profile\'s snapshot.maxRows).'},
+				maxItemsPerRow: {type: 'integer', minimum: 1, maximum: 60, description: 'Items per row, centred on the focused item (default 12, or the profile\'s snapshot.maxItemsPerRow).'},
+				release: {type: 'boolean', description: 'Drop the ref store on the page now instead of waiting for the TTL. Returns nothing else.'}
+			}
+		}
+	},
+	{
 		name: 'tv_wait_for',
 		description: 'Wait until a condition holds, instead of sleeping. Give exactly one condition. stableMs additionally requires it to keep holding, which avoids acting on a half-rendered frame. Returns the elapsed time and the final state. element / elementGone / sceneName take a NAME from the app profile registry instead of raw CSS; the answer echoes resolvedFrom so the report names the selector that was really checked, and an unknown name fails with the list of known ones.',
 		inputSchema: {
@@ -198,6 +215,7 @@ const TOOLS = [
 			properties: {
 				...DEVICE_PROP,
 				direction: {type: 'string', enum: ['UP', 'DOWN', 'LEFT', 'RIGHT'], description: 'Direction to travel in.'},
+				ref: {type: 'string', description: 'Stop on the exact element behind this tv_snapshot ref (e1, e2, …). Checked by identity, which is stronger than a text match — duplicate titles in a catalog are normal. A stale ref is refused with a reason, never re-resolved.'},
 				element: {type: 'string', description: 'Stop on the element with this NAME from the app profile\'s "elements" registry. An explicit text/selector/testid given alongside narrows it further.'},
 				text: {type: 'string', description: "Stop when the focused element's text contains this (case-insensitive)."},
 				selector: {type: 'string', description: 'Stop when the focused element matches this CSS selector.'},
@@ -432,6 +450,13 @@ async function handleCall(name, args) {
 			const s = sessionFor(args.device);
 			return textResult(await s.state());
 		}
+		case 'tv_snapshot': {
+			const s = sessionFor(args.device);
+			return textResult(await s.snapshot({
+				detail: args.detail, maxRows: args.maxRows, maxItemsPerRow: args.maxItemsPerRow,
+				release: !!args.release
+			}));
+		}
 		case 'tv_wait_for': {
 			const s = sessionFor(args.device);
 			const condition = pickCondition(args);
@@ -442,7 +467,7 @@ async function handleCall(name, args) {
 		case 'tv_goto': {
 			const s = sessionFor(args.device);
 			return textResult(await s.goto({
-				direction: args.direction, element: args.element,
+				direction: args.direction, element: args.element, ref: args.ref,
 				text: args.text, selector: args.selector, testid: args.testid,
 				select: args.select, maxSteps: args.maxSteps, deadlineMs: args.deadlineMs
 			}));

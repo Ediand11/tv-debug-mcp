@@ -115,6 +115,15 @@ export class PcAdapter {
 			'--no-first-run',
 			'--no-default-browser-check',
 			'--disable-features=Translate',
+			// Mandatory once more than one pc device is alive: Chrome throttles timers in
+			// windows it considers backgrounded or occluded, and every window but the newest
+			// is. The app under test is full of timers — the fixture's long-press contract is
+			// a setTimeout — so without these a case silently changes behaviour depending on
+			// which browser window happens to be on top. The TV has no such optimisation, so
+			// the throttled run is the WRONG experiment, not a stricter one.
+			'--disable-background-timer-throttling',
+			'--disable-backgrounding-occluded-windows',
+			'--disable-renderer-backgrounding',
 			'--window-size=1280,720',
 			...this._extraArgs,
 			'about:blank'

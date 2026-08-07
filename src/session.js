@@ -19,7 +19,8 @@ import {SyntheticInput} from './input/synthetic.js';
 import {TrustedInput} from './input/trusted.js';
 import {CdpSession, resolvePageWs, sleep, isUnsupportedMethod, MAX_POSTDATA_BYTES} from './cdp.js';
 import {resolveKey} from './keymaps.js';
-import {focusSnapshotJs, videoStateJs, videoSampleStartJs, videoSampleFinishJs} from './inject.js';
+import {focusSnapshotJs, videoStateJs, videoSampleStartJs, videoSampleFinishJs, PAGE_SLOT_TTL_MS} from './inject.js';
+import {snapshotJs, focusIsRefJs, snapshotReleaseJs} from './snapshot.js';
 import {freePort} from './ports.js';
 import {loadAppProfile, requireMenu, resolveTarget, resolveCondition} from './appprofile.js';
 import {stateJs, focusSignatureJs, focusMatchesJs, menuItemsJs} from './state.js';
@@ -407,6 +408,42 @@ export class DeviceSession {
 	}
 
 	/** Compact focus signature — used to detect movement and loops. */
+	/**
+	 * A structural read of the screen around the focus: the rows, their items, and where the
+	 * focus sits among them. One call instead of press-look-press-look.
+	 * @param {{detail?: 'focus'|'rows'|'full', maxRows?: number, maxItemsPerRow?: number,
+	 *          release?: boolean}} [opts]
+	 */
+	async snapshot(opts = {}) {
+		if (opts.release) {
+			const res = await this.evaluate(snapshotReleaseJs(), true).catch((e) => ({released: false, reason: e.message}));
+			return {ok: true, ...res};
+		}
+		const out = await this.evaluate(snapshotJs(this.profile, {...opts, ttlMs: PAGE_SLOT_TTL_MS}), true);
+		if (!out || typeof out !== 'object') {
+			return {ok: false, reason: 'the page returned no snapshot', raw: out};
+		}
+		out.ok = true;
+		if (!out.rows || !out.rows.length) {
+			// Never invent structure: an agent WILL navigate by a made-up row.
+			out.warning =
+				'no rows could be derived — add a "snapshot" block (row/item selectors) or a "tile" ' +
+				`selector to apps/${this.profile.id}.json, or use detail:"focus"`;
+		}
+		// The size of this very answer, so the agent can see what the call costs it and drop to
+		// detail:"focus" when the rows are not what the next move needs.
+		let bytes = JSON.stringify(out).length;
+		for (let i = 0; i < 3; i++) {
+			const next = JSON.stringify({...out, bytes}).length;
+			if (next === bytes) {
+				break;
+			}
+			bytes = next;
+		}
+		out.bytes = bytes;
+		return out;
+	}
+
 	async focusSignature() {
 		const cdp = await this._cdp();
 		return cdp.evaluate(focusSignatureJs(this.profile));
@@ -1236,7 +1273,7 @@ export class DeviceSession {
 	 */
 	async goto(opts) {
 		const {target, resolvedFrom} = resolveTarget(this.profile, opts);
-		const res = await this._gotoTarget(target, opts);
+		const res = await this._gotoTarget({...target, ref: opts.ref}, opts);
 		if (resolvedFrom) {
 			// Echo what the name actually became: a red case has to name the selector it
 			// really checked, otherwise the indirection is a debugging tax.
@@ -1261,16 +1298,25 @@ export class DeviceSession {
 		if (!direction) {
 			throw new Error('tv_goto needs a direction (UP / DOWN / LEFT / RIGHT)');
 		}
-		if (target.text == null && target.selector == null && target.testid == null) {
-			throw new Error('tv_goto needs a target: element, text, selector or testid');
+		if (target.ref == null && target.text == null && target.selector == null && target.testid == null) {
+			throw new Error('tv_goto needs a target: ref, element, text, selector or testid');
 		}
 		const maxSteps = Math.min(200, Math.max(1, Math.floor(opts.maxSteps || 30)));
 		const deadline = Date.now() + (opts.deadlineMs || 45000);
-		const matchJs = focusMatchesJs(this.profile, target);
+		// A ref is checked by IDENTITY (focusLeaf() === the stashed element), which is strictly
+		// stronger than matching text: duplicate titles in a catalog are normal, and a text
+		// match silently stops on the wrong tile.
+		const matchJs = target.ref != null
+			? focusIsRefJs(this.profile, target.ref)
+			: focusMatchesJs(this.profile, target);
 		const steps = [];
 		const seen = new Set();
 
 		let match = await this.evaluate(matchJs, true);
+		// A stale ref must fail here, not after thirty presses in the wrong direction.
+		if (match && match.refMissing) {
+			return {ok: false, reason: match.reason, presses: 0, steps};
+		}
 		if (match.ok) {
 			return {ok: true, presses: 0, reason: 'already on target', focus: match.detail, steps};
 		}
@@ -1286,6 +1332,10 @@ export class DeviceSession {
 			match = await this.evaluate(matchJs, true);
 			steps.push({press: direction, focus: match.detail ? match.detail.text : null, matched: !!match.ok});
 
+			if (match.refMissing) {
+				// The page navigated under us and took the ref store with it.
+				return {ok: false, reason: match.reason, presses: i + 1, steps};
+			}
 			if (match.ok) {
 				return {ok: true, presses: i + 1, steps, focus: match.detail};
 			}
@@ -1488,6 +1538,12 @@ export class DeviceSession {
 		if (step.state) {
 			return {ok: true, state: await this.state()};
 		}
+		if (step.snapshot !== undefined) {
+			// So a case can take the structural read at a checkpoint, under the operation lock,
+			// instead of racing a separate tv_snapshot call against its own steps.
+			const o = step.snapshot && typeof step.snapshot === 'object' ? step.snapshot : {};
+			return this.snapshot(o);
+		}
 		// Profiling has to be expressible as steps: tv_sequence holds the operation lock, so a
 		// separate tv_profile call cannot slip in between two steps of the scenario it measures.
 		if (step.profileStart !== undefined) {
@@ -1505,7 +1561,7 @@ export class DeviceSession {
 		throw new Error(
 			`unknown step ${JSON.stringify(step).slice(0, 120)} — expected one of: ` +
 			'launch, press, longpress, goto, menu, wait, expect, expectRequest, networkMark, eval, ' +
-			'sleep, videoState, state, profileStart, profileStop, metrics'
+			'sleep, videoState, state, snapshot, profileStart, profileStop, metrics'
 		);
 	}
 

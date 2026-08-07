@@ -16,10 +16,18 @@ export function stateHelpersJs(profile) {
 	const focusSel = profile.focus.join(', ');
 	const sceneSel = profile.scene.container;
 	const strip = profile.scene.strip || '';
+	const popupSel = profile.popup.join(', ');
 	return `
 		var FOCUS_SEL = ${JSON.stringify(focusSel)};
 		var SCENE_SEL = ${JSON.stringify(sceneSel)};
 		var STRIP = ${JSON.stringify(strip)};
+		var POPUP_SEL = ${JSON.stringify(popupSel)};
+		// Anything this MCP itself puts on the page (the recorder's REC badge) is marked with
+		// a reserved __tvdbg prefix and must never show up as app structure — it would land in
+		// popup scans, in snapshot rows, and in the recorder's own change detection.
+		function isOurs(el){
+			return !!(el && el.className && String(el.className).indexOf('__tvdbg') >= 0);
+		}
 		function matchesSel(el, sel){
 			if (!el || el.nodeType !== 1) { return false; }
 			var fn = el.matches || el.webkitMatchesSelector || el.msMatchesSelector;
@@ -101,6 +109,40 @@ export function stateHelpersJs(profile) {
 			}
 			return out;
 		}
+		function popupList(max){
+			var out = [];
+			var cap = max || 5;
+			var plist = document.querySelectorAll(POPUP_SEL);
+			for (var i = 0; i < plist.length && out.length < cap; i++) {
+				if (isOurs(plist[i]) || !visible(plist[i])) { continue; }
+				out.push({className: cls(plist[i]).slice(0, 90), text: txt(plist[i], 120)});
+			}
+			return out;
+		}
+		function rectOf(el){
+			if (!el || !el.getBoundingClientRect) { return null; }
+			var r;
+			try { r = el.getBoundingClientRect(); } catch (e) { return null; }
+			return {x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height)};
+		}
+		// On a 40-row catalog this is the single filter that decides whether the answer costs
+		// 1.5 KB or 40 KB: what is off-screen is not what the next press is about.
+		function inViewport(el, pad){
+			var r = rectOf(el);
+			if (!r || r.w <= 0 || r.h <= 0) { return false; }
+			var vw = window.innerWidth || document.documentElement.clientWidth || 0;
+			var vh = window.innerHeight || document.documentElement.clientHeight || 0;
+			var p = pad || 0;
+			return r.x < vw + p && r.y < vh + p && (r.x + r.w) > -p && (r.y + r.h) > -p;
+		}
+		function containsEl(root, el){
+			var n = el;
+			while (n) {
+				if (n === root) { return true; }
+				n = n.parentNode;
+			}
+			return false;
+		}
 	`;
 }
 
@@ -110,15 +152,10 @@ export function stateHelpersJs(profile) {
  * @return {string}
  */
 export function stateJs(profile) {
-	const popupSel = profile.popup.join(', ');
 	const menu = profile.menu;
 	return `(function(){
 		${stateHelpersJs(profile)}
-		var popups = [];
-		var plist = document.querySelectorAll(${JSON.stringify(popupSel)});
-		for (var i = 0; i < plist.length && popups.length < 5; i++) {
-			if (visible(plist[i])) { popups.push({className: cls(plist[i]).slice(0, 90), text: txt(plist[i], 120)}); }
-		}
+		var popups = popupList(5);
 		var f = focusInfo();
 		var inMenu = false;
 		${menu ? `
