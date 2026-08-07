@@ -146,3 +146,40 @@ export function resolveKeyCode(platform, name) {
 export function knownKeys(platform) {
 	return Object.keys(KEYMAPS[platform] || KEYMAPS.tizen);
 }
+
+/**
+ * keyCode -> logical name, for reading a recording back. Not a bijection, and the collisions
+ * are real platform facts, not bugs to paper over:
+ *   * Tizen `MENU` and `INFO` are both 457 (KEY_MENU == KEY_INFO upstream);
+ *   * webOS `PAGE_UP`/`CHANNEL_UP` are both 33, `PAGE_DOWN`/`CHANNEL_DOWN` both 34.
+ * The map is deterministic: the FIRST name in declaration order wins, so a recorded 457 on
+ * Tizen always reads back as MENU and a recorded 33 on webOS always as PAGE_UP. Replaying the
+ * winner produces the identical event, because the collision is in the code, not the meaning.
+ * @param {string} platform
+ * @return {Map<number, string>}
+ */
+export function reverseKeyMap(platform) {
+	const map = KEYMAPS[platform] || KEYMAPS.tizen;
+	const out = new Map();
+	for (const name of Object.keys(map)) {
+		if (!out.has(map[name].code)) {
+			out.set(map[name].code, name);
+		}
+	}
+	return out;
+}
+
+/**
+ * @param {string} platform
+ * @param {number} code
+ * @return {string|number} the logical name, or the raw code when the platform has no name for
+ *   it — `resolveKey` accepts a number, so an unknown key still replays.
+ */
+export function keyNameFor(platform, code) {
+	const n = Number(code);
+	const found = reverseKeyMap(platform).get(n);
+	return found !== undefined ? found : n;
+}
+
+/** Keys whose physical auto-repeat means "keep moving", not "hold". */
+export const DPAD_NAMES = ['LEFT', 'RIGHT', 'UP', 'DOWN', 'PAGE_UP', 'PAGE_DOWN', 'CHANNEL_UP', 'CHANNEL_DOWN'];

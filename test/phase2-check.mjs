@@ -570,6 +570,84 @@ async function main() {
 		profSeq.steps?.[2]?.result?.path === seqProfPath && !!profSeq.steps?.[2]?.result?.summary,
 		JSON.stringify(profSeq.steps?.[2]?.result?.summary?.totalMs));
 
+	console.log('\n--- tv_record: record with keys, compile, replay ---');
+	// Run on the PARITY device (inputMode: synthetic) on purpose: those presses are dispatched
+	// into `document`, exactly like a TV's, so a capture listener on `window` seeing them is
+	// the same experiment the remote will be. The zero-TV replay test only exists because of it.
+	await s.call('tv_launch', {device: 'pc-parity', relaunch: true});
+	const recStart = await s.call('tv_record', {device: 'pc-parity', action: 'start', title: 'phase2 recorded case'});
+	check('tv_record starts and says what it installed', recStart.ok === true && recStart.recording === true,
+		JSON.stringify(recStart));
+	const badgeUp = await s.call('tv_evaluate', {device: 'pc-parity', expression: 'document.querySelectorAll(".__tvdbg-rec").length'});
+	check('the REC badge is on screen while recording', badgeUp.value === 1, JSON.stringify(badgeUp));
+	const badgeInvisible = await s.call('tv_snapshot', {device: 'pc-parity'});
+	check('and the badge never shows up as app structure in a snapshot',
+		!JSON.stringify(badgeInvisible.rows || []).includes('REC') &&
+		!JSON.stringify(badgeInvisible.popups || []).includes('tvdbg'),
+		JSON.stringify(badgeInvisible.popups));
+
+	await s.call('tv_press', {device: 'pc-parity', key: 'RIGHT', repeat: 3, intervalMs: 200});
+	await sleep(700);
+	const midStatus = await s.call('tv_record', {device: 'pc-parity', action: 'status'});
+	check('status reports the keys that really reached the page', midStatus.keysSeen >= 3,
+		JSON.stringify({keys: midStatus.keysSeen, connected: midStatus.connected}));
+
+	await s.call('tv_press', {device: 'pc-parity', key: 'ENTER', durationMs: 1200});
+	await s.call('tv_wait_for', {device: 'pc-parity', selector: '.demo-popup', timeoutMs: 5000});
+	await s.call('tv_press', {device: 'pc-parity', key: 'BACK'});
+	await sleep(900);
+
+	const recPath = join(dir, 'recorded-case.md');
+	const rec = await s.call('tv_record', {device: 'pc-parity', action: 'stop', title: 'phase2 recorded case', path: recPath});
+	check('tv_record stop compiles the recording', rec.ok === true, rec.reason || rec.__error);
+	const recSteps = rec.steps || [];
+	check('three RIGHT presses that all moved the focus became ONE goto, not three presses',
+		recSteps.filter((x) => x.goto).length === 1 &&
+		recSteps.filter((x) => x.press === 'RIGHT').length === 0,
+		JSON.stringify(recSteps));
+	const recLong = recSteps.find((x) => x.longpress);
+	check('the 1200ms hold came back as a longpress with the right duration',
+		recLong?.longpress === 'ENTER' && Math.abs(recLong.durationMs - 1200) <= 250,
+		JSON.stringify(recLong));
+	check('the popup opening and closing became expect steps',
+		recSteps.some((x) => x.expect?.selector === '.demo-popup') &&
+		recSteps.some((x) => x.expect?.selectorGone === '.demo-popup'),
+		JSON.stringify(recSteps.filter((x) => x.expect)));
+	check('no sleep step is ever emitted', JSON.stringify(recSteps).indexOf('sleep') < 0);
+	check('the case is on disk', rec.written === true && existsSync(rec.path), JSON.stringify({w: rec.written, p: rec.path}));
+	const md = readFileSync(rec.path, 'utf8');
+	const fence = /```json\n([\s\S]*?)\n```/.exec(md);
+	let roundTripped = null;
+	try {
+		roundTripped = JSON.parse(fence[1]);
+	} catch (e) {
+		roundTripped = e.message;
+	}
+	check('and its JSON block round-trips back to the same steps',
+		JSON.stringify(roundTripped) === JSON.stringify(recSteps), typeof roundTripped === 'string' ? roundTripped : 'mismatch');
+
+	// The reckoning: the recording has to actually run.
+	const replay = await s.call('tv_sequence', {device: 'pc-parity', steps: recSteps});
+	check('the recorded case REPLAYS green through tv_sequence', replay.ok === true,
+		JSON.stringify((replay.steps || []).map((x) => `${x.step}=${x.ok}`)));
+
+	// A name collision is handed back, never resolved behind the human's back.
+	await s.call('tv_record', {device: 'pc-parity', action: 'start'});
+	await s.call('tv_press', {device: 'pc-parity', key: 'RIGHT'});
+	await sleep(700);
+	const second = await s.call('tv_record', {device: 'pc-parity', action: 'stop', title: 'phase2 recorded case', path: recPath});
+	check('a second recording refuses to overwrite and says what it collided with',
+		second.written === false && second.conflict === recPath && (second.steps || []).length > 0,
+		JSON.stringify({written: second.written, conflict: second.conflict}));
+	const forced = await s.call('tv_record', {device: 'pc-parity', action: 'write', path: recPath, overwrite: true});
+	check('action:"write" with overwrite finishes the job from the held compilation',
+		forced.written === true && forced.path === recPath, JSON.stringify(forced));
+
+	const badgeGone = await s.call('tv_evaluate', {device: 'pc-parity', expression: 'document.querySelectorAll(".__tvdbg-rec").length'});
+	check('the REC badge is gone after stop', badgeGone.value === 0, JSON.stringify(badgeGone));
+	const idle = await s.call('tv_record', {device: 'pc-parity', action: 'status'});
+	check('status after stop says there is no recording', idle.recording === false, JSON.stringify(idle));
+
 	console.log('\n--- parity run: TV-identical synthetic input ---');
 	await s.call('tv_launch', {device: 'pc-parity'});
 	await s.call('tv_wait_for', {device: 'pc-parity', selector: '.demo-tile', timeoutMs: 20000, stableMs: 300});

@@ -9,8 +9,9 @@
 //                    it. It must NOT be the lifecycle lock, or an auto-reconnect inside a
 //                    sequence step would deadlock against the sequence itself.
 
-import {createWriteStream, unlinkSync, writeFileSync} from 'node:fs';
-import {resolve} from 'node:path';
+import {createWriteStream, unlinkSync, writeFileSync, existsSync, mkdirSync} from 'node:fs';
+import {resolve, join, dirname} from 'node:path';
+import {fileURLToPath} from 'node:url';
 
 import {TizenAdapter} from './adapters/tizen.js';
 import {WebosAdapter} from './adapters/webos.js';
@@ -21,6 +22,8 @@ import {CdpSession, resolvePageWs, sleep, isUnsupportedMethod, MAX_POSTDATA_BYTE
 import {resolveKey} from './keymaps.js';
 import {focusSnapshotJs, videoStateJs, videoSampleStartJs, videoSampleFinishJs, PAGE_SLOT_TTL_MS} from './inject.js';
 import {snapshotJs, focusIsRefJs, snapshotReleaseJs} from './snapshot.js';
+import {recorderInstallJs, recorderDrainJs, recorderStopJs, recorderStatusJs} from './record-inject.js';
+import {Timeline, compileCase, renderCase, slugify} from './recorder.js';
 import {freePort} from './ports.js';
 import {loadAppProfile, requireMenu, resolveTarget, resolveCondition} from './appprofile.js';
 import {stateJs, focusSignatureJs, focusMatchesJs, menuItemsJs} from './state.js';
@@ -32,6 +35,12 @@ import {metricsToMap, metricsDiff, windowSecondsOf} from './metrics.js';
 
 /** A big profile off a slow TV takes far longer to serialise than a normal CDP round-trip. */
 const PROFILE_STOP_TIMEOUT_MS = 60000;
+/** How often the host empties the page-side recorder buffer. */
+const RECORD_DRAIN_MS = 300;
+/** Page-side ring buffer size. Overflow is counted and reported, never hidden. */
+const RECORD_BUFFER_CAP = 400;
+/** Where recorded cases land unless told otherwise — gitignored, see .gitignore. */
+const RECORDED_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'cases', 'recorded');
 /** A forced GC on a weak TV with a full heap is not an 8-second operation. */
 const GC_TIMEOUT_MS = 30000;
 /**
@@ -159,6 +168,16 @@ export class DeviceSession {
 		 * @type {?number}
 		 */
 		this._networkMarkAt = null;
+		/**
+		 * Live remote recording, if any. Like `_profiling`, it remembers the CdpSession it was
+		 * installed on rather than a boolean: a silent reattach gives a NEW V8 where the
+		 * page-side recorder does not exist, and comparing instances is how that is noticed.
+		 * @type {?{cdp: CdpSession, timeline: Timeline, startedAt: number, opts: object,
+		 *          timer: ?ReturnType<typeof setInterval>, trusted: ?number, keysSeen: number}}
+		 */
+		this._recorder = null;
+		/** The compiled-but-unwritten case held between `stop` and an explicit `write`. */
+		this._pendingCase = null;
 		this._lifecycleLock = Promise.resolve();
 		this._opLock = Promise.resolve();
 		/** Separates concurrent two-call video samples on the legacy eval dialect. */
@@ -442,6 +461,275 @@ export class DeviceSession {
 		}
 		out.bytes = bytes;
 		return out;
+	}
+
+	// ---------------------------------------------------------------------------------------
+	// tv_record — the person drives with the physical remote, the MCP writes the case.
+	//
+	// The drain takes NO lock, deliberately. `_opLock` would block tv_sequence for the whole
+	// recording, and `_cdp()` (which reaches for `_lifecycleLock` on a dead socket) would fight
+	// a user's own `tv_launch relaunch:true`. Draining is a read of a page-side array; a tick
+	// with no live socket is simply skipped, and the gap is reported rather than smoothed over.
+	// ---------------------------------------------------------------------------------------
+
+	/**
+	 * @param {{assert?: string, longPressMs?: number, collapse?: boolean, heartbeatMs?: number,
+	 *          overlay?: boolean}} [opts]
+	 */
+	async recordStart(opts = {}) {
+		if (this._recorder) {
+			throw new Error(
+				`a recording is already running on "${this.cfg.id}" (started ${Math.round((Date.now() - this._recorder.startedAt) / 1000)}s ago) — ` +
+				'stop it first with tv_record action:"stop"'
+			);
+		}
+		const cdp = await this._cdp();
+		const installed = await this._installRecorder(cdp, opts);
+		this._recorder = {
+			cdp, timeline: new Timeline(), startedAt: Date.now(), opts,
+			timer: null, trusted: installed.trusted, keysSeen: 0
+		};
+		this._recorder.timeline.setClock(installed.t0, Date.now());
+		this._recorder.timer = setInterval(() => {
+			this._recorderTick().catch(() => {});
+		}, RECORD_DRAIN_MS);
+		// Never hold the process open for a recording nobody stopped.
+		if (this._recorder.timer.unref) {
+			this._recorder.timer.unref();
+		}
+
+		const warnings = [];
+		if (!installed.trusted) {
+			warnings.push(
+				'this engine does not report Event.isTrusted (below Chrome 46), so synthetic presses ' +
+				'from other tools will be recorded as if they came from the remote'
+			);
+		}
+		return {
+			ok: true, recording: true, device: this.cfg.id, target: installed.target,
+			overlay: opts.overlay !== false,
+			note: 'нажимайте пультом; на экране горит «● REC». Закончив — tv_record action:"stop"',
+			...(warnings.length ? {warnings} : {})
+		};
+	}
+
+	/**
+	 * @param {CdpSession} cdp
+	 * @param {object} opts
+	 */
+	async _installRecorder(cdp, opts) {
+		const js = recorderInstallJs(this.profile, {
+			cap: RECORD_BUFFER_CAP,
+			heartbeatMs: opts.heartbeatMs,
+			overlay: opts.overlay !== false
+		});
+		const res = await cdp.evaluate(js, {awaitPromise: false});
+		if (!res || !res.ok) {
+			throw new Error(`could not install the recorder on the page: ${JSON.stringify(res).slice(0, 200)}`);
+		}
+		return res;
+	}
+
+	/** One drain. Silent about a dead socket; loud about a lost page. */
+	async _recorderTick() {
+		const r = this._recorder;
+		if (!r) {
+			return;
+		}
+		// `this.cdp` on purpose, never `_cdp()`: see the block comment above.
+		const cdp = this.cdp;
+		if (!cdp || !cdp.isOpen) {
+			return;
+		}
+		if (cdp !== r.cdp) {
+			// Connection identity, not a flag: the page-side recorder died with the old V8.
+			r.timeline.markReattach(Date.now());
+			r.cdp = cdp;
+			const installed = await this._installRecorder(cdp, r.opts).catch(() => null);
+			if (installed) {
+				r.timeline.setClock(installed.t0, Date.now());
+			}
+			return;
+		}
+		const res = await cdp.evaluate(recorderDrainJs(), {awaitPromise: false}).catch(() => null);
+		if (!res) {
+			return;
+		}
+		if (res.gone) {
+			// A navigation blew the global away; the buffer went with it.
+			r.timeline.markReattach(Date.now());
+			const installed = await this._installRecorder(cdp, r.opts).catch(() => null);
+			if (installed) {
+				r.timeline.setClock(installed.t0, Date.now());
+			}
+			return;
+		}
+		r.timeline.add(res.events, res.dropped);
+		r.keysSeen = res.keys || r.keysSeen;
+	}
+
+	async recordStatus() {
+		const r = this._recorder;
+		if (!r) {
+			return {ok: true, recording: false};
+		}
+		await this._recorderTick().catch(() => {});
+		const page = this.cdp && this.cdp.isOpen
+			? await this.cdp.evaluate(recorderStatusJs(), {awaitPromise: false}).catch(() => null)
+			: null;
+		return {
+			ok: true, recording: true, device: this.cfg.id,
+			elapsedMs: Date.now() - r.startedAt,
+			keysSeen: r.keysSeen,
+			observations: r.timeline.events.filter((e) => e.k === 'o').length,
+			bufferDropped: r.timeline.dropped,
+			reinstalls: r.timeline.reinstalls,
+			badge: page ? !!page.badge : null,
+			connected: !!(this.cdp && this.cdp.isOpen)
+		};
+	}
+
+	/**
+	 * @param {{title?: string, path?: string, overwrite?: boolean, note?: string,
+	 *          assert?: string, longPressMs?: number, collapse?: boolean, watch?: Array<object>}} [opts]
+	 */
+	async recordStop(opts = {}) {
+		const r = this._recorder;
+		if (!r) {
+			throw new Error(`no recording is running on "${this.cfg.id}" — start one with tv_record action:"start"`);
+		}
+		clearInterval(r.timer);
+		r.timer = null;
+		// One last drain while `_recorder` is still set, then take the page-side remains.
+		await this._recorderTick().catch(() => {});
+		this._recorder = null;
+		if (this.cdp && this.cdp.isOpen) {
+			const last = await this.cdp.evaluate(recorderStopJs(), {awaitPromise: false}).catch(() => null);
+			if (last && !last.gone) {
+				r.timeline.add(last.events, last.dropped);
+				r.keysSeen = last.keys || r.keysSeen;
+			}
+		}
+
+		const durationMs = Date.now() - r.startedAt;
+		// An honest refusal beats an empty case that looks like a pass. This is the answer to
+		// the open question about webOS 2: whether remote keys reach the page at all.
+		if (!r.timeline.keyCount) {
+			return {
+				ok: false, written: false, durationMs, keys: 0,
+				reason: 'no key events reached the page during the recording',
+				hint: 'на этом движке клавиши пульта могут не доходить до webview (часть кнопок съедает лаунчер). ' +
+					'Проверьте tv_record action:"status" во время нажатий.',
+				warnings: r.timeline.reinstalls ? [`connection dropped ${r.timeline.reinstalls} time(s)`] : []
+			};
+		}
+
+		// The profile's whitelist says what is worth asserting; the network log says what the
+		// person's run actually produced. Only the intersection becomes a step — an assertion on
+		// a request this scenario never made would be red on its first replay for a reason that
+		// has nothing to do with the app.
+		const declared = (opts.watch || (this.profile.record && this.profile.record.watch) || []);
+		const watch = [];
+		const unseen = [];
+		for (const w of declared) {
+			let count = 0;
+			try {
+				count = this._networkMatches({urlPattern: w.urlPattern, method: w.method}, r.startedAt).count;
+			} catch (e) {
+				count = 0;
+			}
+			if (count > 0) {
+				watch.push(w);
+			} else {
+				unseen.push(w.name || w.urlPattern);
+			}
+		}
+
+		const compiled = compileCase(r.timeline, this.profile, {
+			platform: this.platform,
+			assert: opts.assert || r.opts.assert || 'normal',
+			longPressMs: opts.longPressMs || r.opts.longPressMs,
+			collapse: opts.collapse !== undefined ? opts.collapse : r.opts.collapse,
+			watch
+		});
+		if (unseen.length) {
+			compiled.warnings.push(
+				`no request matched ${unseen.map((x) => `"${x}"`).join(', ')} during the recording, so no assertion ` +
+				'was written for it — the scenario may not be the one that fires it'
+			);
+		}
+		const title = opts.title || `Запись с пульта (${this.cfg.id})`;
+		this._pendingCase = {
+			title, device: this.cfg.id, durationMs, note: opts.note,
+			steps: compiled.steps, checklist: compiled.checklist, warnings: compiled.warnings
+		};
+		const written = this._writeCase(this._pendingCase, {path: opts.path, overwrite: opts.overwrite});
+		return {
+			ok: true, durationMs, keys: compiled.stats.keys, observations: compiled.stats.observations,
+			dropped: compiled.stats.droppedPresses, reinstalls: compiled.stats.reinstalls,
+			// Steps inline: this is what goes straight into tv_sequence to check the recording,
+			// and it is 8-20 objects. The markdown stays on disk.
+			steps: compiled.steps,
+			checklist: compiled.checklist,
+			...(compiled.warnings.length ? {warnings: compiled.warnings} : {}),
+			...written,
+			replay: 'реплей не запускается сам: на живом ТВ он стартует плеер и шлёт аналитику. ' +
+				'Скормите steps в tv_sequence, когда решите прогнать'
+		};
+	}
+
+	/**
+	 * Finish a `stop` that refused to overwrite: the compiled case is still in the session.
+	 * @param {{path?: string, overwrite?: boolean, title?: string}} [opts]
+	 */
+	recordWrite(opts = {}) {
+		if (!this._pendingCase) {
+			throw new Error('nothing to write — the last recorded case is gone (a new tv_record start clears it)');
+		}
+		if (opts.title) {
+			this._pendingCase.title = opts.title;
+		}
+		const written = this._writeCase(this._pendingCase, {path: opts.path, overwrite: opts.overwrite});
+		return {ok: !!written.written, ...written, steps: this._pendingCase.steps, checklist: this._pendingCase.checklist};
+	}
+
+	/**
+	 * Write the markdown. A name collision is NOT resolved here — no silent suffix, no silent
+	 * overwrite: the tool hands the conflict back and a human decides.
+	 * @param {object} c
+	 * @param {{path?: string, overwrite?: boolean}} opts
+	 * @return {{written: boolean, path?: string, conflict?: string, warnings?: Array<string>}}
+	 */
+	_writeCase(c, opts) {
+		const warnings = [];
+		let outPath;
+		if (opts.path) {
+			outPath = resolve(opts.path);
+		} else {
+			const dir = process.env.TV_DEBUG_CASES_DIR ? resolve(process.env.TV_DEBUG_CASES_DIR) : RECORDED_DIR;
+			outPath = join(dir, `${slugify(c.title)}.md`);
+		}
+		if (existsSync(outPath) && !opts.overwrite) {
+			return {written: false, conflict: outPath};
+		}
+		const body = renderCase(c);
+		try {
+			mkdirSync(dirname(outPath), {recursive: true});
+			writeFileSync(outPath, body, 'utf8');
+			return {written: true, path: outPath, ...(warnings.length ? {warnings} : {})};
+		} catch (e) {
+			// A globally linked package sits in a read-only directory. Losing the compilation
+			// over that would be absurd — fall back and say where it went.
+			const fallback = join(resolve(process.env.TMPDIR || '/tmp'), `${slugify(c.title)}.md`);
+			try {
+				writeFileSync(fallback, body, 'utf8');
+				warnings.push(`could not write to ${outPath} (${e.message}) — the case went to ${fallback} instead`);
+				return {written: true, path: fallback, warnings};
+			} catch (e2) {
+				warnings.push(`could not write the case anywhere (${e.message}; ${e2.message}) — the steps above are the whole result`);
+				return {written: false, warnings};
+			}
+		}
 	}
 
 	async focusSignature() {
@@ -1611,6 +1899,15 @@ export class DeviceSession {
 	}
 
 	async dispose() {
+		// A recording left running would keep a REC badge on screen and listeners on an app that
+		// outlives this process. Take it down while the socket is still alive.
+		if (this._recorder) {
+			clearInterval(this._recorder.timer);
+			this._recorder = null;
+			if (this.cdp && this.cdp.isOpen) {
+				await this.cdp.evaluate(recorderStopJs(), {awaitPromise: false}).catch(() => {});
+			}
+		}
 		// Leaving V8 sampling on in an app that keeps running after we detach is a real cost on
 		// a TV — stop it while the socket is still alive.
 		if (this._profiling && this.cdp && this.cdp.isOpen) {

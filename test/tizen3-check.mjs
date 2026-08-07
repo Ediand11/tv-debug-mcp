@@ -156,6 +156,43 @@ async function main() {
 	check('tv_network answers with a log', !net.__error && Array.isArray(net.requests),
 		net.__error || JSON.stringify(net).slice(0, 160));
 
+	// The recorder on a pre-M54 engine: the drain runs with awaitPromise:false (this protocol
+	// ignores it anyway), and Event.isTrusted does not exist here — which has to be SAID, not
+	// papered over as "this press was synthetic".
+	console.log('\n--- recorder on Chromium 47 ---');
+	const recStart = await s.call('tv_record', {device: DEVICE, action: 'start'});
+	check('the recorder installs on Chromium 47', recStart.ok === true,
+		recStart.__error || JSON.stringify(recStart).slice(0, 160));
+	// isTrusted arrived in Chrome 46, so Chromium 47 DOES report it (unlike webOS 3 / webOS 2).
+	// Assert the warning against what the engine really answers, not against a guess about it.
+	const trustProbe = await s.call('tv_evaluate', {
+		device: DEVICE,
+		expression: '(function(){var e=document.createEvent("Event");e.initEvent("p",false,false);return typeof e.isTrusted;})()'
+	});
+	const hasTrusted = trustProbe.value === 'boolean';
+	const trustWarned = (recStart.warnings || []).some((w) => /isTrusted/.test(w));
+	check(`the isTrusted warning matches the engine (isTrusted is ${hasTrusted ? '' : 'not '}reported here)`,
+		trustWarned === !hasTrusted, JSON.stringify({typeofIsTrusted: trustProbe.value, warnings: recStart.warnings}));
+	if (recStart.ok) {
+		await s.call('tv_press', {device: DEVICE, key: 'RIGHT'});
+		await s.call('tv_press', {device: DEVICE, key: 'LEFT'});
+		await sleep(900);
+		const recStatus = await s.call('tv_record', {device: DEVICE, action: 'status'});
+		check('the drain collects key events and observations',
+			recStatus.keysSeen >= 2 && recStatus.observations > 0,
+			JSON.stringify({keys: recStatus.keysSeen, obs: recStatus.observations}));
+		const stopped = await s.call('tv_record', {
+			device: DEVICE, action: 'stop', overwrite: true,
+			path: `${process.env.TMPDIR || '/tmp'}/tizen3-recorded.md`
+		});
+		check('stop compiles a runnable case', stopped.ok === true && (stopped.steps || []).length > 1,
+			stopped.reason || String((stopped.steps || []).length));
+		check('no screenshot step is emitted on a platform that cannot take one',
+			JSON.stringify(stopped.steps || []).indexOf('screenshot') < 0);
+		check('the checklist tells the human that the video verdict comes from tv_video_state',
+			(stopped.checklist || []).some((x) => /tv_video_state/.test(x)), JSON.stringify(stopped.checklist));
+	}
+
 	const alive = await s.call('tv_evaluate', {device: DEVICE, expression: '2*21'});
 	check('the session survives everything above', alive.value === 42, JSON.stringify(alive).slice(0, 120));
 

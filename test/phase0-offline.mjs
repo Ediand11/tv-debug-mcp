@@ -40,6 +40,9 @@ import {pollRequests, conditionJs} from '../src/wait.js';
 import {loadAppProfile, resolveElement, resolveScene, resolveTarget, resolveCondition} from '../src/appprofile.js';
 import {snapshotJs, focusIsRefJs, snapshotReleaseJs} from '../src/snapshot.js';
 import {stateJs, focusSignatureJs, focusMatchesJs} from '../src/state.js';
+import {recorderInstallJs, recorderDrainJs, recorderStopJs, recorderStatusJs} from '../src/record-inject.js';
+import {Timeline, compileCase, renderCase, slugify} from '../src/recorder.js';
+import {reverseKeyMap, keyNameFor} from '../src/keymaps.js';
 import {videoStateJs, videoSampleStartJs, videoSampleFinishJs} from '../src/inject.js';
 
 /**
@@ -988,6 +991,234 @@ function snapshotChecks() {
 	check('releasing twice is honest about there being nothing to release', r6.released === false);
 }
 
+/**
+ * 15: the recorder. The compiler is a pure function of a timeline, which is exactly why it is
+ * tested here on hand-written ones: every judgement call in it (collapse or not, repeat or
+ * long-press, assert or drop) is a decision a bad recording can only make silently.
+ */
+function recorderChecks() {
+	console.log('\n--- recorder: page-side builders ---');
+	const fx = loadAppProfile('fixture');
+	for (const [name, js] of [
+		['recorderInstallJs', recorderInstallJs(fx, {cap: 400, heartbeatMs: 1000, overlay: true})],
+		['recorderInstallJs(no overlay)', recorderInstallJs(fx, {overlay: false})],
+		['recorderDrainJs', recorderDrainJs()],
+		['recorderStopJs', recorderStopJs()],
+		['recorderStatusJs', recorderStatusJs()]
+	]) {
+		check(`${name} is ES5`, !ES6_IN_PAGE_JS.test(js), (js.match(ES6_IN_PAGE_JS) || [])[0]);
+		try {
+			new Function(js);
+			check(`${name} parses`, true);
+		} catch (e) {
+			check(`${name} parses`, false, e.message);
+		}
+	}
+
+	console.log('\n--- recorder: reverse key map ---');
+	const tz = reverseKeyMap('tizen');
+	check('Tizen 457 reads back deterministically (MENU and INFO share the code upstream)',
+		tz.get(457) === 'MENU', tz.get(457));
+	const wo = reverseKeyMap('webos');
+	check('webOS 33 reads back deterministically (PAGE_UP and CHANNEL_UP share it)',
+		wo.get(33) === 'PAGE_UP', wo.get(33));
+	check('an unnamed code stays a number so the case still replays',
+		keyNameFor('tizen', 424242) === 424242, String(keyNameFor('tizen', 424242)));
+
+	console.log('\n--- recorder: the compiler ---');
+	// A tiny timeline DSL. `sig` is the focus signature, and it moving is what proves a press
+	// landed — the same signal tv_goto uses.
+	const build = (script) => {
+		const t = new Timeline();
+		t.setClock(0, 0);
+		const evs = [];
+		let ts = 1000;
+		const obs = (over) => evs.push({k: 'o', ts, f: 'row > tile#0/6::Tile', sc: 's-catalog', pp: '', v: null, fx: 'Tile', fi: null, ...over});
+		const key = (code, opts = {}) => {
+			const hold = opts.holdMs || 40;
+			const repeats = opts.repeats || 1;
+			evs.push({k: 'd', c: code, ts, tr: opts.tr === undefined ? 1 : opts.tr});
+			for (let i = 1; i < repeats; i++) {
+				ts += opts.repeatMs || 90;
+				evs.push({k: 'd', c: code, ts, rp: 1});
+			}
+			ts += hold;
+			evs.push({k: 'u', c: code, ts});
+			ts += 10;
+		};
+		const idle = (ms) => {
+			ts += ms;
+		};
+		script({obs, key, idle, at: () => ts});
+		t.add(evs, 0);
+		return t;
+	};
+	const DOWN = 40;
+	const ENTER = 13;
+	const profile = fx;
+
+	// Four DOWN presses that each moved the focus -> one goto.
+	const moved = build(({obs, key}) => {
+		obs({f: 'sig0'});
+		for (let i = 1; i <= 4; i++) {
+			key(DOWN);
+			obs({f: `sig${i}`, fx: i === 4 ? 'Fourth row' : `Row ${i}`});
+		}
+	});
+	const c1 = compileCase(moved, profile, {platform: 'tizen'});
+	const gotos = c1.steps.filter((s) => s.goto);
+	check('four DOWN presses that all moved the focus collapse into ONE goto',
+		gotos.length === 1 && c1.steps.filter((s) => s.press).length === 0,
+		JSON.stringify(c1.steps));
+	check('and the goto aims at what the focus landed on, not at a press count',
+		gotos[0]?.goto?.text === 'Fourth row' && gotos[0].goto.direction === 'DOWN',
+		JSON.stringify(gotos[0]));
+
+	// Same run, but the last two presses did nothing: the person hit the edge of the list.
+	const overshot = build(({obs, key}) => {
+		obs({f: 'sig0'});
+		key(DOWN);
+		obs({f: 'sig1', fx: 'Row 1'});
+		key(DOWN);
+		obs({f: 'sig2', fx: 'Row 2'});
+		key(DOWN);
+		obs({f: 'sig2', fx: 'Row 2'});
+		key(DOWN);
+		obs({f: 'sig2', fx: 'Row 2'});
+	});
+	const c2 = compileCase(overshot, profile, {platform: 'tizen'});
+	check('an overshoot at the edge is dropped, not recorded as real movement',
+		c2.stats.droppedPresses === 2 && c2.warnings.some((w) => /stopped moving/.test(w)),
+		JSON.stringify({dropped: c2.stats.droppedPresses, warnings: c2.warnings}));
+	check('and the human is told to check the case is still about the same place',
+		c2.checklist.some((x) => /не двигала фокус/.test(x)), JSON.stringify(c2.checklist));
+
+	// A held ENTER is a long-press; a held DOWN is the platform auto-repeating.
+	const held = build(({obs, key}) => {
+		obs({f: 'sig0'});
+		key(ENTER, {holdMs: 1200});
+		obs({f: 'sig0', pp: 'demo-popup'});
+	});
+	const c3 = compileCase(held, profile, {platform: 'tizen'});
+	const lp = c3.steps.find((s) => s.longpress);
+	check('a 1200ms hold on ENTER becomes a longpress with its real duration',
+		lp?.longpress === 'ENTER' && Math.abs(lp.durationMs - 1200) <= 50, JSON.stringify(lp));
+	check('and a longpress always earns a "check it on real hardware" line',
+		c3.checklist.some((x) => /Лонгтап/.test(x)), JSON.stringify(c3.checklist));
+	check('a popup that appeared becomes an expect on a selector derived from its class',
+		c3.steps.some((s) => s.expect && s.expect.selector === '.demo-popup'), JSON.stringify(c3.steps));
+
+	const repeated = build(({obs, key}) => {
+		obs({f: 'sig0'});
+		key(DOWN, {repeats: 6, repeatMs: 90});
+		obs({f: 'sig9', fx: 'Far row'});
+	});
+	const c4 = compileCase(repeated, profile, {platform: 'tizen', collapse: false});
+	const burst = c4.steps.find((s) => s.press === 'DOWN');
+	check('physical auto-repeat on a direction becomes {press, repeat}, NOT a longpress',
+		burst?.repeat === 6 && !c4.steps.some((s) => s.longpress),
+		JSON.stringify(c4.steps));
+	check('and it carries the interval it was actually pressed at',
+		burst?.intervalMs >= 60 && burst?.intervalMs <= 130, String(burst?.intervalMs));
+
+	// A scene change -> a wait whose timeout is derived from what was observed, floored.
+	const scened = build(({obs, key, idle}) => {
+		obs({f: 'sig0', sc: 's-catalog'});
+		key(ENTER);
+		idle(400);
+		obs({f: 'sig1', sc: 's-player'});
+	});
+	const c5 = compileCase(scened, profile, {platform: 'tizen'});
+	const wait = c5.steps.find((s) => s.wait && s.wait.scene);
+	check('a scene change becomes a wait on the new scene token',
+		wait?.wait?.scene === 's-player', JSON.stringify(wait));
+	check('with a timeout of 3x what was observed, floored at 5s and capped at 30s',
+		wait?.timeoutMs >= 5000 && wait?.timeoutMs <= 30000, String(wait?.timeoutMs));
+
+	// The rule cases/README.md states outright.
+	const idled = build(({obs, key, idle}) => {
+		obs({f: 'sig0'});
+		key(DOWN);
+		obs({f: 'sig1', fx: 'Row 1'});
+		idle(4000);
+	});
+	const c6 = compileCase(idled, profile, {platform: 'tizen'});
+	check('four seconds of nobody pressing anything produce no step at all',
+		JSON.stringify(c6.steps).indexOf('sleep') < 0, JSON.stringify(c6.steps));
+	check('the case always establishes its own precondition first',
+		c6.steps[0]?.launch?.relaunch === true, JSON.stringify(c6.steps[0]));
+
+	// Network: whitelist only, and never an inferred body assertion.
+	const c7 = compileCase(moved, profile, {platform: 'tizen'});
+	check('a whitelist in the profile alone produces NO network step — the session only passes ' +
+		'through the entries a request actually matched during the recording',
+		!c7.steps.some((s) => s.expectRequest || s.networkMark !== undefined), JSON.stringify(c7.steps));
+	const c8 = compileCase(moved, profile, {platform: 'tizen', watch: profile.record.watch});
+	const req = c8.steps.find((s) => s.expectRequest);
+	check('a whitelisted request becomes an assertion, with the mark placed before the action',
+		!!req && c8.steps.findIndex((s) => s.networkMark !== undefined) === 1, JSON.stringify(c8.steps));
+	check('bodyContains is never inferred — a recorded body is tokens and ids',
+		!req.expectRequest.bodyContains && c8.checklist.some((x) => /зелёный один раз/.test(x)),
+		JSON.stringify(req));
+
+	// assert levels.
+	const c9 = compileCase(held, profile, {platform: 'tizen', assert: 'minimal'});
+	check('assert:"minimal" gives a case that would stay green with the app broken',
+		!c9.steps.some((s) => s.expect || s.wait), JSON.stringify(c9.steps));
+
+	// isTrusted: a synthetic press from another tool must be visible, not laundered.
+	const synthetic = build(({obs, key}) => {
+		obs({f: 'sig0'});
+		key(ENTER, {tr: 0});
+		obs({f: 'sig1'});
+	});
+	const c10 = compileCase(synthetic, profile, {platform: 'tizen'});
+	check('a press the engine says was synthetic is flagged to the human',
+		c10.checklist.some((x) => /isTrusted=false/.test(x)), JSON.stringify(c10.checklist));
+
+	// The hole a dropped connection leaves is reported, not smoothed over.
+	const holed = build(({obs, key}) => {
+		obs({f: 'sig0'});
+		key(DOWN);
+		obs({f: 'sig1', fx: 'Row 1'});
+	});
+	holed.markReattach(9999);
+	holed.dropped = 7;
+	const c11 = compileCase(holed, profile, {platform: 'tizen'});
+	check('a dropped connection and an overflowed buffer are both reported',
+		c11.warnings.some((w) => /connection dropped/.test(w)) &&
+		c11.warnings.some((w) => /ring buffer/.test(w)), JSON.stringify(c11.warnings));
+
+	console.log('\n--- recorder: markdown round-trip ---');
+	const md = renderCase({title: 'Тестовый кейс', device: 'tizen3', steps: c1.steps, checklist: c1.checklist,
+		warnings: c1.warnings, durationMs: 12000});
+	const fenced = /```json\n([\s\S]*?)\n```/.exec(md);
+	let parsed = null;
+	try {
+		parsed = JSON.parse(fenced[1]);
+	} catch (e) {
+		parsed = e.message;
+	}
+	check('the rendered case carries the steps as a JSON block that parses back identical',
+		JSON.stringify(parsed) === JSON.stringify(c1.steps), typeof parsed === 'string' ? parsed : 'mismatch');
+	check('and the checklist is written as check boxes a human ticks',
+		/- \[ \] /.test(md) && md.includes('# Тестовый кейс'));
+	check('slugify keeps a Cyrillic title usable as a file name',
+		slugify('Запись с пульта (tizen3)').length > 0 && !/[()\s]/.test(slugify('Запись с пульта (tizen3)')),
+		slugify('Запись с пульта (tizen3)'));
+
+	console.log('\n--- recorder: the clock ---');
+	// TVs with a wrong clock are normal; the network log stamps with host time for the same
+	// reason. Page timestamps are converted in exactly one place.
+	const skewed = new Timeline();
+	skewed.setClock(1000000, 5000);
+	skewed.add([{k: 'd', c: 40, ts: 1000500}, {k: 'u', c: 40, ts: 1000600}], 3);
+	check('page timestamps are converted into host time',
+		skewed.events[0].ts === 5500 && skewed.events[1].ts === 5600,
+		JSON.stringify(skewed.events.map((e) => e.ts)));
+	check('and the drop counter is carried through', skewed.dropped === 3, String(skewed.dropped));
+}
+
 async function main() {
 	profileChecks();
 	metricsChecks();
@@ -998,6 +1229,7 @@ async function main() {
 	avplayProbeChecks();
 	namedTargetChecks();
 	snapshotChecks();
+	recorderChecks();
 
 	console.log('\n--- config and failure isolation ---');
 	// A PATH with node but no `sdb`/`tizen`, so tool calls have to fail gracefully.

@@ -86,6 +86,36 @@ async function main() {
 	const alive = await s.call('tv_evaluate', {device: DEVICE, expression: '2*21'});
 	check('session survives the refused screenshot', alive.value === 42, JSON.stringify(alive).slice(0, 120));
 
+	// The open question this device exists to answer: does anything the recorder listens for
+	// reach the page at all on legacy WebKit? Dispatching keys here needs a prototype swap
+	// (inject.js) — LISTENING is not supposed to, but "supposed to" is not evidence.
+	console.log('\n--- recorder on legacy WebKit ---');
+	const recStart = await s.call('tv_record', {device: DEVICE, action: 'start'});
+	check('the recorder installs without throwing on WebKit 538',
+		recStart.ok === true && recStart.recording === true,
+		recStart.__error || JSON.stringify(recStart).slice(0, 160));
+	if (recStart.ok) {
+		await s.call('tv_press', {device: DEVICE, key: 'DOWN'});
+		await s.call('tv_press', {device: DEVICE, key: 'UP'});
+		await sleep(900);
+		const recStatus = await s.call('tv_record', {device: DEVICE, action: 'status'});
+		check('key events reach the page and the drain sees them',
+			recStatus.keysSeen >= 2, JSON.stringify({keys: recStatus.keysSeen, connected: recStatus.connected}));
+		const stopped = await s.call('tv_record', {
+			device: DEVICE, action: 'stop', overwrite: true,
+			path: `${process.env.TMPDIR || '/tmp'}/webos2-recorded.md`
+		});
+		// Either a compiled case, or an honest refusal — never an empty case that looks like a pass.
+		check('stop either compiles a case or refuses honestly',
+			(stopped.ok === true && (stopped.steps || []).length > 1) ||
+			(stopped.ok === false && /no key events/.test(String(stopped.reason))),
+			JSON.stringify({ok: stopped.ok, reason: stopped.reason, steps: (stopped.steps || []).length}));
+		const leftover = await s.call('tv_evaluate', {
+			device: DEVICE, expression: 'document.querySelectorAll(".__tvdbg-rec").length'
+		});
+		check('the recording did not leave the REC badge behind', leftover.value === 0, JSON.stringify(leftover));
+	}
+
 	console.log('\n--- sequence ---');
 	const seq = await s.call('tv_sequence', {device: DEVICE, steps: [
 		{press: 'DOWN'},

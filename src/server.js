@@ -2,8 +2,8 @@
 // tv-debug-mcp — MCP server for semi-manual QA runs on real Smart TVs over CDP.
 //
 // Tools: tv_devices, tv_install, tv_launch, tv_press, tv_screenshot, tv_console, tv_network,
-// tv_video_state, tv_state, tv_snapshot, tv_wait_for, tv_goto, tv_menu, tv_sequence,
-// tv_evaluate, tv_profile, tv_heap.
+// tv_video_state, tv_state, tv_snapshot, tv_record, tv_wait_for, tv_goto, tv_menu,
+// tv_sequence, tv_evaluate, tv_profile, tv_heap.
 // The park is described in devices.json (or TV_DEBUG_CONFIG) and can also contain a `pc`
 // device — the same case run against a local Chrome. One persistent CDP session per device
 // is kept across calls so console/exceptions accumulate from launch. All progress goes to
@@ -177,6 +177,29 @@ const TOOLS = [
 				maxRows: {type: 'integer', minimum: 1, maximum: 40, description: 'Rows to keep, centred on the focused row (default 6, or the profile\'s snapshot.maxRows).'},
 				maxItemsPerRow: {type: 'integer', minimum: 1, maximum: 60, description: 'Items per row, centred on the focused item (default 12, or the profile\'s snapshot.maxItemsPerRow).'},
 				release: {type: 'boolean', description: 'Drop the ref store on the page now instead of waiting for the TTL. Returns nothing else.'}
+			}
+		}
+	},
+	{
+		name: 'tv_record',
+		description: 'Record what a person does with the PHYSICAL remote and compile it into a runnable tv_sequence plus a checklist of what only a human can confirm. action:"start" installs a page-side listener and puts a "● REC" badge on screen (overlay:false turns it off); the person then navigates with the real remote; action:"stop" compiles and writes a markdown case. action:"status" says how many keys have been seen — use it to check the remote is reaching the page at all. The compiler collapses a run of the same direction into ONE goto (only while the focus actually moved on every press — an overshoot at the edge of a list is dropped with a warning), turns physical auto-repeat into {press,repeat} rather than a long-press (a synthetic long-press sends one keydown and would scroll nothing), turns observed scene/popup/video changes into waits and expects, and NEVER emits a sleep step. Network assertions come only from the app profile\'s record.watch whitelist, and bodyContains is never inferred. `steps` come back inline — that is what you feed to tv_sequence to check the recording. The replay is NOT run automatically: on a live TV it starts the player and fires analytics. A file that already exists is NOT overwritten and NOT silently suffixed: you get {written:false, conflict} and ask the human, then finish with action:"write" and an explicit path or overwrite:true.',
+		inputSchema: {
+			type: 'object',
+			properties: {
+				...DEVICE_PROP,
+				action: {type: 'string', enum: ['start', 'stop', 'status', 'write'], description: 'start (default) | stop | status | write (finish a stop that hit a name collision).'},
+				title: {type: 'string', description: 'Case title; also the file name. Default: "Запись с пульта (<device>)".'},
+				path: {type: 'string', description: 'Where to write the .md. Default: <package>/cases/recorded/<slug>.md (gitignored), or TV_DEBUG_CASES_DIR.'},
+				overwrite: {type: 'boolean', description: 'Allow replacing an existing file. Off by default — a collision is reported, not resolved.'},
+				note: {type: 'string', description: 'A line of context written into the case above the steps.'},
+				assert: {
+					type: 'string', enum: ['minimal', 'normal', 'rich'],
+					description: 'How much to assert. minimal: keys only — a case that stays green with the app broken. normal (default): scene and popup changes. rich: also video-advancing assertions, which are brittle from day one if you do not need them.'
+				},
+				longPressMs: {type: 'integer', minimum: 200, maximum: 10000, description: 'A hold at least this long becomes a longpress step (default 700).'},
+				collapse: {type: 'boolean', description: 'Collapse runs of one direction into goto steps (default true).'},
+				heartbeatMs: {type: 'integer', minimum: 250, maximum: 10000, description: 'How often the page checks itself for changes between key presses (default 1000).'},
+				overlay: {type: 'boolean', description: 'Show the "● REC" badge on screen (default true). It will appear in screenshots.'}
 			}
 		}
 	},
@@ -449,6 +472,29 @@ async function handleCall(name, args) {
 		case 'tv_state': {
 			const s = sessionFor(args.device);
 			return textResult(await s.state());
+		}
+		case 'tv_record': {
+			const s = sessionFor(args.device);
+			const action = args.action || 'start';
+			if (action === 'start') {
+				return textResult(await s.recordStart({
+					assert: args.assert, longPressMs: args.longPressMs, collapse: args.collapse,
+					heartbeatMs: args.heartbeatMs, overlay: args.overlay
+				}));
+			}
+			if (action === 'status') {
+				return textResult(await s.recordStatus());
+			}
+			if (action === 'stop') {
+				return textResult(await s.recordStop({
+					title: args.title, path: args.path, overwrite: !!args.overwrite, note: args.note,
+					assert: args.assert, longPressMs: args.longPressMs, collapse: args.collapse
+				}));
+			}
+			if (action === 'write') {
+				return textResult(s.recordWrite({path: args.path, overwrite: !!args.overwrite, title: args.title}));
+			}
+			return errorResult(`tv_record needs action "start", "stop", "status" or "write", got ${JSON.stringify(args.action)}`);
 		}
 		case 'tv_snapshot': {
 			const s = sessionFor(args.device);
