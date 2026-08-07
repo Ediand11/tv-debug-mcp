@@ -21,6 +21,7 @@ export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
  *
  * @param {string} [deviceId] defaults to the device config's defaultDevice
  * @return {{app: string, tile: string, popup: ?string, homeSection: Array<string>, bootTimeoutMs: number,
+ *           dismissOnBoot: ?{selector: string, key?: string},
  *           elements: Object<string, *>, scenes: Object<string, string>}}
  */
 export function appTargets(deviceId) {
@@ -43,6 +44,10 @@ export function appTargets(deviceId) {
 		homeSection: checks.homeSection
 			? (Array.isArray(checks.homeSection) ? checks.homeSection : [checks.homeSection])
 			: [],
+		// Some apps put a consent modal up after every launch and trap the focus in it. That is
+		// app knowledge, so it lives in the profile: {"selector": "…", "key": "ENTER"}. Without
+		// it every navigation check on such a set is red for one and the same reason.
+		dismissOnBoot: checks.dismissOnBoot || null,
 		bootTimeoutMs: profile.bootReady?.timeoutMs || 60000,
 		// The named registries, so an on-device check can exercise the `element` forms with
 		// this app's own names and stay unpinned from any particular product.

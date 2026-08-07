@@ -40,6 +40,21 @@ async function main() {
 	const booted = await s.call('tv_wait_for', {selector: target.tile, timeoutMs: 60000, stableMs: 700});
 	check('tv_wait_for replaces the boot sleep', booted.ok, `${booted.elapsedMs}ms, ${booted.polls} polls`);
 
+	// A consent modal that traps the focus makes every navigation check below red for one and
+	// the same reason. Clear it if the profile declares one — and say out loud that we did, so
+	// nobody reads a green run as "the app came up ready to drive".
+	if (target.dismissOnBoot) {
+		const present = await s.call('tv_wait_for', {selector: target.dismissOnBoot.selector, timeoutMs: 4000});
+		if (present.ok) {
+			await s.call('tv_press', {key: target.dismissOnBoot.key || 'ENTER'});
+			const gone = await s.call('tv_wait_for', {selectorGone: target.dismissOnBoot.selector, timeoutMs: 8000});
+			check(`the boot dialog (${target.dismissOnBoot.selector}) was dismissed before navigating`, gone.ok,
+				gone.detail || 'still on screen');
+		} else {
+			console.log(`  NOTE  no boot dialog on this set (${target.dismissOnBoot.selector})`);
+		}
+	}
+
 	console.log('\n--- state ---');
 	const st = await s.call('tv_state');
 	check('tv_state returns a structured focus',
@@ -99,9 +114,16 @@ async function main() {
 	const layout = await s.call('tv_snapshot', {});
 	check('tv_snapshot derives rows on a real TV', layout.ok && (layout.rows || []).length > 0,
 		layout.warning || layout.__error || `tier=${layout.tier}`);
-	console.log(`        tier=${layout.tier} rows=${layout.rows?.length} items=${layout.counts?.items} bytes=${layout.bytes}`);
+	console.log(`        tier=${layout.tier} rows=${layout.rows?.length} items=${layout.counts?.items} bytes=${layout.bytes}` +
+		(layout.warning ? ` warning=${layout.warning}` : ''));
+	console.log('        sample:', JSON.stringify((layout.rows || [])[0]?.items?.slice(0, 3).map((x) => x.t)));
 	check('and the answer stays small enough to plan with', layout.bytes > 0 && layout.bytes < 6000,
 		`bytes=${layout.bytes}`);
+	// Rows of empty strings are a layout an agent cannot plan by. The snapshot says so in a
+	// warning; the acceptance has to fail on it, or "20/20 green" hides a useless answer.
+	const labelled = (layout.rows || []).reduce((n, r) => n + r.items.filter((x) => x.t).length, 0);
+	check('the items carry text, not just structure', labelled > 0,
+		layout.warning || 'every item came back with an empty label');
 	// Take the move `neighbours` claims is one press away — that is exactly what it is for, and
 	// picking an arbitrary item of the row instead is how you land on a node a virtualised list
 	// has already recycled (a real TV app does that between two calls).

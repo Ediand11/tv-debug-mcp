@@ -448,6 +448,26 @@ export class DeviceSession {
 			out.warning =
 				'no rows could be derived — add a "snapshot" block (row/item selectors) or a "tile" ' +
 				`selector to apps/${this.profile.id}.json, or use detail:"focus"`;
+		} else {
+			// "The selector is visible" is not "the content is rendered" — cases/README.md records
+			// that trap, and a snapshot taken inside that window returns a grid of empty strings.
+			// The layout is real, the labels are not there YET, and an agent planning by them is
+			// planning by nothing. Say so instead of returning a silently useless answer.
+			let items = 0;
+			let labelled = 0;
+			for (const row of out.rows) {
+				for (const it of row.items || []) {
+					items++;
+					if (it.t) {
+						labelled++;
+					}
+				}
+			}
+			if (items > 0 && labelled === 0) {
+				out.warning =
+					'the layout is there but not one item has text yet — the app is probably still ' +
+					'rendering. Take another snapshot, or wait on the text you need (tv_wait_for).';
+			}
 		}
 		// The size of this very answer, so the agent can see what the call costs it and drop to
 		// detail:"focus" when the rows are not what the next move needs.
