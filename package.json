@@ -1,13 +1,13 @@
 {
   "name": "tv-debug-mcp",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Ediand11/tv-debug-mcp.git"
   },
-  "description": "MCP server for semi-manual QA runs on real Smart TVs (Tizen/webOS) and a local Chrome over CDP: install, debug-launch, remote-key input incl. long-press, semantic navigation (goto/menu/sequence), waits, screenshots, console, <video> state and JS CPU profiling.",
+  "description": "MCP server for semi-manual QA runs on real Smart TVs (Tizen/webOS) and a local Chrome over CDP: install, debug-launch, remote-key input incl. long-press, semantic navigation (goto/menu/sequence) with named elements, a one-call layout snapshot, recording a path from the physical remote into a runnable case, waits, screenshots, console, network log, <video> state and JS CPU profiling.",
   "type": "module",
   "bin": {
     "tv-debug-mcp": "src/server.js"
