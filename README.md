@@ -14,7 +14,7 @@ cp devices.example.json devices.json           # devices.json в .gitignore — 
 npm run check:browser                          # зелёный прогон без ТВ: свой Chrome + встроенная фикстура
 ```
 
-Дальше — зарегистрировать сервер в Claude Code:
+Дальше — зарегистрировать сервер в своём MCP-клиенте, см. [«Установка в MCP-клиенты»](#установка-в-mcp-клиенты). Для Claude Code это одна команда **из корня репозитория**:
 
 ```bash
 claude mcp add tv-debug --scope user -- node "$PWD/src/server.js"
@@ -29,6 +29,88 @@ claude mcp add tv-debug --scope user -- node "$PWD/src/server.js"
 3. для ТВ — Developer Mode на устройстве и подключённый `sdb` / `ares`.
 
 Node ≥ 18. Зависимости: `@modelcontextprotocol/sdk`, `ws`, `source-map-js` (чистый JS-порт `source-map` 0.6, без wasm — важно для офлайн-запуска).
+
+## Установка в MCP-клиенты
+
+Сервер — обычный stdio-MCP: команда `node <абсолютный путь>/src/server.js`, ни портов, ни демона. Дальше отличается только синтаксис конкретного клиента.
+
+### Claude Code
+
+```bash
+claude mcp add tv-debug --scope user -- node "$PWD/src/server.js"
+```
+
+⚠️ `"$PWD"` раскрывает **оболочка в момент `claude mcp add`**, а не Claude при запуске сервера: в конфиг уезжает уже готовый абсолютный путь. Поэтому команду обязательно выполнять **из корня репозитория** — иначе в конфиге окажется путь к тому каталогу, где вы стояли. Проверка — `claude mcp list`: там должен стоять абсолютный путь до `src/server.js`.
+
+### Codex CLI
+
+`~/.codex/config.toml`:
+
+```toml
+[mcp_servers.tv-debug]
+command = "node"
+args = ["/absolute/path/to/tv-debug-mcp/src/server.js"]
+startup_timeout_sec = 30
+
+[mcp_servers.tv-debug.env]
+TV_DEBUG_CONFIG = "/absolute/path/to/devices.json"
+```
+
+Переменные окружения — **отдельная таблица** `[mcp_servers.<имя>.env]`, а не ключ внутри блока сервера: в TOML всё, что идёт после `[mcp_servers.tv-debug]`, принадлежит этой таблице, и вложенный объект объявляется своим заголовком.
+
+### OpenCode
+
+`~/.config/opencode/opencode.json`, ключ `mcp`, тип `local`. Переменные окружения здесь — ключ **`environment`**, не `env`, а команда — **массив**, а не строка:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "tv-debug": {
+      "type": "local",
+      "command": ["node", "/absolute/path/to/tv-debug-mcp/src/server.js"],
+      "enabled": true,
+      "environment": {"TV_DEBUG_CONFIG": "/absolute/path/to/devices.json"}
+    }
+  }
+}
+```
+
+### Cursor, Windsurf, Cline, VS Code — схема `mcpServers`
+
+Один и тот же объект, различается только файл (`~/.cursor/mcp.json`, `.vscode/mcp.json`, панель настроек расширения):
+
+```json
+{
+  "mcpServers": {
+    "tv-debug": {
+      "command": "node",
+      "args": ["/absolute/path/to/tv-debug-mcp/src/server.js"],
+      "env": {"TV_DEBUG_CONFIG": "/absolute/path/to/devices.json"}
+    }
+  }
+}
+```
+
+### Стабильное имя команды вместо пути
+
+```bash
+npm link                       # из корня репозитория
+```
+
+`npm link` кладёт `tv-debug-mcp` в PATH (поле `bin` в `package.json`) и заодно ставит exec-бит: в репозитории у `src/server.js` права 644 при живом шебанге, то есть напрямую он не запускается. После линка в любом конфиге можно писать `"command": "tv-debug-mcp"` с пустым `args`.
+
+**Публикации в npm и запуска через `npx` нет и не планируется.** `devices.json` и `apps/<id>.json` лежат рядом с пакетом, а глобальная установка кладёт их в каталог, который переписывается на каждом обновлении. Работать это будет только с `TV_DEBUG_CONFIG` на парк и абсолютными путями в поле `app` — то есть ровно та ручная настройка, ради избавления от которой `npx` и берут.
+
+### Переменные окружения
+
+| Переменная | Что задаёт | Если не задана |
+|---|---|---|
+| `TV_DEBUG_CONFIG` | путь к `devices.json` | `devices.json` рядом с пакетом |
+| `TV_DEBUG_CHROME` | бинарь Chrome для `platform: "pc"` | `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`; поле `chromePath` устройства перебивает и то и другое |
+| `TV_DEBUG_DEVICE` | устройство для платформенных приёмок (`check:webos2`, `check:tizen3`, `webos4-regress-probe`) | `webos2` / `tizen3` / `webos4` соответственно |
+| `TV_DEV_URL` + `TV_DEV_APP` | дополнительный прогон `check:browser` против живого dev-сервера; нужны **обе** | прогон только против встроенной фикстуры |
+| `TMPDIR` | куда падают артефакты (`.cpuprofile`, `.heapsnapshot`, `.png`, HAR), когда `path` не задан явно | системный временный каталог |
 
 ## Зачем не Appium / не playwriter
 
@@ -233,6 +315,34 @@ tv_heap {"action": "diff", "before": "/tmp/before.heapsnapshot", "after": "/tmp/
 
 С `tv_sequence` намеренно не интегрирован: снапшот на слабом ТВ — это десятки секунд, тяжёлый шаг внутри сценария размыл бы тайминги остальных шагов. Порядок «снапшот → сценарий → снапшот → diff» точности окна не теряет.
 
+## Требования к устройствам
+
+Три независимых чек-листа: ТВ Samsung, ТВ LG, браузер на ноуте. Каждый кончается командой, которая отвечает «готово / не готово» до того, как MCP скажет «устройство недоступно».
+
+### Tizen (Samsung)
+
+1. **Developer Mode на ТВ**: *Apps* → набрать `12345` на пульте → *Developer mode: On* → вписать IP машины, с которой будете подключаться → перезагрузить ТВ. Обновление прошивки его выключает.
+2. **Tizen Studio CLI** в PATH — нужны `sdb` и `tizen`: `~/tizen-studio/tools` и `~/tizen-studio/tools/ide/bin`.
+3. **Подключение**: `sdb connect <ip>:26101` (порт по умолчанию, в `devices.json` переопределяется полем `sdbPort`).
+4. **Author-сертификат Samsung**, которым подписан `.wgt`. Билд, подписанный другим сертификатом, поверх старого не встаёт — `tv_install {"uninstallFirst": true}` сносит и ставит заново; это и есть лечение «Author certificate not match».
+
+Проверка: `sdb devices` — устройство должно быть в состоянии `device`. `unauthorized` значит, что на ТВ не подтвердили подключение или Developer Mode слетел.
+
+### webOS (LG)
+
+1. **Developer Mode**: поставить приложение *Developer Mode* из LG Content Store, войти аккаунтом с developer.lge.com, включить Dev Mode. Ключ живёт ограниченное время, в приложении есть продление; протухший ключ снаружи выглядит как «устройство не отвечает».
+2. **ares-cli**: `npm i -g @webosose/ares-cli`.
+3. **Завести устройство**: `ares-setup-device`. ⚠️ В `devices.json` в поле `device` идёт **имя из ares**, а не IP — адресация у webOS-адаптера именная.
+
+Проверка: `ares-device-info -d <name>` отдаёт модель и версию webOS; `ares-setup-device --list` показывает всё заведённое.
+
+### PC (браузерный режим)
+
+1. **Chrome** на машине. Путь по умолчанию — macOS-овый, переопределяется `TV_DEBUG_CHROME` или полем `chromePath` устройства.
+2. **Dev-сервер приложения поднимает пользователь.** MCP только проверяет, что `url` отвечает; он не запускает и не гасит чужой сервер.
+
+Проверка: `npm run check:browser` — полный прогон против встроенной фикстуры, ТВ не нужен.
+
 ## Парк устройств
 
 `devices.json` (или путь в `TV_DEBUG_CONFIG`) — он в `.gitignore`, заводится копией `devices.example.json`. Файл перечитывается по mtime — правка подхватывается без рестарта MCP; дубли id и портов отвергаются с внятной ошибкой.
@@ -251,7 +361,25 @@ tv_heap {"action": "diff", "before": "/tmp/before.heapsnapshot", "after": "/tmp/
 }
 ```
 
-`cliTarget` (Tizen) можно не указывать — выводится из третьей колонки `sdb devices`; он нужен, чтобы `tizen install -t` попал в нужный ТВ на парке.
+Поля устройства:
+
+| Поле | Для кого | Что задаёт |
+|---|---|---|
+| `id` | все | имя устройства в тулах и в `TV_DEBUG_DEVICE`. Уникально — дубли отвергаются на загрузке конфига |
+| `platform` | все | `tizen` \| `webos` \| `pc` |
+| `app` | все | id app-профиля: читается `apps/<app>.json`. Без него доступна только дженерик-часть тулов |
+| `name`, `engine` | все | человекочитаемые подписи, видны в выводе `tv_devices` |
+| `appId` | tizen, webos | id приложения на устройстве (`AbCdEfGhIj.myapp`, `com.example.myapp`) |
+| `host` | tizen | IP телевизора |
+| `sdbPort` | tizen | порт sdb, по умолчанию `26101` |
+| `cliTarget` | tizen | цель для `tizen install -t`, чтобы билд поехал в нужный ТВ на парке. Можно не указывать — выводится из третьей колонки `sdb devices` |
+| `localPort` | tizen | локальный порт под `sdb forward`. Не указан — берётся свободный; два устройства с одним и тем же пином отвергаются, иначе они перекрёстно склеились бы |
+| `device` | webos | имя устройства из `ares-setup-device --list` (не IP) |
+| `url` | pc | адрес dev-сервера, например `http://localhost:1337` |
+| `chromePath` | pc | бинарь Chrome именно для этого устройства; перебивает `TV_DEBUG_CHROME` |
+| `chromeArgs` | pc | дополнительные аргументы к Chrome поверх обязательных |
+| `profileDir` | pc | использовать **этот** каталог профиля вместо одноразового. Тогда профиль считается чужим и на dispose не удаляется — так живёт залогиненный Chrome, который не хочется логинить заново каждый прогон |
+| `inputMode` | pc | `trusted` (по умолчанию) \| `synthetic` — см. [«Trusted vs synthetic»](#trusted-vs-synthetic--почему-это-два-разных-эксперимента). На ТВ клавиши всегда синтетические, поле там не читается |
 
 ## App-профиль
 
@@ -375,6 +503,14 @@ TV_DEV_URL=http://localhost:1337 TV_DEV_APP=myapp npm run check:browser
 ## Демо-кейсы
 
 `cases/fixture-smoke.md` — кейс против встроенной фикстуры, исполним сразу после клона, без ТВ и без dev-сервера. Формат и правила, выведенные из реальных прогонов, — в `cases/README.md`.
+
+Статику фикстуры под этот кейс поднимает человек и оставляет работать:
+
+```bash
+python3 -m http.server 8080 --bind 127.0.0.1 --directory test/fixture
+```
+
+Устройство `pc-fixture` с этим адресом и профилем `apps/fixture.json` уже есть в `devices.example.json`. Не путать с `npm run check:browser`: приёмочный скрипт поднимает свою статику на свободном порту сам и пишет себе одноразовый `devices.json` — ему ничего заранее запускать не надо.
 
 ## Дальше
 

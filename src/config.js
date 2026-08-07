@@ -29,6 +29,7 @@ export const PLATFORMS = ['tizen', 'webos', 'pc'];
  *   url?: string,
  *   chromePath?: string,
  *   chromeArgs?: Array<string>,
+ *   profileDir?: string,
  *   inputMode?: 'trusted'|'synthetic',
  *   localPort?: number
  * }} DeviceConfig
