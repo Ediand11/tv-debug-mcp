@@ -72,14 +72,15 @@ const TOOLS = [
 	},
 	{
 		name: 'tv_launch',
-		description: 'Debug-launch the app and attach over CDP. Establishes the session used by all other tools. By default it kills any running instance first for a deterministic fresh start. reload:true reloads the page in place (same process, keeps localStorage). relaunch:true forces a fresh kill+launch. attach:true reuses the inspector of an app already running in debug, keeping its state.',
+		description: 'Debug-launch the app and attach over CDP. Establishes the session used by all other tools. By default it kills any running instance first for a deterministic fresh start. reload:true reloads the page in place (same process, keeps localStorage). relaunch:true forces a fresh kill+launch. attach:true reuses the inspector of an app already running in debug, keeping its state. After a fresh launch it also waits for the app profile\'s bootReady condition and reports attached.bootReady {ok, elapsedMs, condition} — so the answer says whether the app actually came up, and a case does not need to open with its own wait step. A boot that never completes does NOT fail the call: the attach worked, and tv_console / tv_network are exactly what you need next.',
 		inputSchema: {
 			type: 'object',
 			properties: {
 				...DEVICE_PROP,
 				reload: {type: 'boolean', description: 'Reload the page in place when already attached (does not clear localStorage).'},
 				relaunch: {type: 'boolean', description: 'Force a fresh kill + debug-launch even if already attached.'},
-				attach: {type: 'boolean', description: 'Attach to a running instance without killing it (skips the fresh-start kill).'}
+				attach: {type: 'boolean', description: 'Attach to a running instance without killing it (skips the fresh-start kill).'},
+				waitBoot: {type: 'boolean', description: "Wait for the app profile's bootReady condition after a fresh launch (default true). Set false to attach and look around immediately, e.g. to watch the boot itself."}
 			}
 		}
 	},
@@ -164,12 +165,15 @@ const TOOLS = [
 	},
 	{
 		name: 'tv_wait_for',
-		description: 'Wait until a condition holds, instead of sleeping. Give exactly one condition. stableMs additionally requires it to keep holding, which avoids acting on a half-rendered frame. Returns the elapsed time and the final state.',
+		description: 'Wait until a condition holds, instead of sleeping. Give exactly one condition. stableMs additionally requires it to keep holding, which avoids acting on a half-rendered frame. Returns the elapsed time and the final state. element / elementGone / sceneName take a NAME from the app profile registry instead of raw CSS; the answer echoes resolvedFrom so the report names the selector that was really checked, and an unknown name fails with the list of known ones.',
 		inputSchema: {
 			type: 'object',
 			properties: {
 				...DEVICE_PROP,
 				focusText: {type: 'string', description: "Focused element's text contains this (case-insensitive)."},
+				element: {type: 'string', description: 'A visible element matches this NAME from the app profile\'s "elements" registry (e.g. "player.play").'},
+				elementGone: {type: 'string', description: 'No visible element matches this NAME from the app profile\'s "elements" registry.'},
+				sceneName: {type: 'string', description: 'A visible scene matches this NAME from the app profile\'s "scenes" registry (e.g. "player").'},
 				selector: {type: 'string', description: 'A visible element matches this CSS selector.'},
 				selectorGone: {type: 'string', description: 'No visible element matches this CSS selector (spinner gone, popup closed).'},
 				scene: {type: 'string', description: "A visible scene's class contains this (e.g. player)."},
@@ -188,15 +192,17 @@ const TOOLS = [
 	},
 	{
 		name: 'tv_goto',
-		description: 'Press a direction repeatedly until the FOCUSED element matches a target (text / CSS selector / testid). Bounded by maxSteps, a deadline, and two structural stops: focus that stopped moving (edge of a list) and focus that wrapped around to a position already visited. Use this instead of guessing "press DOWN 7 times".',
+		description: 'Press a direction repeatedly until the FOCUSED element matches a target (a named element from the app profile, or raw text / CSS selector / testid). Bounded by maxSteps, a deadline, and two structural stops: focus that stopped moving (edge of a list) and focus that wrapped around to a position already visited. Use this instead of guessing "press DOWN 7 times". select:true presses ENTER once the target has focus, so arriving and entering is one call — the gap between two calls is where a lazily-loading list moves focus out from under you.',
 		inputSchema: {
 			type: 'object',
 			properties: {
 				...DEVICE_PROP,
 				direction: {type: 'string', enum: ['UP', 'DOWN', 'LEFT', 'RIGHT'], description: 'Direction to travel in.'},
+				element: {type: 'string', description: 'Stop on the element with this NAME from the app profile\'s "elements" registry. An explicit text/selector/testid given alongside narrows it further.'},
 				text: {type: 'string', description: "Stop when the focused element's text contains this (case-insensitive)."},
 				selector: {type: 'string', description: 'Stop when the focused element matches this CSS selector.'},
 				testid: {type: 'string', description: 'Stop when the focused element has this data-testid / data-export-id.'},
+				select: {type: 'boolean', description: 'Press ENTER once the target is focused (default false).'},
 				maxSteps: {type: 'integer', minimum: 1, maximum: 200, description: 'Maximum presses (default 30).'},
 				deadlineMs: {type: 'integer', minimum: 1000, maximum: 300000, description: 'Wall-clock budget (default 45000).'}
 			},
@@ -218,7 +224,7 @@ const TOOLS = [
 	},
 	{
 		name: 'tv_sequence',
-		description: 'Run a whole case body in ONE call, with a verdict, elapsed time and result per step. Steps are objects, one key each: {"launch":{"relaunch":true}} (start from a known state) | {"press":"RIGHT","repeat":2} | {"longpress":"ENTER","durationMs":1500} | {"goto":{"direction":"DOWN","text":"..."}} | {"menu":"Settings"} | {"wait":{"scene":"player"},"timeoutMs":30000} | {"expect":{"selector":"[class*=popup]"}} | {"expectRequest":{"urlPattern":"track","method":"POST","bodyContains":"event_id","timeoutMs":8000}} | {"networkMark":true} | {"eval":"ES5 expression"} | {"sleep":1000} | {"videoState":true} | {"state":true} | {"profileStart":true} | {"profileStop":{"path":"…"}} | {"metrics":true}. `expect` and `wait` take the same conditions as tv_wait_for; a failing one fails the step. `expectRequest` asserts on the network log (see tv_network) and matches requests sent since the step began — put {"networkMark":true} before the action to widen the window, use "absent":true or "count":{"max":1} to catch a duplicate (both wait out the whole timeout). Runs under the device lock so nothing interleaves.',
+		description: 'Run a whole case body in ONE call, with a verdict, elapsed time and result per step. Steps are objects, one key each: {"launch":{"relaunch":true}} (start from a known state) | {"press":"RIGHT","repeat":2} | {"longpress":"ENTER","durationMs":1500} | {"goto":{"direction":"DOWN","text":"..."}} | {"menu":"Settings"} | {"wait":{"scene":"player"},"timeoutMs":30000} | {"expect":{"selector":"[class*=popup]"}} | {"expectRequest":{"urlPattern":"track","method":"POST","bodyContains":"event_id","timeoutMs":8000}} | {"networkMark":true} | {"eval":"ES5 expression"} | {"sleep":1000} | {"videoState":true} | {"state":true} | {"profileStart":true} | {"profileStop":{"path":"…"}} | {"metrics":true}. `goto` also takes {"element":"catalog.tile"} and {"select":true}; `wait`/`expect` also take {"element":…} / {"elementGone":…} / {"sceneName":…} — names from the app profile registry, echoed back as resolvedFrom. `expect` and `wait` take the same conditions as tv_wait_for; a failing one fails the step. `expectRequest` asserts on the network log (see tv_network) and matches requests sent since the step began — put {"networkMark":true} before the action to widen the window, use "absent":true or "count":{"max":1} to catch a duplicate (both wait out the whole timeout). Runs under the device lock so nothing interleaves.',
 		inputSchema: {
 			type: 'object',
 			properties: {
@@ -324,7 +330,10 @@ async function reachability(cfg) {
 	}
 }
 
-const CONDITION_KEYS = ['focusText', 'selector', 'selectorGone', 'scene', 'text', 'expression', 'videoAdvancing', 'request'];
+const CONDITION_KEYS = [
+	'focusText', 'element', 'elementGone', 'sceneName',
+	'selector', 'selectorGone', 'scene', 'text', 'expression', 'videoAdvancing', 'request'
+];
 
 /**
  * tv_wait_for takes its condition as flat arguments (easier for a model than a nested
@@ -362,7 +371,10 @@ async function handleCall(name, args) {
 		}
 		case 'tv_launch': {
 			const s = sessionFor(args.device);
-			const page = await s.ensureConnected({reload: !!args.reload, relaunch: !!args.relaunch, attach: !!args.attach});
+			const page = await s.ensureConnected({
+				reload: !!args.reload, relaunch: !!args.relaunch, attach: !!args.attach,
+				waitBoot: args.waitBoot
+			});
 			return textResult({device: s.cfg.id, engine: s.cfg.engine, attached: page});
 		}
 		case 'tv_press': {
@@ -430,8 +442,9 @@ async function handleCall(name, args) {
 		case 'tv_goto': {
 			const s = sessionFor(args.device);
 			return textResult(await s.goto({
-				direction: args.direction, text: args.text, selector: args.selector, testid: args.testid,
-				maxSteps: args.maxSteps, deadlineMs: args.deadlineMs
+				direction: args.direction, element: args.element,
+				text: args.text, selector: args.selector, testid: args.testid,
+				select: args.select, maxSteps: args.maxSteps, deadlineMs: args.deadlineMs
 			}));
 		}
 		case 'tv_menu': {

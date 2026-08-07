@@ -36,7 +36,8 @@ import {summarizeHeapSnapshot, diffHeapSummaries} from '../src/heap.js';
 import {metricsToMap, metricsDiff, windowSecondsOf} from '../src/metrics.js';
 import {CdpSession} from '../src/cdp.js';
 import {selectRequests, toListEntry, buildCurl, buildHar, capBody, compileUrlPattern} from '../src/network.js';
-import {pollRequests} from '../src/wait.js';
+import {pollRequests, conditionJs} from '../src/wait.js';
+import {loadAppProfile, resolveElement, resolveScene, resolveTarget, resolveCondition} from '../src/appprofile.js';
 import {videoStateJs, videoSampleStartJs, videoSampleFinishJs} from '../src/inject.js';
 
 /**
@@ -780,6 +781,120 @@ function avplayProbeChecks() {
 	check('no player instance reads as no video at all', none.first.found === 0, JSON.stringify(none.first));
 }
 
+/**
+ * 13: named elements and scenes. Pure host-side resolution, so it is fully testable here —
+ * and it has to be, because the whole point of the indirection is that a typo fails loudly
+ * instead of degrading into "nothing matched".
+ */
+function namedTargetChecks() {
+	console.log('\n--- named elements and scenes ---');
+
+	const withNames = join(dir, 'app-with-names.json');
+	writeFileSync(withNames, JSON.stringify({
+		id: 'named',
+		focus: ['._active'],
+		elements: {
+			'catalog.tile': '.demo-tile',
+			'menu.settings': {selector: '.demo-menu-item', text: 'Settings'},
+			'player.play': {testid: 'play-button'},
+			'label.only': {text: 'Continue watching'}
+		},
+		scenes: {catalog: 's-fixture', player: 's-player'}
+	}));
+	const bare = join(dir, 'app-no-names.json');
+	writeFileSync(bare, JSON.stringify({id: 'bare', focus: ['._active']}));
+
+	const p = loadAppProfile(withNames);
+	const b = loadAppProfile(bare);
+
+	check('a bare string element is shorthand for a selector',
+		resolveElement(p, 'catalog.tile').selector === '.demo-tile');
+	check('an object element keeps every qualifier it declares',
+		resolveElement(p, 'menu.settings').selector === '.demo-menu-item' &&
+		resolveElement(p, 'menu.settings').text === 'Settings');
+	check('the registry merges per key, so one defined element does not drop the rest',
+		Object.keys(p.elements).sort().join(',') === 'catalog.tile,label.only,menu.settings,player.play',
+		Object.keys(p.elements).join(','));
+	check('a profile with no elements block still has an empty registry, not undefined',
+		b.elements && Object.keys(b.elements).length === 0 && b.scenes && b.snapshot === null && b.record === null);
+
+	// The requireMenu contract: never a silent miss, always the list of what WOULD work.
+	let msg = '';
+	try {
+		resolveElement(p, 'catalog.tiles');
+	} catch (e) {
+		msg = e.message;
+	}
+	check('an unknown element name fails with the list of known names',
+		msg.includes('catalog.tile') && msg.includes('menu.settings') && msg.includes('player.play'), msg);
+	msg = '';
+	try {
+		resolveElement(b, 'anything');
+	} catch (e) {
+		msg = e.message;
+	}
+	check('a profile without a registry says so instead of listing nothing',
+		msg.includes('defines no elements') && msg.includes('apps/bare.json'), msg);
+	msg = '';
+	try {
+		resolveScene(p, 'catalogue');
+	} catch (e) {
+		msg = e.message;
+	}
+	check('an unknown scene name fails with the list of known scenes',
+		msg.includes('catalog') && msg.includes('player'), msg);
+
+	// tv_goto targets.
+	const t1 = resolveTarget(p, {element: 'catalog.tile', direction: 'RIGHT'});
+	check('a named goto target resolves to the flat matcher fields',
+		t1.target.selector === '.demo-tile' && t1.target.text === undefined,
+		JSON.stringify(t1.target));
+	check('and echoes what the name became',
+		t1.resolvedFrom.element === 'catalog.tile' && t1.resolvedFrom.selector === '.demo-tile',
+		JSON.stringify(t1.resolvedFrom));
+	const t2 = resolveTarget(p, {element: 'menu.settings', text: 'Library'});
+	check('an explicit field on the call narrows the name instead of being ignored',
+		t2.target.text === 'Library' && t2.target.selector === '.demo-menu-item',
+		JSON.stringify(t2.target));
+	const t3 = resolveTarget(p, {text: 'Library'});
+	check('a raw target passes through with no resolvedFrom',
+		t3.target.text === 'Library' && t3.resolvedFrom === null);
+
+	// wait conditions.
+	const c1 = resolveCondition(p, {element: 'catalog.tile'});
+	check('{element} becomes {selector}', c1.condition.selector === '.demo-tile' && !c1.condition.withText);
+	const c2 = resolveCondition(p, {elementGone: 'catalog.tile'});
+	check('{elementGone} becomes {selectorGone}', c2.condition.selectorGone === '.demo-tile');
+	const c3 = resolveCondition(p, {sceneName: 'player'});
+	check('{sceneName} becomes {scene}',
+		c3.condition.scene === 's-player' && c3.resolvedFrom.sceneName === 'player');
+	const c4 = resolveCondition(p, {element: 'menu.settings'});
+	check('a text qualifier is carried into the condition, not dropped silently',
+		c4.condition.selector === '.demo-menu-item' && c4.condition.withText === 'Settings',
+		JSON.stringify(c4.condition));
+	const c5 = resolveCondition(p, {element: 'player.play'});
+	check('a testid-only element becomes a testid selector',
+		c5.condition.selector === '[data-testid="play-button"], [data-export-id="play-button"]',
+		c5.condition.selector);
+	msg = '';
+	try {
+		resolveCondition(p, {element: 'label.only'});
+	} catch (e) {
+		msg = e.message;
+	}
+	check('a text-only element refuses to become a wait condition instead of matching everything',
+		msg.includes('text only') && msg.includes('focusText'), msg);
+	const c6 = resolveCondition(p, {selector: '.demo-popup'});
+	check('a raw condition passes through untouched',
+		c6.condition.selector === '.demo-popup' && c6.resolvedFrom === null);
+
+	// The generated predicate still has to run on Chrome 38, and it has to actually use the
+	// text qualifier — a `withText` that compiles but is ignored is the silent drop again.
+	const js = conditionJs(loadAppProfile('fixture'), {selector: '.demo-menu-item', withText: 'Settings'});
+	check('the withText predicate is ES5', !ES6_IN_PAGE_JS.test(js), (js.match(ES6_IN_PAGE_JS) || [])[0]);
+	check('and it really filters on the text', js.includes('WITH_TEXT') && js.includes('"settings"'));
+}
+
 async function main() {
 	profileChecks();
 	metricsChecks();
@@ -788,6 +903,7 @@ async function main() {
 	await requestWaitChecks();
 	await legacyEvaluateChecks();
 	avplayProbeChecks();
+	namedTargetChecks();
 
 	console.log('\n--- config and failure isolation ---');
 	// A PATH with node but no `sdb`/`tizen`, so tool calls have to fail gracefully.

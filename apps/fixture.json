@@ -13,6 +13,21 @@
   },
   "tile": ".demo-tile",
   "bootReady": {"selector": ".demo-tile", "timeoutMs": 15000},
+  "elements": {
+    "catalog.tile": ".demo-tile",
+    "catalog.title": "h1",
+    "menu.settings": {"selector": ".demo-menu-item", "text": "Settings"},
+    "ctx.popup": ".demo-popup",
+    "stat.button": {"testid": "stat"}
+  },
+  "scenes": {"catalog": "s-fixture"},
+  "snapshot": {
+    "row": ".demo-list, .demo-menu__items",
+    "item": ".demo-tile, .demo-menu-item",
+    "maxRows": 6,
+    "maxItemsPerRow": 12
+  },
+  "record": {"watch": [{"urlPattern": "/stat", "method": "POST", "name": "analytics"}]},
   "checks": {
     "note": "Read by the acceptance scripts (test/phase1-check.mjs) so they are not pinned to one product. homeSection — the section to come back to after a menu excursion; popup — what a tile's context menu looks like.",
     "homeSection": "Main",

@@ -10,25 +10,35 @@
 // Selectors and section names come from the device's app profile (see `appTargets`), so this
 // runs against any app that has one — nothing here is pinned to a particular product.
 //
-// Run: node test/phase1-check.mjs
+// Run: node test/phase1-check.mjs           (the config's defaultDevice)
+//      TV_DEBUG_DEVICE=webos7 node test/phase1-check.mjs
 import {startServer, makeChecker, sleep, appTargets} from './harness.mjs';
 
 const check = makeChecker();
+const DEVICE = process.env.TV_DEBUG_DEVICE || '';
 
 async function main() {
-	const target = appTargets();
+	const target = appTargets(DEVICE || undefined);
+	console.log(`  device: ${DEVICE || '(default)'}`);
 	console.log(`  app profile: ${target.app} (tile ${target.tile}, popup ${target.popup || '—'})`);
 
-	const s = startServer('tv');
-	await s.ready;
+	const raw = startServer('tv');
+	// One place to address the device, so every call below stays as short as it reads.
+	const s = {...raw, call: (name, args = {}) => raw.call(name, DEVICE ? {device: DEVICE, ...args} : args)};
+	await raw.ready;
 
 	console.log('\n--- boot ---');
 	const launched = await s.call('tv_launch', {});
 	check('fresh launch', !!launched.attached?.wsUrl, launched.__error);
+	// The profile's bootReady is now waited on by launch itself, so the answer to "did the app
+	// come up" arrives with the attach instead of taking a second round-trip per case.
+	check('launch reports bootReady from the app profile',
+		launched.attached?.bootReady?.ok === true,
+		JSON.stringify(launched.attached?.bootReady) + (launched.attached?.warning ? ` warn=${launched.attached.warning}` : ''));
+	console.log(`        (bootReady took ${launched.attached?.bootReady?.elapsedMs}ms — the old cases slept a flat 22000)`);
 
 	const booted = await s.call('tv_wait_for', {selector: target.tile, timeoutMs: 60000, stableMs: 700});
 	check('tv_wait_for replaces the boot sleep', booted.ok, `${booted.elapsedMs}ms, ${booted.polls} polls`);
-	console.log(`        (boot took ${booted.elapsedMs}ms — the old cases slept a flat 22000)`);
 
 	console.log('\n--- state ---');
 	const st = await s.call('tv_state');
@@ -67,6 +77,23 @@ async function main() {
 
 	const nowhere = await s.call('tv_goto', {direction: 'RIGHT', text: 'no-such-tile-anywhere-zzz', maxSteps: 6});
 	check('tv_goto stops on its own bound', nowhere.ok === false && !!nowhere.reason, nowhere.reason);
+
+	// Named targets on a real TV, using this app's own registry — nothing product-specific here.
+	const tileName = Object.keys(target.elements).find((n) => /tile|card|item/i.test(n)) || Object.keys(target.elements)[0];
+	if (tileName) {
+		const byName = await s.call('tv_goto', {direction: 'RIGHT', element: tileName, maxSteps: 4});
+		check(`tv_goto takes the named element "${tileName}" from the profile`, byName.ok,
+			byName.reason || byName.__error);
+		check('and echoes what the name resolved to',
+			byName.resolvedFrom?.element === tileName && !!byName.resolvedFrom?.selector,
+			JSON.stringify(byName.resolvedFrom));
+		const typo = await s.call('tv_wait_for', {element: `${tileName}-zzz`, timeoutMs: 2000});
+		check('a typo in a name fails loudly with the known names',
+			!!typo.__error && /unknown element/.test(typo.__error) && typo.__error.includes(tileName),
+			String(typo.__error).slice(0, 120));
+	} else {
+		console.log(`  SKIP  named targets — add an "elements" block to apps/${target.app}.json`);
+	}
 
 	console.log('\n--- menu ---');
 	const opened = await s.call('tv_menu', {select: false});

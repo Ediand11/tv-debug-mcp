@@ -18,7 +18,8 @@ export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
  *   "checks": {"homeSection": "Main", "popup": "[class*=context-menu]"}
  *
  * @param {string} [deviceId] defaults to the device config's defaultDevice
- * @return {{app: string, tile: string, popup: ?string, homeSection: ?string, bootTimeoutMs: number}}
+ * @return {{app: string, tile: string, popup: ?string, homeSection: ?string, bootTimeoutMs: number,
+ *           elements: Object<string, *>, scenes: Object<string, string>}}
  */
 export function appTargets(deviceId) {
 	const dev = getDevice(deviceId);
@@ -36,7 +37,11 @@ export function appTargets(deviceId) {
 		tile,
 		popup: checks.popup || null,
 		homeSection: checks.homeSection || null,
-		bootTimeoutMs: profile.bootReady?.timeoutMs || 60000
+		bootTimeoutMs: profile.bootReady?.timeoutMs || 60000,
+		// The named registries, so an on-device check can exercise the `element` forms with
+		// this app's own names and stay unpinned from any particular product.
+		elements: profile.elements || {},
+		scenes: profile.scenes || {}
 	};
 }
 

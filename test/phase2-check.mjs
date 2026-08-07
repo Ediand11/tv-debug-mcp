@@ -117,8 +117,16 @@ async function main() {
 	const devices = [
 		{id: 'pc-fixture', platform: 'pc', name: 'Chrome + fixture', app: 'fixture', url: fixtureUrl},
 		{id: 'pc-parity', platform: 'pc', name: 'Chrome + fixture, TV-identical input', app: 'fixture', url: fixtureUrl, inputMode: 'synthetic'},
-		{id: 'pc-dead', platform: 'pc', name: 'Chrome + a server that is not there', app: 'fixture', url: 'http://127.0.0.1:1'}
+		{id: 'pc-dead', platform: 'pc', name: 'Chrome + a server that is not there', app: 'fixture', url: 'http://127.0.0.1:1'},
+		// Same fixture, but a profile whose bootReady can never hold: the app "not booting" has
+		// to stay a finding you can investigate, not a failed attach.
+		{id: 'pc-noboot', platform: 'pc', name: 'Chrome + fixture, unreachable bootReady', app: join(dir, 'app-noboot.json'), url: fixtureUrl}
 	];
+	writeFileSync(join(dir, 'app-noboot.json'), JSON.stringify({
+		id: 'noboot',
+		focus: ['._active'],
+		bootReady: {selector: '.this-never-appears', timeoutMs: 1500}
+	}));
 	if (devUp) {
 		devices.push({id: 'pc-app', platform: 'pc', name: 'Chrome + your dev server', app: devApp, url: devUrl});
 	}
@@ -155,6 +163,21 @@ async function main() {
 		launched.attached?.href);
 	check('Chrome runs on an isolated throwaway profile', (await chromeCount()) > 0);
 
+	console.log('\n--- bootReady: launch says whether the app came up ---');
+	check('a fresh launch waits for the profile bootReady condition and reports it',
+		launched.attached?.bootReady?.ok === true && typeof launched.attached?.bootReady?.elapsedMs === 'number',
+		JSON.stringify(launched.attached?.bootReady));
+	const noboot = await s.call('tv_launch', {device: 'pc-noboot'});
+	check('an app that never reaches bootReady still attaches',
+		!!noboot.attached?.wsUrl, noboot.__error);
+	check('and says so with ok:false plus a warning, instead of failing the call',
+		noboot.attached?.bootReady?.ok === false && /bootReady/.test(String(noboot.attached?.warning)),
+		JSON.stringify({boot: noboot.attached?.bootReady, warn: noboot.attached?.warning}));
+	const skipBoot = await s.call('tv_launch', {device: 'pc-noboot', relaunch: true, waitBoot: false});
+	check('waitBoot:false skips the wait entirely',
+		!!skipBoot.attached?.wsUrl && skipBoot.attached?.bootReady === undefined,
+		JSON.stringify(skipBoot.attached?.bootReady));
+
 	console.log('\n--- navigation, unchanged from the TV path ---');
 	const booted = await s.call('tv_wait_for', {device: 'pc-fixture', selector: '.demo-tile', timeoutMs: 20000, stableMs: 300});
 	check('tv_wait_for works in the browser', booted.ok, `${booted.elapsedMs}ms`);
@@ -169,6 +192,29 @@ async function main() {
 
 	const goto = await s.call('tv_goto', {device: 'pc-fixture', direction: 'RIGHT', text: 'космос', maxSteps: 8});
 	check('tv_goto reaches a tile by text', goto.ok, goto.reason || `${goto.presses} presses`);
+
+	console.log('\n--- named elements and scenes, end to end ---');
+	const byName = await s.call('tv_goto', {device: 'pc-fixture', direction: 'LEFT', element: 'catalog.tile', text: 'котиков', maxSteps: 8});
+	check('tv_goto takes a name from the app profile', byName.ok, byName.reason || byName.__error);
+	check('and echoes the selector the name became',
+		byName.resolvedFrom?.element === 'catalog.tile' && byName.resolvedFrom?.selector === '.demo-tile',
+		JSON.stringify(byName.resolvedFrom));
+	const waitByName = await s.call('tv_wait_for', {device: 'pc-fixture', element: 'catalog.tile', timeoutMs: 5000});
+	check('tv_wait_for takes a named element', waitByName.ok && waitByName.resolvedFrom?.selector === '.demo-tile',
+		JSON.stringify(waitByName.resolvedFrom));
+	const waitScene = await s.call('tv_wait_for', {device: 'pc-fixture', sceneName: 'catalog', timeoutMs: 5000});
+	check('tv_wait_for takes a named scene', waitScene.ok && waitScene.resolvedFrom?.scene === 's-fixture',
+		JSON.stringify(waitScene.resolvedFrom));
+	const badName = await s.call('tv_wait_for', {device: 'pc-fixture', element: 'catalog.tiles', timeoutMs: 2000});
+	check('a typo in a name fails loudly with the known names, not as a timeout',
+		!!badName.__error && /unknown element/.test(badName.__error) && /catalog\.tile/.test(badName.__error),
+		String(badName.__error).slice(0, 120));
+	// The whole reason withText exists: this element is ".demo-menu-item" AND "Settings", and
+	// four menu items match the selector alone.
+	const goneWithText = await s.call('tv_wait_for', {device: 'pc-fixture', elementGone: 'menu.settings', timeoutMs: 1200});
+	check('a text-qualified element is not satisfied by any old match of its selector',
+		goneWithText.ok === false && goneWithText.resolvedFrom?.withText === 'Settings',
+		JSON.stringify(goneWithText.resolvedFrom));
 
 	const menu = await s.call('tv_menu', {device: 'pc-fixture', item: 'Settings'});
 	check('tv_menu selects a section', menu.ok, menu.reason || JSON.stringify(menu.items));

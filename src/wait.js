@@ -14,6 +14,11 @@
 //   {videoAdvancing: true}    playback position is moving (<video>, or AVPlay on old Tizen)
 //   {request: {...}}          a request matching the filter was sent (see pollRequests)
 //
+// `selector` / `selectorGone` additionally honour `withText`, which is not a user-facing
+// condition: it is what a named element carrying a text qualifier resolves into, so that
+// {"element": "menu.settings"} = {selector: ".menu-item", text: "Settings"} does not quietly
+// degrade into "any visible .menu-item" (see resolveCondition in appprofile.js).
+//
 // `stableMs` additionally requires the condition to keep holding for that long, which is
 // what stops a case from acting on a half-rendered frame.
 
@@ -38,12 +43,20 @@ export function conditionJs(profile, cond) {
 	} else if (cond.selector != null) {
 		body = `
 			var list = document.querySelectorAll(NEEDLE_RAW);
-			for (var i = 0; i < list.length; i++) { if (visible(list[i])) { return {ok: true, detail: txt(list[i], 60)}; } }
-			return {ok: false, detail: 'matches: ' + list.length + ', none visible'};`;
+			for (var i = 0; i < list.length; i++) {
+				if (!visible(list[i])) { continue; }
+				if (WITH_TEXT && txt(list[i], 200).toLowerCase().indexOf(WITH_TEXT) < 0) { continue; }
+				return {ok: true, detail: txt(list[i], 60)};
+			}
+			return {ok: false, detail: 'matches: ' + list.length + (WITH_TEXT ? ', none visible with that text' : ', none visible')};`;
 	} else if (cond.selectorGone != null) {
 		body = `
 			var list = document.querySelectorAll(NEEDLE_RAW);
-			for (var i = 0; i < list.length; i++) { if (visible(list[i])) { return {ok: false, detail: 'still visible'}; } }
+			for (var i = 0; i < list.length; i++) {
+				if (!visible(list[i])) { continue; }
+				if (WITH_TEXT && txt(list[i], 200).toLowerCase().indexOf(WITH_TEXT) < 0) { continue; }
+				return {ok: false, detail: 'still visible'};
+			}
 			return {ok: true, detail: 'gone'};`;
 	} else if (cond.scene != null) {
 		body = `
@@ -69,10 +82,13 @@ export function conditionJs(profile, cond) {
 
 	const needle = String(cond.focusText ?? cond.scene ?? cond.text ?? '').toLowerCase();
 	const raw = String(cond.selector ?? cond.selectorGone ?? '');
+	// Set only by a named element that carries a text qualifier (see resolveCondition).
+	const withText = cond.withText != null ? String(cond.withText).toLowerCase() : '';
 	return `(function(){
 		${stateHelpersJs(profile)}
 		var NEEDLE = ${JSON.stringify(needle)};
 		var NEEDLE_RAW = ${JSON.stringify(raw)};
+		var WITH_TEXT = ${JSON.stringify(withText)};
 		${body}
 	})()`;
 }
@@ -82,8 +98,9 @@ export function conditionJs(profile, cond) {
  * @return {string} human label for reports
  */
 export function describeCondition(cond) {
-	const key = Object.keys(cond)[0];
-	return `${key}=${JSON.stringify(cond[key])}`;
+	const key = Object.keys(cond).filter((k) => k !== 'withText')[0];
+	const base = `${key}=${JSON.stringify(cond[key])}`;
+	return cond.withText != null ? `${base} withText=${JSON.stringify(cond.withText)}` : base;
 }
 
 /**

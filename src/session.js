@@ -21,9 +21,9 @@ import {CdpSession, resolvePageWs, sleep, isUnsupportedMethod, MAX_POSTDATA_BYTE
 import {resolveKey} from './keymaps.js';
 import {focusSnapshotJs, videoStateJs, videoSampleStartJs, videoSampleFinishJs} from './inject.js';
 import {freePort} from './ports.js';
-import {loadAppProfile, requireMenu} from './appprofile.js';
+import {loadAppProfile, requireMenu, resolveTarget, resolveCondition} from './appprofile.js';
 import {stateJs, focusSignatureJs, focusMatchesJs, menuItemsJs} from './state.js';
-import {pollUntil, pollRequests} from './wait.js';
+import {pollUntil, pollRequests, describeCondition} from './wait.js';
 import {selectRequests, toListEntry, buildCurl, buildHar, capBody, HAR_BODY_TOTAL_LIMIT} from './network.js';
 import {summarizeProfile, applySourceMap, saveProfile} from './profile.js';
 import {summarizeHeapSnapshot} from './heap.js';
@@ -204,10 +204,75 @@ export class DeviceSession {
 	 *   for an already-live connection — a fresh launch is already a clean start.
 	 * - relaunch: drop the CDP connection and do a fresh kill+debug-launch.
 	 * - attach: don't kill a running instance; reuse its live inspector.
-	 * @param {{reload?: boolean, relaunch?: boolean, attach?: boolean}} [opts]
+	 * @param {{reload?: boolean, relaunch?: boolean, attach?: boolean, waitBoot?: boolean}} [opts]
 	 */
 	ensureConnected(opts = {}) {
-		return this._locked('_lifecycleLock', () => this._ensureConnectedLocked(opts));
+		return this._locked('_lifecycleLock', () => this._ensureConnectedLocked(opts))
+			// OUTSIDE the lock, and it has to stay outside: the boot wait evaluates page JS,
+			// and `_cdp()` on a dropped socket reaches for `_lifecycleLock` itself. Anything
+			// touching the page from inside `_ensureConnectedLocked` deadlocks the session.
+			.then((page) => this._waitBootReady(page, opts));
+	}
+
+	/**
+	 * Wait for the app profile's `bootReady` condition after attaching, so the answer to
+	 * tv_launch finally says whether the app actually came up — and every case stops opening
+	 * with a hand-written `{wait: …}` step that repeats the profile.
+	 *
+	 * Never throws. The attach itself succeeded; an app that did not boot is a FINDING, and
+	 * throwing here would take away tv_console / tv_network at the exact moment they matter.
+	 * @param {?object} page
+	 * @param {{reload?: boolean, relaunch?: boolean, waitBoot?: boolean}} opts
+	 * @return {Promise<?object>}
+	 */
+	async _waitBootReady(page, opts) {
+		const boot = this.profile.bootReady;
+		if (!page || !boot || opts.waitBoot === false) {
+			return page;
+		}
+		// Attaching to a running app must not wait for the catalog: it may legitimately be
+		// deep in the player, where the boot selector never appears again.
+		if (!page.freshLaunch && !opts.reload) {
+			return page;
+		}
+		// Already answered for this page object; a plain re-attach must not pay for it twice.
+		if (page.bootReady && !opts.relaunch && !opts.reload) {
+			return page;
+		}
+		const timeoutMs = boot.timeoutMs || 30000;
+		let cond = null;
+		if (boot.selector != null) {
+			cond = {selector: boot.selector};
+		} else if (boot.scene != null) {
+			cond = {scene: boot.scene};
+		}
+		if (!cond) {
+			page.bootReady = {ok: false, reason: 'bootReady block has neither "selector" nor "scene"'};
+			page.warning = `app profile "${this.profile.id}" has a bootReady block with nothing to wait for`;
+			return page;
+		}
+		const started = Date.now();
+		let res;
+		try {
+			// stableMs, because cases/README.md already records the trap: the selector exists
+			// before the tile has any content in it.
+			res = await this.waitFor(cond, {timeoutMs, stableMs: 300});
+		} catch (e) {
+			page.bootReady = {ok: false, elapsedMs: Date.now() - started, condition: describeCondition(cond), reason: e.message};
+			page.warning = `boot readiness could not be checked: ${e.message}`;
+			return page;
+		}
+		page.bootReady = {
+			ok: !!res.ok,
+			elapsedMs: res.elapsedMs != null ? res.elapsedMs : Date.now() - started,
+			condition: res.condition || describeCondition(cond)
+		};
+		if (!res.ok) {
+			page.warning =
+				`app did not reach bootReady (${page.bootReady.condition}) within ${timeoutMs}ms — ` +
+				'attached anyway, so tv_console / tv_network can say why';
+		}
+		return page;
 	}
 
 	async _ensureConnectedLocked(opts) {
@@ -1131,12 +1196,15 @@ export class DeviceSession {
 		if (condition && condition.request) {
 			return this.waitForRequest(condition.request, opts);
 		}
+		// Named forms ({element} / {elementGone} / {sceneName}) are folded into the raw ones
+		// here rather than in the tool handler, so tv_sequence steps get them for free.
+		const {condition: cond, resolvedFrom} = resolveCondition(this.profile, condition);
 		const io = {
 			evaluate: (js) => this.evaluate(js, true),
 			videoState: (gap) => this.videoState(gap)
 		};
-		const res = await pollUntil(io, this.profile, condition, opts);
-		return {...res, state: await this.state().catch(() => null)};
+		const res = await pollUntil(io, this.profile, cond, opts);
+		return {...res, ...(resolvedFrom ? {resolvedFrom} : {}), state: await this.state().catch(() => null)};
 	}
 
 	/**
@@ -1163,17 +1231,38 @@ export class DeviceSession {
 	 * how you burn ten minutes: `maxSteps`, a wall-clock `deadlineMs`, and two structural
 	 * stops — focus that stopped moving (edge of a list) and focus that returned to a
 	 * position we already visited (a carousel that wraps).
-	 * @param {{direction: string, text?: string, selector?: string, testid?: string,
-	 *          maxSteps?: number, deadlineMs?: number}} opts
+	 * @param {{direction: string, element?: string, text?: string, selector?: string, testid?: string,
+	 *          select?: boolean, maxSteps?: number, deadlineMs?: number}} opts
 	 */
 	async goto(opts) {
+		const {target, resolvedFrom} = resolveTarget(this.profile, opts);
+		const res = await this._gotoTarget(target, opts);
+		if (resolvedFrom) {
+			// Echo what the name actually became: a red case has to name the selector it
+			// really checked, otherwise the indirection is a debugging tax.
+			res.resolvedFrom = resolvedFrom;
+		}
+		// Arriving and selecting is one intent and two round-trips otherwise, and the pause
+		// between them is where a lazily-loading list moves the focus out from under you.
+		if (res.ok && opts.select) {
+			await this.press('ENTER');
+			res.selected = true;
+			res.state = await this.state().catch(() => null);
+		}
+		return res;
+	}
+
+	/**
+	 * @param {{text: ?string, selector: ?string, testid: ?string}} target
+	 * @param {{direction: string, maxSteps?: number, deadlineMs?: number}} opts
+	 */
+	async _gotoTarget(target, opts) {
 		const direction = String(opts.direction || '').toUpperCase();
 		if (!direction) {
 			throw new Error('tv_goto needs a direction (UP / DOWN / LEFT / RIGHT)');
 		}
-		const target = {text: opts.text, selector: opts.selector, testid: opts.testid};
 		if (target.text == null && target.selector == null && target.testid == null) {
-			throw new Error('tv_goto needs a target: text, selector or testid');
+			throw new Error('tv_goto needs a target: element, text, selector or testid');
 		}
 		const maxSteps = Math.min(200, Math.max(1, Math.floor(opts.maxSteps || 30)));
 		const deadline = Date.now() + (opts.deadlineMs || 45000);
