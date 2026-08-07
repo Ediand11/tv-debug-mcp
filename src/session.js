@@ -494,7 +494,7 @@ export class DeviceSession {
 
 	/**
 	 * @param {{assert?: string, longPressMs?: number, collapse?: boolean, heartbeatMs?: number,
-	 *          overlay?: boolean}} [opts]
+	 *          overlay?: boolean, relaunch?: boolean}} [opts]
 	 */
 	async recordStart(opts = {}) {
 		if (this._recorder) {
@@ -503,11 +503,40 @@ export class DeviceSession {
 				'stop it first with tv_record action:"stop"'
 			);
 		}
+		// Relaunch first, by default. Every compiled case opens with {launch:{relaunch:true}} —
+		// so a recording that began wherever the app happened to be produces a case whose first
+		// step contradicts all the others: the replay starts on the catalog, the recording started
+		// three screens in, and the case goes red for a reason that has nothing to do with the app.
+		// Recording from a fresh launch makes the two starting states the same one.
+		const warnings = [];
+		const relaunch = opts.relaunch !== false;
+		let bootReady = null;
+		if (relaunch) {
+			const page = await this.ensureConnected({relaunch: true});
+			bootReady = (page && page.bootReady) || null;
+			if (bootReady && bootReady.ok === false) {
+				// Not a throw: an app that did not reach bootReady is a finding, and the person
+				// may well be about to record exactly that. Say it and keep going.
+				warnings.push(
+					`the app did not reach bootReady in ${bootReady.elapsedMs}ms (${JSON.stringify(bootReady.condition)}) — ` +
+					'recording anyway, but the first steps may have been pressed into a screen that was still loading'
+				);
+			}
+		} else {
+			// The escape hatch, and the case has to carry its cost: this warning is copied into
+			// the compiled case at stop, because it is a property of the case, not of the session.
+			warnings.push(
+				'recorded with relaunch:false, so the recording did not start from a fresh launch — the compiled case ' +
+				'still opens with {launch:{relaunch:true}} and will replay from wherever THAT lands. Check the first steps by hand.'
+			);
+		}
 		const cdp = await this._cdp();
 		const installed = await this._installRecorder(cdp, opts);
 		this._recorder = {
 			cdp, timeline: new Timeline(), startedAt: Date.now(), opts,
-			timer: null, trusted: installed.trusted, keysSeen: 0
+			timer: null, trusted: installed.trusted, keysSeen: 0,
+			// Carried into the compiled case: whoever reads the case later never sees this answer.
+			caseWarnings: relaunch ? [] : warnings.slice()
 		};
 		this._recorder.timeline.setClock(installed.t0, Date.now());
 		this._recorder.timer = setInterval(() => {
@@ -518,7 +547,6 @@ export class DeviceSession {
 			this._recorder.timer.unref();
 		}
 
-		const warnings = [];
 		if (!installed.trusted) {
 			warnings.push(
 				'this engine does not report Event.isTrusted (below Chrome 46), so synthetic presses ' +
@@ -528,6 +556,8 @@ export class DeviceSession {
 		return {
 			ok: true, recording: true, device: this.cfg.id, target: installed.target,
 			overlay: opts.overlay !== false,
+			relaunched: relaunch,
+			...(bootReady ? {bootReady} : {}),
 			note: 'нажимайте пультом; на экране горит «● REC». Закончив — tv_record action:"stop"',
 			...(warnings.length ? {warnings} : {})
 		};
@@ -640,7 +670,10 @@ export class DeviceSession {
 				reason: 'no key events reached the page during the recording',
 				hint: 'на этом движке клавиши пульта могут не доходить до webview (часть кнопок съедает лаунчер). ' +
 					'Проверьте tv_record action:"status" во время нажатий.',
-				warnings: r.timeline.reinstalls ? [`connection dropped ${r.timeline.reinstalls} time(s)`] : []
+				warnings: [
+					...(r.caseWarnings || []),
+					...(r.timeline.reinstalls ? [`connection dropped ${r.timeline.reinstalls} time(s)`] : [])
+				]
 			};
 		}
 
@@ -681,36 +714,97 @@ export class DeviceSession {
 		const title = opts.title || `Запись с пульта (${this.cfg.id})`;
 		this._pendingCase = {
 			title, device: this.cfg.id, durationMs, note: opts.note,
-			steps: compiled.steps, checklist: compiled.checklist, warnings: compiled.warnings
+			steps: compiled.steps, checklist: compiled.checklist,
+			warnings: [...(r.caseWarnings || []), ...compiled.warnings],
+			path: opts.path || null
 		};
-		const written = this._writeCase(this._pendingCase, {path: opts.path, overwrite: opts.overwrite});
+		// Nothing is written here, on purpose. A compiled case is a DRAFT: the steps are inferred
+		// from what the person happened to press, and the one who can tell a real path from a
+		// wrong turn is the person who pressed it. So `stop` shows the case and waits — the file
+		// appears on action:"write", after a human has read it (and possibly edited the steps).
+		const wouldWriteTo = this._casePath(this._pendingCase, {});
 		return {
-			ok: true, durationMs, keys: compiled.stats.keys, observations: compiled.stats.observations,
+			ok: true, written: false, durationMs,
+			keys: compiled.stats.keys, observations: compiled.stats.observations,
 			dropped: compiled.stats.droppedPresses, reinstalls: compiled.stats.reinstalls,
 			// Steps inline: this is what goes straight into tv_sequence to check the recording,
-			// and it is 8-20 objects. The markdown stays on disk.
+			// and it is 8-20 objects.
 			steps: compiled.steps,
 			checklist: compiled.checklist,
-			...(compiled.warnings.length ? {warnings: compiled.warnings} : {}),
-			...written,
+			...(this._pendingCase.warnings.length ? {warnings: this._pendingCase.warnings} : {}),
+			// The exact file that action:"write" would produce — show THIS to the person, not a
+			// retelling of it, or they are approving something other than what lands on disk.
+			markdown: renderCase(this._pendingCase),
+			wouldWriteTo,
+			exists: existsSync(wouldWriteTo),
+			next: 'на диск ничего не записано. Покажите кейс человеку и спросите: сохранить как есть, ' +
+				'поправить (шаги/заголовок) или выбросить. Сохранить — tv_record action:"write" ' +
+				'(можно с title, note, path, overwrite, steps).',
 			replay: 'реплей не запускается сам: на живом ТВ он стартует плеер и шлёт аналитику. ' +
 				'Скормите steps в tv_sequence, когда решите прогнать'
 		};
 	}
 
 	/**
-	 * Finish a `stop` that refused to overwrite: the compiled case is still in the session.
-	 * @param {{path?: string, overwrite?: boolean, title?: string}} [opts]
+	 * Write the case `stop` compiled, once a human has approved it — optionally with edits.
+	 * Editing goes through here rather than through a hand-written file so that the checklist and
+	 * the warnings stay attached to the steps they belong to.
+	 * @param {{path?: string, overwrite?: boolean, title?: string, note?: string,
+	 *          steps?: Array<object>}} [opts]
 	 */
 	recordWrite(opts = {}) {
 		if (!this._pendingCase) {
-			throw new Error('nothing to write — the last recorded case is gone (a new tv_record start clears it)');
+			throw new Error('nothing to write — there is no compiled case in this session (tv_record action:"stop" makes one, and a new "start" clears it)');
 		}
 		if (opts.title) {
 			this._pendingCase.title = opts.title;
 		}
+		if (opts.note !== undefined) {
+			this._pendingCase.note = opts.note;
+		}
+		if (opts.steps !== undefined) {
+			if (!Array.isArray(opts.steps) || !opts.steps.length) {
+				throw new Error('steps must be a non-empty array of tv_sequence steps');
+			}
+			for (const [i, st] of opts.steps.entries()) {
+				if (!st || typeof st !== 'object' || Array.isArray(st) || !Object.keys(st).length) {
+					throw new Error(`steps[${i}] is not a step object: ${JSON.stringify(st)}`);
+				}
+			}
+			this._pendingCase.steps = opts.steps;
+			// The checklist was compiled against the ORIGINAL steps. Saying so is cheaper than
+			// recompiling it from steps a human wrote, and honest about what it now covers.
+			if (!this._pendingCase.edited) {
+				this._pendingCase.checklist = [
+					...this._pendingCase.checklist,
+					'шаги отредактированы вручную после компиляции — пункты выше относятся к исходной записи, перечитать'
+				];
+				this._pendingCase.edited = true;
+			}
+		}
 		const written = this._writeCase(this._pendingCase, {path: opts.path, overwrite: opts.overwrite});
+		if (written.written) {
+			this._pendingCase.path = written.path;
+		}
 		return {ok: !!written.written, ...written, steps: this._pendingCase.steps, checklist: this._pendingCase.checklist};
+	}
+
+	/**
+	 * Where a case would go. `stop` reports it, `_writeCase` uses it — one rule, so the path the
+	 * human approves is the path that gets written.
+	 * @param {object} c
+	 * @param {{path?: string}} opts
+	 * @return {string}
+	 */
+	_casePath(c, opts) {
+		if (opts.path) {
+			return resolve(opts.path);
+		}
+		if (c.path) {
+			return resolve(c.path);
+		}
+		const dir = process.env.TV_DEBUG_CASES_DIR ? resolve(process.env.TV_DEBUG_CASES_DIR) : RECORDED_DIR;
+		return join(dir, `${slugify(c.title)}.md`);
 	}
 
 	/**
@@ -722,13 +816,7 @@ export class DeviceSession {
 	 */
 	_writeCase(c, opts) {
 		const warnings = [];
-		let outPath;
-		if (opts.path) {
-			outPath = resolve(opts.path);
-		} else {
-			const dir = process.env.TV_DEBUG_CASES_DIR ? resolve(process.env.TV_DEBUG_CASES_DIR) : RECORDED_DIR;
-			outPath = join(dir, `${slugify(c.title)}.md`);
-		}
+		const outPath = this._casePath(c, opts);
 		if (existsSync(outPath) && !opts.overwrite) {
 			return {written: false, conflict: outPath};
 		}

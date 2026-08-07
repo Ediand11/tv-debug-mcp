@@ -574,10 +574,19 @@ async function main() {
 	// Run on the PARITY device (inputMode: synthetic) on purpose: those presses are dispatched
 	// into `document`, exactly like a TV's, so a capture listener on `window` seeing them is
 	// the same experiment the remote will be. The zero-TV replay test only exists because of it.
-	await s.call('tv_launch', {device: 'pc-parity', relaunch: true});
+	// Deliberately NOT launching first: start has to do it itself. The case it compiles opens
+	// with {launch:{relaunch:true}}, so a recording that began anywhere else compiles into a
+	// case whose first step disagrees with the rest of it.
+	await s.call('tv_press', {device: 'pc-parity', key: 'RIGHT', repeat: 2});
 	const recStart = await s.call('tv_record', {device: 'pc-parity', action: 'start', title: 'phase2 recorded case'});
 	check('tv_record starts and says what it installed', recStart.ok === true && recStart.recording === true,
 		JSON.stringify(recStart));
+	check('start relaunched the app itself, so the recording begins where the case will replay',
+		recStart.relaunched === true && recStart.bootReady?.ok === true,
+		JSON.stringify({relaunched: recStart.relaunched, boot: recStart.bootReady}));
+	const focusAtStart = await s.call('tv_state', {device: 'pc-parity'});
+	check('and the focus really is back at the start of the list', focusAtStart.focus?.index === 0,
+		JSON.stringify(focusAtStart.focus));
 	const badgeUp = await s.call('tv_evaluate', {device: 'pc-parity', expression: 'document.querySelectorAll(".__tvdbg-rec").length'});
 	check('the REC badge is on screen while recording', badgeUp.value === 1, JSON.stringify(badgeUp));
 	const badgeInvisible = await s.call('tv_snapshot', {device: 'pc-parity'});
@@ -614,17 +623,31 @@ async function main() {
 		recSteps.some((x) => x.expect?.selectorGone === '.demo-popup'),
 		JSON.stringify(recSteps.filter((x) => x.expect)));
 	check('no sleep step is ever emitted', JSON.stringify(recSteps).indexOf('sleep') < 0);
-	check('the case is on disk', rec.written === true && existsSync(rec.path), JSON.stringify({w: rec.written, p: rec.path}));
-	const md = readFileSync(rec.path, 'utf8');
-	const fence = /```json\n([\s\S]*?)\n```/.exec(md);
+	// A compiled case is a DRAFT. stop shows it and stops; nothing reaches the disk until a
+	// human has read it. This is the whole point of the two-step flow — assert the file's ABSENCE.
+	check('stop writes NOTHING to disk and says where the case would go',
+		rec.written === false && !existsSync(recPath) && rec.wouldWriteTo === recPath && rec.exists === false,
+		JSON.stringify({written: rec.written, would: rec.wouldWriteTo, onDisk: existsSync(recPath)}));
+	check('and it hands back the exact markdown a human is asked to approve',
+		typeof rec.markdown === 'string' && rec.markdown.startsWith('# phase2 recorded case') && !!rec.next,
+		String(rec.markdown).slice(0, 60));
+	const fence = /```json\n([\s\S]*?)\n```/.exec(rec.markdown || '');
 	let roundTripped = null;
 	try {
 		roundTripped = JSON.parse(fence[1]);
 	} catch (e) {
 		roundTripped = e.message;
 	}
-	check('and its JSON block round-trips back to the same steps',
+	check('the JSON block in that preview round-trips back to the same steps',
 		JSON.stringify(roundTripped) === JSON.stringify(recSteps), typeof roundTripped === 'string' ? roundTripped : 'mismatch');
+
+	// Approval, second step: the file appears only now, and its content is what was previewed.
+	const saved = await s.call('tv_record', {device: 'pc-parity', action: 'write'});
+	check('action:"write" saves the approved case where stop said it would',
+		saved.written === true && saved.path === recPath && existsSync(recPath),
+		JSON.stringify({written: saved.written, path: saved.path}));
+	check('and the file on disk is byte-for-byte the preview',
+		readFileSync(recPath, 'utf8') === rec.markdown, 'the human approved something other than what was written');
 
 	// The reckoning: the recording has to actually run.
 	const replay = await s.call('tv_sequence', {device: 'pc-parity', steps: recSteps});
@@ -636,12 +659,33 @@ async function main() {
 	await s.call('tv_press', {device: 'pc-parity', key: 'RIGHT'});
 	await sleep(700);
 	const second = await s.call('tv_record', {device: 'pc-parity', action: 'stop', title: 'phase2 recorded case', path: recPath});
-	check('a second recording refuses to overwrite and says what it collided with',
-		second.written === false && second.conflict === recPath && (second.steps || []).length > 0,
-		JSON.stringify({written: second.written, conflict: second.conflict}));
-	const forced = await s.call('tv_record', {device: 'pc-parity', action: 'write', path: recPath, overwrite: true});
+	check('a second recording warns up front that the file is already there',
+		second.written === false && second.exists === true && (second.steps || []).length > 0,
+		JSON.stringify({written: second.written, exists: second.exists}));
+	const collided = await s.call('tv_record', {device: 'pc-parity', action: 'write'});
+	check('writing over it is refused and the conflict is named',
+		collided.written === false && collided.conflict === recPath,
+		JSON.stringify({written: collided.written, conflict: collided.conflict}));
+
+	// "Save it, edit it, or throw it away" — the edit branch. A human drops a step they know was
+	// a wrong turn; saving the correction must not need hand-writing markdown.
+	const edited = (second.steps || []).slice(0, -1);
+	const forced = await s.call('tv_record', {
+		device: 'pc-parity', action: 'write', path: recPath, overwrite: true,
+		title: 'phase2 recorded case', steps: edited
+	});
 	check('action:"write" with overwrite finishes the job from the held compilation',
 		forced.written === true && forced.path === recPath, JSON.stringify(forced));
+	const editedMd = readFileSync(recPath, 'utf8');
+	const onDisk = JSON.parse(/```json\n([\s\S]*?)\n```/.exec(editedMd)[1]);
+	check('the edited steps are what landed on disk, not the compiled ones',
+		JSON.stringify(onDisk) === JSON.stringify(edited) && onDisk.length === second.steps.length - 1,
+		JSON.stringify({disk: onDisk.length, compiled: second.steps.length}));
+	check('and the checklist says the steps were edited after compilation',
+		/отредактированы вручную/.test(editedMd), 'the case claims a checklist it no longer matches');
+	const badSteps = await s.call('tv_record', {device: 'pc-parity', action: 'write', path: recPath, overwrite: true, steps: []});
+	check('an empty steps override is refused instead of writing an empty case',
+		!!badSteps.__error && /non-empty/.test(badSteps.__error), String(badSteps.__error).slice(0, 80));
 
 	const badgeGone = await s.call('tv_evaluate', {device: 'pc-parity', expression: 'document.querySelectorAll(".__tvdbg-rec").length'});
 	check('the REC badge is gone after stop', badgeGone.value === 0, JSON.stringify(badgeGone));

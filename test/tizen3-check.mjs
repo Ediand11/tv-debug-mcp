@@ -182,7 +182,7 @@ async function main() {
 			recStatus.keysSeen >= 2 && recStatus.observations > 0,
 			JSON.stringify({keys: recStatus.keysSeen, obs: recStatus.observations}));
 		const stopped = await s.call('tv_record', {
-			device: DEVICE, action: 'stop', overwrite: true,
+			device: DEVICE, action: 'stop',
 			path: `${process.env.TMPDIR || '/tmp'}/tizen3-recorded.md`
 		});
 		check('stop compiles a runnable case', stopped.ok === true && (stopped.steps || []).length > 1,

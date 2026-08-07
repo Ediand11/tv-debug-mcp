@@ -182,16 +182,21 @@ const TOOLS = [
 	},
 	{
 		name: 'tv_record',
-		description: 'Record what a person does with the PHYSICAL remote and compile it into a runnable tv_sequence plus a checklist of what only a human can confirm. action:"start" installs a page-side listener and puts a "● REC" badge on screen (overlay:false turns it off); the person then navigates with the real remote; action:"stop" compiles and writes a markdown case. action:"status" says how many keys have been seen — use it to check the remote is reaching the page at all. The compiler collapses a run of the same direction into ONE goto (only while the focus actually moved on every press — an overshoot at the edge of a list is dropped with a warning), turns physical auto-repeat into {press,repeat} rather than a long-press (a synthetic long-press sends one keydown and would scroll nothing), turns observed scene/popup/video changes into waits and expects, and NEVER emits a sleep step. Network assertions come only from the app profile\'s record.watch whitelist, and bodyContains is never inferred. `steps` come back inline — that is what you feed to tv_sequence to check the recording. The replay is NOT run automatically: on a live TV it starts the player and fires analytics. A file that already exists is NOT overwritten and NOT silently suffixed: you get {written:false, conflict} and ask the human, then finish with action:"write" and an explicit path or overwrite:true.',
+		description: 'Record what a person does with the PHYSICAL remote and compile it into a runnable tv_sequence plus a checklist of what only a human can confirm. action:"start" RELAUNCHES the app (so the recording begins in the same state the compiled case will replay from), installs a page-side listener and puts a "● REC" badge on screen (overlay:false turns it off, relaunch:false skips the restart and warns in the case); the person then navigates with the real remote; action:"stop" compiles the case and RETURNS it — steps inline plus the exact `markdown` that would be written — WITHOUT touching the disk. Show that case to the human and ask: save it, edit it, or throw it away; then action:"write" writes the file (title / note / path / overwrite / steps override the draft — pass `steps` to save a corrected version). action:"status" says how many keys have been seen — use it to check the remote is reaching the page at all. The compiler collapses a run of the same direction into ONE goto (only while the focus actually moved on every press — an overshoot at the edge of a list is dropped with a warning), turns physical auto-repeat into {press,repeat} rather than a long-press (a synthetic long-press sends one keydown and would scroll nothing), turns observed scene/popup/video changes into waits and expects, and NEVER emits a sleep step. Network assertions come only from the app profile\'s record.watch whitelist, and bodyContains is never inferred. The replay is NOT run automatically: on a live TV it starts the player and fires analytics. A file that already exists is NOT overwritten and NOT silently suffixed: you get {written:false, conflict} and ask the human, then write again with an explicit path or overwrite:true.',
 		inputSchema: {
 			type: 'object',
 			properties: {
 				...DEVICE_PROP,
-				action: {type: 'string', enum: ['start', 'stop', 'status', 'write'], description: 'start (default) | stop | status | write (finish a stop that hit a name collision).'},
+				action: {type: 'string', enum: ['start', 'stop', 'status', 'write'], description: 'start (default) | stop (compile and show, writes nothing) | status | write (save the case stop compiled, after a human has approved it).'},
 				title: {type: 'string', description: 'Case title; also the file name. Default: "Запись с пульта (<device>)".'},
-				path: {type: 'string', description: 'Where to write the .md. Default: <package>/cases/recorded/<slug>.md (gitignored), or TV_DEBUG_CASES_DIR.'},
+				path: {type: 'string', description: 'Where to write the .md. Default: <package>/cases/recorded/<slug>.md (gitignored), or TV_DEBUG_CASES_DIR. On stop it only chooses the path reported as wouldWriteTo.'},
 				overwrite: {type: 'boolean', description: 'Allow replacing an existing file. Off by default — a collision is reported, not resolved.'},
 				note: {type: 'string', description: 'A line of context written into the case above the steps.'},
+				steps: {
+					type: 'array', items: {type: 'object'},
+					description: 'action:"write" only — save these steps instead of the compiled ones. This is how a human-corrected case is saved (drop a wrong turn, add an expect) without hand-writing the markdown; the checklist is kept and marked as belonging to the original recording.'
+				},
+				relaunch: {type: 'boolean', description: 'action:"start" only. Relaunch the app before recording (default true). The compiled case always opens with {launch:{relaunch:true}}, so recording from a fresh launch is what makes the case replay from the state it was recorded in. false records from wherever the app is now, and says so in the case.'},
 				assert: {
 					type: 'string', enum: ['minimal', 'normal', 'rich'],
 					description: 'How much to assert. minimal: keys only — a case that stays green with the app broken. normal (default): scene and popup changes. rich: also video-advancing assertions, which are brittle from day one if you do not need them.'
@@ -479,7 +484,7 @@ async function handleCall(name, args) {
 			if (action === 'start') {
 				return textResult(await s.recordStart({
 					assert: args.assert, longPressMs: args.longPressMs, collapse: args.collapse,
-					heartbeatMs: args.heartbeatMs, overlay: args.overlay
+					heartbeatMs: args.heartbeatMs, overlay: args.overlay, relaunch: args.relaunch
 				}));
 			}
 			if (action === 'status') {
@@ -492,7 +497,10 @@ async function handleCall(name, args) {
 				}));
 			}
 			if (action === 'write') {
-				return textResult(s.recordWrite({path: args.path, overwrite: !!args.overwrite, title: args.title}));
+				return textResult(s.recordWrite({
+					path: args.path, overwrite: !!args.overwrite, title: args.title,
+					note: args.note, steps: args.steps
+				}));
 			}
 			return errorResult(`tv_record needs action "start", "stop", "status" or "write", got ${JSON.stringify(args.action)}`);
 		}

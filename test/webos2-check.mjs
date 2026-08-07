@@ -102,7 +102,7 @@ async function main() {
 		check('key events reach the page and the drain sees them',
 			recStatus.keysSeen >= 2, JSON.stringify({keys: recStatus.keysSeen, connected: recStatus.connected}));
 		const stopped = await s.call('tv_record', {
-			device: DEVICE, action: 'stop', overwrite: true,
+			device: DEVICE, action: 'stop',
 			path: `${process.env.TMPDIR || '/tmp'}/webos2-recorded.md`
 		});
 		// Either a compiled case, or an honest refusal — never an empty case that looks like a pass.
