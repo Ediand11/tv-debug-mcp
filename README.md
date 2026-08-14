@@ -441,6 +441,7 @@ tv_heap {"action": "diff", "before": "/tmp/before.heapsnapshot", "after": "/tmp/
     {"id": "tizen", "platform": "tizen", "app": "myapp", "appId": "AbCdEfGhIj.myapp",
      "host": "192.168.1.10", "sdbPort": 26101, "localPort": 9955},
     {"id": "webos", "platform": "webos", "app": "myapp", "appId": "com.example.myapp", "device": "webos7"},
+    {"id": "vidaa", "platform": "vidaa", "app": "myapp", "host": "192.168.1.13", "port": 9226},
     {"id": "pc-dev", "platform": "pc", "app": "myapp", "url": "http://localhost:1337"},
     {"id": "pc-dev-parity", "platform": "pc", "app": "myapp", "url": "http://localhost:1337",
      "inputMode": "synthetic"}
@@ -453,11 +454,12 @@ tv_heap {"action": "diff", "before": "/tmp/before.heapsnapshot", "after": "/tmp/
 | Поле | Для кого | Что задаёт |
 |---|---|---|
 | `id` | все | имя устройства в тулах и в `TV_DEBUG_DEVICE`. Уникально — дубли отвергаются на загрузке конфига |
-| `platform` | все | `tizen` \| `webos` \| `pc` |
+| `platform` | все | `tizen` \| `webos` \| `vidaa` \| `pc` |
 | `app` | все | id app-профиля: читается `apps/<app>.json`. Без него доступна только дженерик-часть тулов |
 | `name`, `engine` | все | человекочитаемые подписи, видны в выводе `tv_devices` |
 | `appId` | tizen, webos | id приложения на устройстве (`AbCdEfGhIj.myapp`, `com.example.myapp`) |
-| `host` | tizen | IP телевизора |
+| `host` | tizen, vidaa | IP телевизора. У vidaa это **весь адрес**: инспектор слушает на самом ТВ (в отличие от webOS, где `device` — имя из ares) |
+| `port` | vidaa | порт DevTools-инспектора на ТВ. Не указан — узкий автоскан 9222–9230. На VIDAA 9 (50A53FEVS) это **9226**, на старых прошивках встречался 9223. Dev-режим включается пультом: `Home×3 → Up×2 → Right-Left-Right-Left-Right`. ⚠️ Инспектор без авторизации — любой в LAN может подключиться; только для dev-девайса. `appId` не нужен: апп hosted, sideload/kill по сети недоступны (`relaunch` = перезагрузка страницы) |
 | `sdbPort` | tizen | порт sdb, по умолчанию `26101` |
 | `cliTarget` | tizen | цель для `tizen install -t`, чтобы билд поехал в нужный ТВ на парке. Можно не указывать — выводится из третьей колонки `sdb devices` |
 | `localPort` | tizen | локальный порт под `sdb forward`. Не указан — берётся свободный; два устройства с одним и тем же пином отвергаются, иначе они перекрёстно склеились бы |

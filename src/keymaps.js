@@ -97,6 +97,33 @@ const WEBOS = {
 	CHANNEL_DOWN: k(34, 'PageDown', 'PageDown')
 };
 
+// Vidaa (Hisense). Codes come verbatim from the platform's own input layer — the OS keeps
+// MENU / HOME / INFO / EXIT for itself and never delivers them to the app, so they are
+// deliberately absent here.
+// BACK really is 8 (Backspace), not 461 (webOS) or 10009 (Tizen). FAST_FORWARD/REWIND
+// each have a second platform code (424/425) the app also accepts; the primary one is
+// enough to drive it, and a raw number still resolves for the rest.
+/** @type {KeyMap} */
+const VIDAA = {
+	...DPAD,
+	BACK: k(8, 'Backspace', 'Backspace'),
+	RED: k(403, 'ColorF0Red'),
+	GREEN: k(404, 'ColorF1Green'),
+	YELLOW: k(405, 'ColorF2Yellow'),
+	BLUE: k(406, 'ColorF3Blue'),
+	PLAY: k(415, 'MediaPlay'),
+	PAUSE: k(19, 'MediaPause', 'Pause'),
+	PLAY_PAUSE: k(463, 'MediaPlayPause'),
+	STOP: k(413, 'MediaStop'),
+	REWIND: k(412, 'MediaRewind'),
+	FAST_FORWARD: k(417, 'MediaFastForward'),
+	// The app maps the channel-key codes to page scrolling, same as webOS; aliases kept.
+	PAGE_UP: k(427, 'ChannelUp'),
+	PAGE_DOWN: k(428, 'ChannelDown'),
+	CHANNEL_UP: k(427, 'ChannelUp'),
+	CHANNEL_DOWN: k(428, 'ChannelDown')
+};
+
 // The PC/dev build runs in a plain Chrome, so only keys a desktop keyboard can produce.
 /** @type {KeyMap} */
 const PC = {
@@ -107,7 +134,7 @@ const PC = {
 	PAGE_DOWN: k(34, 'PageDown', 'PageDown')
 };
 
-export const KEYMAPS = {tizen: TIZEN, webos: WEBOS, pc: PC};
+export const KEYMAPS = {tizen: TIZEN, webos: WEBOS, vidaa: VIDAA, pc: PC};
 
 /**
  * @param {string} platform

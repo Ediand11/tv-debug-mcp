@@ -15,6 +15,7 @@ import {fileURLToPath} from 'node:url';
 
 import {TizenAdapter} from './adapters/tizen.js';
 import {WebosAdapter} from './adapters/webos.js';
+import {VidaaAdapter} from './adapters/vidaa.js';
 import {PcAdapter} from './adapters/pc.js';
 import {SyntheticInput} from './input/synthetic.js';
 import {TrustedInput} from './input/trusted.js';
@@ -82,6 +83,9 @@ function makeAdapter(cfg, log) {
 	}
 	if (cfg.platform === 'webos') {
 		return new WebosAdapter({device: cfg.device, log});
+	}
+	if (cfg.platform === 'vidaa') {
+		return new VidaaAdapter({host: cfg.host, port: cfg.port, log});
 	}
 	if (cfg.platform === 'pc') {
 		return new PcAdapter({chromePath: cfg.chromePath, profileDir: cfg.profileDir, chromeArgs: cfg.chromeArgs, log});

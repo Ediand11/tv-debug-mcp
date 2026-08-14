@@ -44,6 +44,14 @@
       "host": "192.168.1.11"
     },
     {
+      "id": "vidaa",
+      "platform": "vidaa",
+      "name": "Hisense, VIDAA 9 / Chromium 111 — attach по IP, host = реальный IP ТВ",
+      "app": "myapp",
+      "host": "192.168.1.13",
+      "port": 9226
+    },
+    {
       "id": "webos2",
       "platform": "webos",
       "name": "LG, webOS 2 / WebKit 538 — legacy inspector, no CDP",

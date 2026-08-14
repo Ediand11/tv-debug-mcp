@@ -12,17 +12,18 @@ import {dirname, join, resolve} from 'node:path';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-export const PLATFORMS = ['tizen', 'webos', 'pc'];
+export const PLATFORMS = ['tizen', 'webos', 'vidaa', 'pc'];
 
 /**
  * @typedef {{
  *   id: string,
- *   platform: 'tizen'|'webos'|'pc',
+ *   platform: 'tizen'|'webos'|'vidaa'|'pc',
  *   name?: string,
  *   engine?: string,
  *   app?: string,
  *   appId?: string,
  *   host?: string,
+ *   port?: number,
  *   sdbPort?: number,
  *   cliTarget?: string,
  *   device?: string,
@@ -69,6 +70,11 @@ function validate(devices, path, defaultDevice) {
 		}
 		if (d.platform === 'tizen' && !d.host) {
 			throw new Error(`${path}: tizen device "${d.id}" needs "host" (the TV's IP)`);
+		}
+		// Vidaa is attach-only over the network: the inspector listens on the TV itself, so the
+		// IP is the whole address. No appId — the hosted app has nothing to install or launch.
+		if (d.platform === 'vidaa' && !d.host) {
+			throw new Error(`${path}: vidaa device "${d.id}" needs "host" (the TV's IP)`);
 		}
 		if ((d.platform === 'tizen' || d.platform === 'webos') && !d.appId) {
 			throw new Error(`${path}: ${d.platform} device "${d.id}" needs "appId"`);

@@ -18,7 +18,8 @@
     "check:browser": "node test/phase2-check.mjs",
     "check:tv": "node test/phase0-check.mjs && node test/phase1-check.mjs",
     "check:webos2": "node test/webos2-check.mjs",
-    "check:tizen3": "node test/tizen3-check.mjs"
+    "check:tizen3": "node test/tizen3-check.mjs",
+    "check:vidaa": "node test/vidaa-check.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",

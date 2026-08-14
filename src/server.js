@@ -358,6 +358,19 @@ async function reachability(cfg) {
 				.catch((e) => ({stdout: e.stdout || ''}));
 			return stdout ? 'reachable' : 'unknown';
 		}
+		if (cfg.platform === 'vidaa') {
+			// Attach-only platform: reachable ⇔ the on-TV inspector answers /json/version.
+			const ac = new AbortController();
+			const t = setTimeout(() => ac.abort(), 3000);
+			try {
+				const res = await fetch(`http://${cfg.host}:${cfg.port || 9226}/json/version`, {signal: ac.signal});
+				return res.ok ? 'online' : `inspector-http-${res.status}`;
+			} catch {
+				return 'offline';
+			} finally {
+				clearTimeout(t);
+			}
+		}
 		if (cfg.platform === 'pc') {
 			const ac = new AbortController();
 			const t = setTimeout(() => ac.abort(), 3000);
