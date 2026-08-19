@@ -7,7 +7,7 @@ MCP-сервер для полуручного прогона QA-кейсов н
 ## Быстрый старт
 
 ```bash
-git clone https://github.com/Ediand11/tv-debug-mcp.git
+git clone git@gitlab.corp.mail.ru:vkvideo/tv-debug-mcp.git
 cd tv-debug-mcp
 npm install                                    # за корп-прокси: env -u HTTP_PROXY -u HTTPS_PROXY npm install
 cp devices.example.json devices.json           # devices.json в .gitignore — ваш парк остаётся локальным
