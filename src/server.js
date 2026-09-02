@@ -14,7 +14,9 @@
 
 import {Server} from '@modelcontextprotocol/sdk/server/index.js';
 import {StdioServerTransport} from '@modelcontextprotocol/sdk/server/stdio.js';
-import {ListToolsRequestSchema, CallToolRequestSchema} from '@modelcontextprotocol/sdk/types.js';
+import {
+	ListToolsRequestSchema, CallToolRequestSchema, ListResourcesRequestSchema, ReadResourceRequestSchema
+} from '@modelcontextprotocol/sdk/types.js';
 import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
 import {writeFileSync} from 'node:fs';
@@ -25,6 +27,9 @@ import {DeviceSession, deviceCapabilities} from './session.js';
 import {diffHeapSummaries} from './heap.js';
 import {knownKeys} from './keymaps.js';
 import {parseSdbDevices} from './adapters/tizen.js';
+import {listDocResources, readDocResource, DOC_URI_PREFIX} from './tooldocs.js';
+import {renderStateText, renderSnapshotText} from './render.js';
+import {PKG_VERSION} from './version.js';
 
 const execFileP = promisify(execFile);
 const log = (...a) => console.error('[tv-debug-mcp]', ...a);
@@ -48,290 +53,184 @@ function sessionFor(deviceId) {
 }
 
 const DEVICE_PROP = {
-	device: {type: 'string', description: 'Device id from devices.json. Omit to use the default device.'}
+	device: {type: 'string'}
 };
 
+// Bounds are enforced by the handlers, not advertised: 18 tools × min/max was a kilobyte of schema.
+const withDesc = (o, description) => (description ? {...o, description} : o);
+const int = (min, max, description) => withDesc({type: 'integer'}, description);
+const str = (description) => withDesc({type: 'string'}, description);
+const bool = (description) => withDesc({type: 'boolean'}, description);
+const en = (values, description) => withDesc({type: 'string', enum: values}, description);
+const tool = (name, description, properties = {}, required = []) => ({
+	name,
+	description,
+	inputSchema: {type: 'object', properties: {...DEVICE_PROP, ...properties}, ...(required.length ? {required} : {})}
+});
+
+/**
+ * The tool list is sent to the model by every client, by some on every turn — it is kept to a
+ * sentence or two per tool. The full reference (actions, step shapes, answer shapes) is an MCP
+ * resource per tool: tv-debug://docs/<tool>.
+ */
 const TOOLS = [
-	{
-		name: 'tv_devices',
-		description: 'List configured TVs, their reachability (sdb/ares) and which operations each supports. Start here to see the park.',
-		inputSchema: {type: 'object', properties: {}}
-	},
-	{
-		name: 'tv_install',
-		description: 'Install an app package on a TV (.wgt for Tizen, .ipk for webOS). Provide an absolute path. Set uninstallFirst:true when an app signed with a different certificate is already installed.',
-		inputSchema: {
-			type: 'object',
-			properties: {
-				...DEVICE_PROP,
-				path: {type: 'string', description: 'Absolute path to the .wgt/.ipk package.'},
-				uninstallFirst: {type: 'boolean', description: 'Uninstall the app id from this device before installing (fixes "Author certificate not match").'}
-			},
-			required: ['path']
-		}
-	},
-	{
-		name: 'tv_launch',
-		description: 'Debug-launch the app and attach over CDP. Establishes the session used by all other tools. By default it kills any running instance first for a deterministic fresh start. reload:true reloads the page in place (same process, keeps localStorage). relaunch:true forces a fresh kill+launch. attach:true reuses the inspector of an app already running in debug, keeping its state. After a fresh launch it also waits for the app profile\'s bootReady condition and reports attached.bootReady {ok, elapsedMs, condition} — so the answer says whether the app actually came up, and a case does not need to open with its own wait step. A boot that never completes does NOT fail the call: the attach worked, and tv_console / tv_network are exactly what you need next.',
-		inputSchema: {
-			type: 'object',
-			properties: {
-				...DEVICE_PROP,
-				reload: {type: 'boolean', description: 'Reload the page in place when already attached (does not clear localStorage).'},
-				relaunch: {type: 'boolean', description: 'Force a fresh kill + debug-launch even if already attached.'},
-				attach: {type: 'boolean', description: 'Attach to a running instance without killing it (skips the fresh-start kill).'},
-				waitBoot: {type: 'boolean', description: "Wait for the app profile's bootReady condition after a fresh launch (default true). Set false to attach and look around immediately, e.g. to watch the boot itself."}
-			}
-		}
-	},
-	{
-		name: 'tv_press',
-		description: 'Send a remote key. Names: UP/DOWN/LEFT/RIGHT/ENTER/BACK/MENU/RED/GREEN/YELLOW/BLUE/PLAY/PAUSE/PAGE_UP/... (or a raw numeric keyCode). durationMs holds the key (long-press); repeat+intervalMs sends a burst (e.g. move several tiles). Returns the focused element after the press.',
-		inputSchema: {
-			type: 'object',
-			properties: {
-				...DEVICE_PROP,
-				key: {type: 'string', description: 'Key name (case-insensitive) or raw numeric keyCode.'},
-				durationMs: {type: 'integer', minimum: 0, maximum: 60000, description: 'Hold duration in ms for a long-press. Omit or 0 for a normal press.'},
-				repeat: {type: 'integer', minimum: 1, maximum: 100, description: 'Send the press N times (default 1).'},
-				intervalMs: {type: 'integer', minimum: 0, maximum: 10000, description: 'Delay between repeats in ms (default 250).'}
-			},
-			required: ['key']
-		}
-	},
-	{
-		name: 'tv_screenshot',
-		description: 'Capture the app frame via CDP and save a PNG. NOTE: on Samsung/Tizen the secure video/overlay plane often makes captureScreenshot hang or return black — for playback verdicts prefer tv_video_state and a human glance at the physical TV. UI screens (menus, focus, tiles) usually capture fine. On an engine that renders no capturable frame at all (old Tizen) the first call times out and every later call in the session refuses instantly instead of hanging again; tv_launch relaunch:true retries.',
-		inputSchema: {
-			type: 'object',
-			properties: {
-				...DEVICE_PROP,
-				path: {type: 'string', description: 'Where to write the PNG. Defaults to a scratch path.'},
-				timeoutMs: {type: 'integer', minimum: 500, maximum: 60000, description: 'Give up after this many ms (default 6000).'}
-			}
-		}
-	},
-	{
-		name: 'tv_console',
-		description: 'Console output, uncaught exceptions and failed network requests buffered since launch. Filter by substring and/or level. Reports how many entries were dropped from the ring buffer.',
-		inputSchema: {
-			type: 'object',
-			properties: {
-				...DEVICE_PROP,
-				filter: {type: 'string', description: 'Case-insensitive substring filter on message text (and on failed request URLs).'},
-				levels: {
-					type: 'array',
-					items: {type: 'string', enum: ['log', 'info', 'debug', 'warning', 'error']},
-					description: 'Console levels to include. Omit for all levels.'
-				},
-				limit: {type: 'integer', minimum: 1, maximum: 500, description: 'Max entries per bucket (default 60).'}
-			}
-		}
-	},
-	{
-		name: 'tv_network',
-		description: 'The full request log since launch — the tool for "the request went out, but not the right one" (analytics that lost a field, an API call with a parameter dropped, a stat event fired twice). action:"list" (default) returns url, method, status, mime type, size and the POST body of each request, newest first, filtered by urlPattern (substring, or /regex/), method and status ("failed" | a number | {min,max}). action:"body" reads one response body back by requestId — bodies live in the ENGINE buffer only until the page navigates or the app is relaunched, so this answers "why is the catalog empty" right now and cannot be used to re-read history; assert bodies at the moment of the case with a tv_sequence expectRequest step. action:"curl" turns one request into a runnable command for a terminal or a ticket (Cookie/Authorization redacted unless raw:true). action:"har" writes a HAR 1.2 file of the filtered log — importable into DevTools -> Network -> Import or Charles, and a ready proof attachment; it contains cookies and auth headers as they were, so do not put it in a public ticket. action:"mark" moves the assertion window used by expectRequest to now. POST bodies carry tokens: the list cuts them to 1000 characters and full bodies never go into reports. Reading the log needs no live connection — it survives the app dying.',
-		inputSchema: {
-			type: 'object',
-			properties: {
-				...DEVICE_PROP,
-				action: {type: 'string', enum: ['list', 'body', 'curl', 'har', 'mark'], description: 'list (default): the log. body/curl: one request by requestId. har: write a .har file. mark: move the expectRequest window to now.'},
-				urlPattern: {type: 'string', description: 'list/har: case-insensitive substring of the URL, or /regex/flags.'},
-				method: {type: 'string', description: 'list/har: HTTP method (GET, POST, …).'},
-				status: {description: 'list/har: "failed", an exact status number, or {"min":200,"max":299}.'},
-				limit: {type: 'integer', minimum: 1, maximum: 500, description: 'list: how many requests to return, newest first (default 50).'},
-				requestId: {type: 'string', description: 'body/curl: the requestId of a request from action:"list".'},
-				raw: {type: 'boolean', description: 'curl: keep Cookie/Authorization values instead of REDACTED (default false).'},
-				path: {type: 'string', description: 'har: where to write the .har file. Defaults to a scratch path.'},
-				withBodies: {type: 'boolean', description: 'har: read response bodies into the file (default true). They are best-effort: only what the engine still has.'}
-			}
-		}
-	},
-	{
-		name: 'tv_video_state',
-		description: 'Programmatic <video> snapshot: whether currentTime is advancing (two samples), readyState, size, muted, src and MediaError code. The reliable way to confirm playback when a screenshot would be black. On a page with no <video> at all it reads the Tizen object player instead (webapis.avplay) and answers with the same advancing/paused/currentTime/duration fields plus source:"avplay", the AVPlay state, codec, bitrate and the available bitrate ladder.',
-		inputSchema: {
-			type: 'object',
-			properties: {
-				...DEVICE_PROP,
-				sampleGapMs: {type: 'integer', minimum: 100, maximum: 10000, description: 'Gap between the two currentTime samples (default 600).'}
-			}
-		}
-	},
-	{
-		name: 'tv_state',
-		description: 'Structured snapshot of the app right now: url, title, visible scenes, the focused element (text, class, path, index/total among its siblings), visible popups and element counts. Read-only — use it to assert a step without pressing anything.',
-		inputSchema: {type: 'object', properties: {...DEVICE_PROP}}
-	},
-	{
-		name: 'tv_snapshot',
-		description: 'One structural read of the screen: the rows around the focus, their items, and where the focus sits among them — so the next three to five moves are arithmetic instead of press-look-press-look. Every item carries a `ref` (e1, e2, …) that tv_goto takes directly, and `neighbours` names the nearest ref in each direction. IMPORTANT: neighbours is LAYOUT GEOMETRY (nearest centre among the collected elements), not the app\'s navigation graph — it proves a move is one press away, it does not know what the app does on that press. Rows come either from the app profile\'s "snapshot" block (named, precise) or, with no app knowledge at all, from the focused element\'s siblings; the answer says which in `tier`, and returns rows:[] with a warning rather than inventing structure. Off-screen rows and items are dropped (counted in `more`/`moreRows`), text is cut to 32 characters, and `bytes` reports what this answer cost you. Refs expire: they are dropped by the next snapshot, by a navigation, and by a 60s TTL — a stale one is REFUSED, never silently re-resolved.',
-		inputSchema: {
-			type: 'object',
-			properties: {
-				...DEVICE_PROP,
-				detail: {
-					type: 'string', enum: ['focus', 'rows', 'full'],
-					description: 'focus: just the focused element, scenes and popups (cheapest). rows (default): the visible rows around the focus. full: no viewport filter — everything the selectors match, still capped.'
-				},
-				maxRows: {type: 'integer', minimum: 1, maximum: 40, description: 'Rows to keep, centred on the focused row (default 6, or the profile\'s snapshot.maxRows).'},
-				maxItemsPerRow: {type: 'integer', minimum: 1, maximum: 60, description: 'Items per row, centred on the focused item (default 12, or the profile\'s snapshot.maxItemsPerRow).'},
-				release: {type: 'boolean', description: 'Drop the ref store on the page now instead of waiting for the TTL. Returns nothing else.'}
-			}
-		}
-	},
-	{
-		name: 'tv_record',
-		description: 'Record what a person does with the PHYSICAL remote and compile it into a runnable tv_sequence plus a checklist of what only a human can confirm. action:"start" RELAUNCHES the app (so the recording begins in the same state the compiled case will replay from), installs a page-side listener and puts a "● REC" badge on screen (overlay:false turns it off, relaunch:false skips the restart and warns in the case); the person then navigates with the real remote; action:"stop" compiles the case and RETURNS it — steps inline plus the exact `markdown` that would be written — WITHOUT touching the disk. Show that case to the human and ask: save it, edit it, or throw it away; then action:"write" writes the file (title / note / path / overwrite / steps override the draft — pass `steps` to save a corrected version). action:"status" says how many keys have been seen — use it to check the remote is reaching the page at all. The compiler collapses a run of the same direction into ONE goto (only while the focus actually moved on every press — an overshoot at the edge of a list is dropped with a warning), turns physical auto-repeat into {press,repeat} rather than a long-press (a synthetic long-press sends one keydown and would scroll nothing), turns observed scene/popup/video changes into waits and expects, and NEVER emits a sleep step. Network assertions come only from the app profile\'s record.watch whitelist, and bodyContains is never inferred. The replay is NOT run automatically: on a live TV it starts the player and fires analytics. A file that already exists is NOT overwritten and NOT silently suffixed: you get {written:false, conflict} and ask the human, then write again with an explicit path or overwrite:true.',
-		inputSchema: {
-			type: 'object',
-			properties: {
-				...DEVICE_PROP,
-				action: {type: 'string', enum: ['start', 'stop', 'status', 'write'], description: 'start (default) | stop (compile and show, writes nothing) | status | write (save the case stop compiled, after a human has approved it).'},
-				title: {type: 'string', description: 'Case title; also the file name. Default: "Запись с пульта (<device>)".'},
-				path: {type: 'string', description: 'Where to write the .md. Default: <package>/cases/recorded/<slug>.md (gitignored), or TV_DEBUG_CASES_DIR. On stop it only chooses the path reported as wouldWriteTo.'},
-				overwrite: {type: 'boolean', description: 'Allow replacing an existing file. Off by default — a collision is reported, not resolved.'},
-				note: {type: 'string', description: 'A line of context written into the case above the steps.'},
-				steps: {
-					type: 'array', items: {type: 'object'},
-					description: 'action:"write" only — save these steps instead of the compiled ones. This is how a human-corrected case is saved (drop a wrong turn, add an expect) without hand-writing the markdown; the checklist is kept and marked as belonging to the original recording.'
-				},
-				relaunch: {type: 'boolean', description: 'action:"start" only. Relaunch the app before recording (default true). The compiled case always opens with {launch:{relaunch:true}}, so recording from a fresh launch is what makes the case replay from the state it was recorded in. false records from wherever the app is now, and says so in the case.'},
-				assert: {
-					type: 'string', enum: ['minimal', 'normal', 'rich'],
-					description: 'How much to assert. minimal: keys only — a case that stays green with the app broken. normal (default): scene and popup changes. rich: also video-advancing assertions, which are brittle from day one if you do not need them.'
-				},
-				longPressMs: {type: 'integer', minimum: 200, maximum: 10000, description: 'A hold at least this long becomes a longpress step (default 700).'},
-				collapse: {type: 'boolean', description: 'Collapse runs of one direction into goto steps (default true).'},
-				heartbeatMs: {type: 'integer', minimum: 250, maximum: 10000, description: 'How often the page checks itself for changes between key presses (default 1000).'},
-				overlay: {type: 'boolean', description: 'Show the "● REC" badge on screen (default true). It will appear in screenshots.'}
-			}
-		}
-	},
-	{
-		name: 'tv_wait_for',
-		description: 'Wait until a condition holds, instead of sleeping. Give exactly one condition. stableMs additionally requires it to keep holding, which avoids acting on a half-rendered frame. Returns the elapsed time and the final state. element / elementGone / sceneName take a NAME from the app profile registry instead of raw CSS; the answer echoes resolvedFrom so the report names the selector that was really checked, and an unknown name fails with the list of known ones.',
-		inputSchema: {
-			type: 'object',
-			properties: {
-				...DEVICE_PROP,
-				focusText: {type: 'string', description: "Focused element's text contains this (case-insensitive)."},
-				element: {type: 'string', description: 'A visible element matches this NAME from the app profile\'s "elements" registry (e.g. "player.play").'},
-				elementGone: {type: 'string', description: 'No visible element matches this NAME from the app profile\'s "elements" registry.'},
-				sceneName: {type: 'string', description: 'A visible scene matches this NAME from the app profile\'s "scenes" registry (e.g. "player").'},
-				selector: {type: 'string', description: 'A visible element matches this CSS selector.'},
-				selectorGone: {type: 'string', description: 'No visible element matches this CSS selector (spinner gone, popup closed).'},
-				scene: {type: 'string', description: "A visible scene's class contains this (e.g. player)."},
-				text: {type: 'string', description: "The page's visible text contains this."},
-				expression: {type: 'string', description: 'ES5 expression that must evaluate truthy.'},
-				videoAdvancing: {type: 'boolean', description: 'Wait until <video> currentTime is actually moving.'},
-				request: {
-					type: 'object',
-					description: 'Wait until a matching request has been sent: {"urlPattern":"track","method":"POST","bodyContains":"event_id","statusMax":399}. Matches requests received since this call (or since the last tv_network action:"mark"). "absent":true inverts it — succeeds only if nothing matched by the timeout, which is how a duplicated stat event is caught; it waits out the whole timeout by definition. "count":{"min":1,"max":1} bounds how many matched.'
-				},
-				timeoutMs: {type: 'integer', minimum: 100, maximum: 300000, description: 'Give up after this long (default 15000; 8000 for a request condition).'},
-				intervalMs: {type: 'integer', minimum: 50, maximum: 5000, description: 'Poll interval (default 250).'},
-				stableMs: {type: 'integer', minimum: 0, maximum: 10000, description: 'Require the condition to hold this long before succeeding (default 0).'}
-			}
-		}
-	},
-	{
-		name: 'tv_goto',
-		description: 'Press a direction repeatedly until the FOCUSED element matches a target (a named element from the app profile, or raw text / CSS selector / testid). Bounded by maxSteps, a deadline, and two structural stops: focus that stopped moving (edge of a list) and focus that wrapped around to a position already visited. Use this instead of guessing "press DOWN 7 times". select:true presses ENTER once the target has focus, so arriving and entering is one call — the gap between two calls is where a lazily-loading list moves focus out from under you.',
-		inputSchema: {
-			type: 'object',
-			properties: {
-				...DEVICE_PROP,
-				direction: {type: 'string', enum: ['UP', 'DOWN', 'LEFT', 'RIGHT'], description: 'Direction to travel in.'},
-				ref: {type: 'string', description: 'Stop on the exact element behind this tv_snapshot ref (e1, e2, …). Checked by identity, which is stronger than a text match — duplicate titles in a catalog are normal. A stale ref is refused with a reason, never re-resolved.'},
-				element: {type: 'string', description: 'Stop on the element with this NAME from the app profile\'s "elements" registry. An explicit text/selector/testid given alongside narrows it further.'},
-				text: {type: 'string', description: "Stop when the focused element's text contains this (case-insensitive)."},
-				selector: {type: 'string', description: 'Stop when the focused element matches this CSS selector.'},
-				testid: {type: 'string', description: 'Stop when the focused element has this data-testid / data-export-id.'},
-				select: {type: 'boolean', description: 'Press ENTER once the target is focused (default false).'},
-				maxSteps: {type: 'integer', minimum: 1, maximum: 200, description: 'Maximum presses (default 30).'},
-				deadlineMs: {type: 'integer', minimum: 1000, maximum: 300000, description: 'Wall-clock budget (default 45000).'}
-			},
-			required: ['direction']
-		}
-	},
-	{
-		name: 'tv_menu',
-		description: "Move focus into the app's main menu and pick a section by name. Omit `item` to just open the menu and list its sections. Requires a `menu` block in the app profile (apps/<app>.json) — the MCP itself knows nothing about any particular app's markup.",
-		inputSchema: {
-			type: 'object',
-			properties: {
-				...DEVICE_PROP,
-				item: {type: 'string', description: 'Section title to select (case-insensitive substring). Omit to only open the menu and list items.'},
-				select: {type: 'boolean', description: 'Press ENTER on the item once focused (default true).'},
-				maxOpenPresses: {type: 'integer', minimum: 1, maximum: 50, description: 'Upper bound on presses of the menu key while travelling to the sidebar (default 20; it takes one press per column).'}
-			}
-		}
-	},
-	{
-		name: 'tv_sequence',
-		description: 'Run a whole case body in ONE call, with a verdict, elapsed time and result per step. Steps are objects, one key each: {"launch":{"relaunch":true}} (start from a known state) | {"press":"RIGHT","repeat":2} | {"longpress":"ENTER","durationMs":1500} | {"goto":{"direction":"DOWN","text":"..."}} | {"menu":"Settings"} | {"wait":{"scene":"player"},"timeoutMs":30000} | {"expect":{"selector":"[class*=popup]"}} | {"expectRequest":{"urlPattern":"track","method":"POST","bodyContains":"event_id","timeoutMs":8000}} | {"networkMark":true} | {"eval":"ES5 expression"} | {"sleep":1000} | {"videoState":true} | {"state":true} | {"profileStart":true} | {"profileStop":{"path":"…"}} | {"metrics":true}. `goto` also takes {"element":"catalog.tile"} and {"select":true}; `wait`/`expect` also take {"element":…} / {"elementGone":…} / {"sceneName":…} — names from the app profile registry, echoed back as resolvedFrom. `expect` and `wait` take the same conditions as tv_wait_for; a failing one fails the step. `expectRequest` asserts on the network log (see tv_network) and matches requests sent since the step began — put {"networkMark":true} before the action to widen the window, use "absent":true or "count":{"max":1} to catch a duplicate (both wait out the whole timeout). Runs under the device lock so nothing interleaves.',
-		inputSchema: {
-			type: 'object',
-			properties: {
-				...DEVICE_PROP,
-				steps: {type: 'array', minItems: 1, maxItems: 100, items: {type: 'object'}, description: 'Ordered steps, see the tool description for the shapes.'},
-				stopOnFail: {type: 'boolean', description: 'Stop at the first failing step (default true).'}
-			},
-			required: ['steps']
-		}
-	},
-	{
-		name: 'tv_evaluate',
-		description: 'Run arbitrary JavaScript in the app page and return the value (escape hatch). Use for custom assertions, reading app state, or restoring localStorage after a debug relaunch. Old TVs are Chrome 38 — keep the expression ES5.',
-		inputSchema: {
-			type: 'object',
-			properties: {
-				...DEVICE_PROP,
-				expression: {type: 'string', description: 'JS expression to evaluate in the page.'},
-				awaitPromise: {type: 'boolean', description: 'Await a returned promise (default true).'}
-			},
-			required: ['expression']
-		}
-	},
-	{
-		name: 'tv_profile',
-		description: 'Record a JS CPU profile on the device, and/or read memory & layout metrics. action:"start" begins sampling, then do the thing you want to measure (tv_press / tv_goto / a scroll), then action:"stop" writes a .cpuprofile file (open it in Chrome DevTools -> Performance -> Load profile) and returns a top-N summary of self time by function and by file. start and stop each also take a Performance.getMetrics reading, so stop reports before/after/diff per metric (JSHeapUsedSize, Nodes, JSEventListeners, LayoutCount, RecalcStyleCount, cumulative Duration counters) — that is how you catch growth the CPU profile cannot see. action:"metrics" is just that reading, with no recording. On a minified production build pass sourceMap (the app.js.map of THAT build) to get readable names. The CPU profile works on the whole park (Profiler exists down to Chrome 38); the full metric set needs Chromium 60+ (tizen55, pc). An older engine with no Performance domain falls back to Memory.getDOMCounters — Nodes, Documents, JSEventListeners and Timestamp, enough to catch a DOM/listener leak, with a warning saying so and no faked heap or layout numbers; where even that is missing, action:"metrics" fails with a clear message while start/stop still return the profile with metrics:null.',
-		inputSchema: {
-			type: 'object',
-			properties: {
-				...DEVICE_PROP,
-				action: {type: 'string', enum: ['start', 'stop', 'metrics'], description: 'start a recording, stop it and get the result, or just read the metrics right now.'},
-				samplingIntervalUs: {type: 'integer', minimum: 50, maximum: 1000000, description: 'start: sampling interval in microseconds (default 1000). Raise it (e.g. 4000) for long recordings on a weak TV, where sampling itself costs.'},
-				path: {type: 'string', description: 'stop: where to write the .cpuprofile. Defaults to a scratch path.'},
-				sourceMap: {type: 'string', description: 'stop: path to the .map of the build running on the device. Only the top-N frames are de-minified; a map that fails to load degrades to a warning.'},
-				topN: {type: 'integer', minimum: 1, maximum: 200, description: 'stop: how many functions/files to report (default 20).'},
-				collectGarbage: {type: 'boolean', description: 'Force a GC right before this reading (default false). Turn it on for leak hunting — on stop it makes the heap diff show what is really retained instead of garbage not collected yet. It costs a GC pause, which is why it is off by default inside a recording.'}
-			},
-			required: ['action']
-		}
-	},
-	{
-		name: 'tv_heap',
-		description: 'Take a heap snapshot on the device and/or compare two of them — the tool for "the heap grew and never came back". Leak hunt: tv_heap action:"snapshot" (before) -> do the scenario (tv_press / tv_menu / tv_sequence) -> tv_heap action:"snapshot" (after) -> tv_heap action:"diff" with the two paths. A snapshot writes a .heapsnapshot file (open it in Chrome DevTools -> Memory -> Load) and returns the Summary view in numbers: total nodes and shallow size, how many DETACHED DOM nodes are still retained, and the top-N constructors by shallow size. diff returns the deltas — which constructors gained objects and bytes (topGrowth) and which lost them (topShrink), like the DevTools Comparison view. Retainer paths ("who holds this") and retained/dominator sizes are deliberately NOT computed: load the saved files in DevTools for those. A snapshot forces a full GC and pauses V8 for a long time (it can take a minute on a TV), so it is refused while a tv_profile recording is running. Needs the HeapProfiler domain — fine on tizen55/webos7/pc, best-effort on webOS 3. diff is a pure file operation: no device needed.',
-		inputSchema: {
-			type: 'object',
-			properties: {
-				...DEVICE_PROP,
-				action: {type: 'string', enum: ['snapshot', 'diff'], description: 'snapshot: take one on the device. diff: compare two files already on disk.'},
-				path: {type: 'string', description: 'snapshot: where to write the .heapsnapshot. Defaults to a scratch path.'},
-				before: {type: 'string', description: 'diff: path to the earlier .heapsnapshot.'},
-				after: {type: 'string', description: 'diff: path to the later .heapsnapshot.'},
-				topN: {type: 'integer', minimum: 1, maximum: 200, description: 'How many constructors to report (default 20).'},
-				timeoutMs: {type: 'integer', minimum: 5000, maximum: 600000, description: 'snapshot: give up after this long (default 120000 — a full heap off a slow TV legitimately takes tens of seconds).'}
-			},
-			required: ['action']
-		}
-	}
+	tool('tv_devices',
+		'List configured TVs, reachability and what each supports. Start here.'),
+	tool('tv_install',
+		'Install a .wgt (Tizen) / .ipk (webOS) from an absolute path.',
+		{path: str(''), uninstallFirst: bool('Uninstall first (cert mismatch).')},
+		['path']),
+	tool('tv_launch',
+		'Debug-launch the app and attach over CDP (needed first). Default: kill, launch, wait for bootReady.',
+		{
+			reload: bool('Reload in place (keeps localStorage).'),
+			relaunch: bool('Force kill + fresh launch.'),
+			attach: bool('Reuse a running debug instance.'),
+			waitBoot: bool('Wait for bootReady (default true).')
+		}),
+	tool('tv_press',
+		'Send a remote key (UP/DOWN/LEFT/RIGHT/ENTER/BACK/… or a keyCode) and wait for the focus to settle.',
+		{
+			key: str('Key name or numeric keyCode.'),
+			durationMs: int(0, 60000, 'Hold (long-press).'),
+			repeat: int(1, 100, 'Press N times (default 1).'),
+			intervalMs: int(0, 10000, 'Gap between repeats (default 250).'),
+			settle: bool('false = no focus wait/read.')
+		},
+		['key']),
+	tool('tv_screenshot',
+		'Save a PNG of the frame (Tizen video plane often black/hangs; use tv_video_state for playback).',
+		{path: str(''), timeoutMs: int(500, 60000, 'Default 6000.')}),
+	tool('tv_console',
+		'Console, exceptions, failed requests since launch, deduplicated with counts.',
+		{
+			filter: str('Substring on text / failed URLs.'),
+			levels: {type: 'array', items: {type: 'string'}, description: 'log|info|debug|warning|error'},
+			limit: int(1, 500, 'Per list (default 30).')
+		}),
+	tool('tv_network',
+		'Request log since launch. Actions: list | body | curl | har | mark. Survives the app dying.',
+		{
+			action: en(['list', 'body', 'curl', 'har', 'mark'], ''),
+			urlPattern: str('Substring or /regex/flags.'),
+			method: str(''),
+			status: {description: '"failed", a number, or {min,max}.'},
+			limit: int(1, 500, 'Newest N (default 25).'),
+			requestId: str('body/curl: id from list.'),
+			raw: bool('curl: keep credentials.'),
+			path: str('har: output path.'),
+			withBodies: bool('har: include bodies (default true).')
+		}),
+	tool('tv_video_state',
+		'Is playback advancing? Two currentTime samples of <video> (or webapis.avplay on old Tizen), readyState, size, src, error.',
+		{sampleGapMs: int(100, 10000, 'Default 600.')}),
+	tool('tv_state',
+		'Read-only snapshot: url, scenes, focused element (text, path, index/total), popups, counts.',
+		{format: en(['text', 'json'], 'Default text.')}),
+	tool('tv_snapshot',
+		'Rows around the focus with refs (e1, e2…) for tv_goto {ref} and neighbours per direction. Refs expire on the next snapshot/navigation/60s.',
+		{
+			detail: en(['focus', 'rows', 'full'], 'Default rows; full = no viewport filter.'),
+			maxRows: int(1, 40, 'Default 6.'),
+			maxItemsPerRow: int(1, 60, 'Default 12.'),
+			release: bool('Drop the refs now.'),
+			format: en(['text', 'json'], 'Default text.')
+		}),
+	tool('tv_record',
+		'Record the PHYSICAL remote into a tv_sequence: start (relaunch, ● REC), stop (compile + return, no write), write (after human approval).',
+		{
+			action: en(['start', 'stop', 'status', 'write'], ''),
+			title: str(''),
+			path: str(''),
+			overwrite: bool('write: replace existing.'),
+			note: str(''),
+			steps: {type: 'array', description: 'write: edited steps.'},
+			relaunch: bool('start: default true.'),
+			assert: en(['minimal', 'normal', 'rich'], 'Default normal.'),
+			longPressMs: int(200, 10000, 'Default 700.'),
+			collapse: bool('Runs into goto (default true).'),
+			heartbeatMs: int(250, 10000, 'Default 1000.'),
+			overlay: bool('REC badge (default true).')
+		}),
+	tool('tv_wait_for',
+		'Wait for exactly one condition instead of sleeping. element/elementGone/sceneName take names from the app profile.',
+		{
+			focusText: str('Focused text contains.'),
+			element: str('Visible profile element NAME.'),
+			elementGone: str('No visible profile element NAME.'),
+			sceneName: str('Visible profile scene NAME.'),
+			selector: str('Visible CSS match.'),
+			selectorGone: str('No visible CSS match.'),
+			scene: str('Visible scene class contains.'),
+			text: str('Page text contains.'),
+			expression: str('Truthy ES5 expression.'),
+			videoAdvancing: bool('Playback is moving.'),
+			request: {type: 'object', description: '{urlPattern, method, bodyContains, status, statusMin/Max, absent, count}.'},
+			timeoutMs: int(100, 300000, 'Default 15000.'),
+			intervalMs: int(50, 5000, 'Default 250.'),
+			stableMs: int(0, 10000, 'Keep holding this long.'),
+			withState: bool('Append tv_state.')
+		}),
+	tool('tv_goto',
+		'Press a direction until the FOCUSED element matches the target (ref | element | text | selector | testid); stops at edges/wrap-around. select:true = ENTER on arrival.',
+		{
+			direction: en(['UP', 'DOWN', 'LEFT', 'RIGHT'], 'Direction to travel.'),
+			ref: str('tv_snapshot ref.'),
+			element: str('Profile element NAME.'),
+			text: str('Focused text contains.'),
+			selector: str('Focused element CSS.'),
+			testid: str('Focused data-testid.'),
+			select: bool('ENTER on arrival.'),
+			maxSteps: int(1, 200, 'Default 30.'),
+			deadlineMs: int(1000, 300000, 'Default 45000.')
+		},
+		['direction']),
+	tool('tv_menu',
+		'Open the app menu (profile menu block) and pick a section by name; without item, open and list sections.',
+		{
+			item: str('Section title (substring).'),
+			select: bool('ENTER on the item (default true).'),
+			maxOpenPresses: int(1, 50, 'Default 20.')
+		}),
+	tool('tv_sequence',
+		'Run a whole case in one call under the device lock. Steps (one key each): launch, press, longpress, goto, menu, wait, expect, expectRequest, networkMark, eval, sleep, videoState, state, snapshot, profileStart, profileStop, metrics — see tv-debug://docs/tv_sequence.',
+		{
+			steps: {type: 'array', items: {type: 'object'}},
+			stopOnFail: bool('Default true.'),
+			report: en(['compact', 'full'], 'full: every step result.')
+		},
+		['steps']),
+	tool('tv_evaluate',
+		'Run JS in the page (ES5 on old TVs) and return the value, capped at 16 KB.',
+		{expression: str(''), awaitPromise: bool('Default true.')},
+		['expression']),
+	tool('tv_profile',
+		'CPU profile: start, act, stop (.cpuprofile + top functions + metrics diff); action metrics = one reading.',
+		{
+			action: en(['start', 'stop', 'metrics'], ''),
+			samplingIntervalUs: int(50, 1000000, 'start: default 1000.'),
+			path: str('stop: .cpuprofile path.'),
+			sourceMap: str('stop: .map of the build.'),
+			topN: int(1, 200, 'stop: default 20.'),
+			collectGarbage: bool('GC first.')
+		},
+		['action']),
+	tool('tv_heap',
+		'Heap snapshot file + constructor summary + detached nodes; action diff compares two files.',
+		{
+			action: en(['snapshot', 'diff'], ''),
+			path: str('snapshot: output path.'),
+			before: str('diff: earlier file.'),
+			after: str('diff: later file.'),
+			topN: int(1, 200, 'Default 20.'),
+			timeoutMs: int(5000, 600000, 'Default 120000.')
+		},
+		['action'])
 ];
 
 function textResult(obj) {
-	const text = typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2);
+	// No pretty-printing: the indentation was a quarter of every answer.
+	const text = typeof obj === 'string' ? obj : JSON.stringify(obj);
 	return {content: [{type: 'text', text}]};
 }
 
@@ -339,22 +238,28 @@ function errorResult(message) {
 	return {content: [{type: 'text', text: 'ERROR: ' + message}], isError: true};
 }
 
+/** tv_devices answers are cached this long: a reachability probe per device is 3-8s of CLI. */
+const REACH_CACHE_MS = 5000;
+/** @type {Map<string, {at: number, status: string}>} */
+const reachCache = new Map();
+
 /**
  * Honest per-device reachability. The previous version searched the whole `sdb devices`
  * output for the word "device", which the header line "List of devices attached" always
  * satisfies — so every configured TV reported "connected".
  * @param {import('./config.js').DeviceConfig} cfg
+ * @param {{sdbRows: ?Promise<Array<object>>}} shared one `sdb devices` for the whole park
  */
-async function reachability(cfg) {
+async function reachability(cfg, shared) {
 	try {
 		if (cfg.platform === 'tizen') {
-			const {stdout} = await execFileP('sdb', ['devices'], {timeout: 8000});
+			const rows = await shared.sdbRows;
 			const serial = `${cfg.host}:${cfg.sdbPort || 26101}`;
-			const row = parseSdbDevices(stdout).find((d) => d.serial === serial);
+			const row = rows.find((d) => d.serial === serial);
 			return row ? row.state : 'not-connected';
 		}
 		if (cfg.platform === 'webos') {
-			const {stdout} = await execFileP('ares-device-info', cfg.device ? ['-d', cfg.device] : [], {timeout: 8000})
+			const {stdout} = await execFileP('ares-device-info', cfg.device ? ['-d', cfg.device] : [], {timeout: 3000})
 				.catch((e) => ({stdout: e.stdout || ''}));
 			return stdout ? 'reachable' : 'unknown';
 		}
@@ -389,6 +294,38 @@ async function reachability(cfg) {
 	}
 }
 
+/**
+ * Reachability of the whole park: one `sdb devices` shared by every Tizen entry, every device
+ * probed in parallel, answers cached for a few seconds.
+ * @param {Array<import('./config.js').DeviceConfig>} devices
+ * @return {Promise<Map<string, string>>}
+ */
+async function reachabilityAll(devices) {
+	const now = Date.now();
+	const out = new Map();
+	const todo = devices.filter((d) => {
+		const hit = reachCache.get(d.id);
+		if (hit && now - hit.at < REACH_CACHE_MS) {
+			out.set(d.id, hit.status);
+			return false;
+		}
+		return true;
+	});
+	const shared = {
+		sdbRows: todo.some((d) => d.platform === 'tizen')
+			? execFileP('sdb', ['devices'], {timeout: 8000})
+				.then(({stdout}) => parseSdbDevices(stdout))
+				.catch(() => [])
+			: null
+	};
+	await Promise.all(todo.map(async (d) => {
+		const status = await reachability(d, shared);
+		reachCache.set(d.id, {at: Date.now(), status});
+		out.set(d.id, status);
+	}));
+	return out;
+}
+
 const CONDITION_KEYS = [
 	'focusText', 'element', 'elementGone', 'sceneName',
 	'selector', 'selectorGone', 'scene', 'text', 'expression', 'videoAdvancing', 'request'
@@ -413,13 +350,14 @@ async function handleCall(name, args) {
 	switch (name) {
 		case 'tv_devices': {
 			const {devices, defaultDevice, path} = loadConfig();
-			const rows = await Promise.all(devices.map(async (d) => ({
+			const status = await reachabilityAll(devices);
+			const rows = devices.map((d) => ({
 				id: d.id, platform: d.platform, name: d.name, engine: d.engine,
 				appId: d.appId, target: d.host || d.device || d.url,
-				status: await reachability(d),
+				status: status.get(d.id),
 				capabilities: deviceCapabilities(d),
 				default: d.id === (defaultDevice || devices[0].id)
-			})));
+			}));
 			return textResult({configPath: path, devices: rows});
 		}
 		case 'tv_install': {
@@ -434,11 +372,13 @@ async function handleCall(name, args) {
 				reload: !!args.reload, relaunch: !!args.relaunch, attach: !!args.attach,
 				waitBoot: args.waitBoot
 			});
-			return textResult({device: s.cfg.id, engine: s.cfg.engine, attached: page});
+			return textResult(s.launchReport(page));
 		}
 		case 'tv_press': {
 			const s = sessionFor(args.device);
-			const res = await s.press(args.key, {durationMs: args.durationMs, repeat: args.repeat, intervalMs: args.intervalMs});
+			const res = await s.press(args.key, {
+				durationMs: args.durationMs, repeat: args.repeat, intervalMs: args.intervalMs, settle: args.settle
+			});
 			return textResult(res);
 		}
 		case 'tv_screenshot': {
@@ -489,7 +429,8 @@ async function handleCall(name, args) {
 		}
 		case 'tv_state': {
 			const s = sessionFor(args.device);
-			return textResult(await s.state());
+			const st = await s.state();
+			return textResult(args.format === 'json' ? st : renderStateText(st));
 		}
 		case 'tv_record': {
 			const s = sessionFor(args.device);
@@ -519,16 +460,17 @@ async function handleCall(name, args) {
 		}
 		case 'tv_snapshot': {
 			const s = sessionFor(args.device);
-			return textResult(await s.snapshot({
+			const snap = await s.snapshot({
 				detail: args.detail, maxRows: args.maxRows, maxItemsPerRow: args.maxItemsPerRow,
 				release: !!args.release
-			}));
+			});
+			return textResult(args.format === 'json' ? snap : renderSnapshotText(snap));
 		}
 		case 'tv_wait_for': {
 			const s = sessionFor(args.device);
 			const condition = pickCondition(args);
 			return textResult(await s.waitFor(condition, {
-				timeoutMs: args.timeoutMs, intervalMs: args.intervalMs, stableMs: args.stableMs
+				timeoutMs: args.timeoutMs, intervalMs: args.intervalMs, stableMs: args.stableMs, withState: !!args.withState
 			}));
 		}
 		case 'tv_goto': {
@@ -545,12 +487,11 @@ async function handleCall(name, args) {
 		}
 		case 'tv_sequence': {
 			const s = sessionFor(args.device);
-			return textResult(await s.sequence(args.steps, {stopOnFail: args.stopOnFail}));
+			return textResult(await s.sequence(args.steps, {stopOnFail: args.stopOnFail, report: args.report}));
 		}
 		case 'tv_evaluate': {
 			const s = sessionFor(args.device);
-			const value = await s.evaluate(args.expression, args.awaitPromise);
-			return textResult({value});
+			return textResult(await s.evaluateCapped(args.expression, args.awaitPromise));
 		}
 		case 'tv_profile': {
 			const s = sessionFor(args.device);
@@ -600,11 +541,22 @@ async function main() {
 	}
 
 	const server = new Server(
-		{name: 'tv-debug-mcp', version: '0.2.0'},
-		{capabilities: {tools: {}}}
+		{name: 'tv-debug-mcp', version: PKG_VERSION},
+		{capabilities: {tools: {}, resources: {}}}
 	);
 
 	server.setRequestHandler(ListToolsRequestSchema, async () => ({tools: TOOLS}));
+	// The long-form reference lives here, not in the tool descriptions: read once when needed
+	// instead of being re-sent with every turn.
+	server.setRequestHandler(ListResourcesRequestSchema, async () => ({resources: listDocResources()}));
+	server.setRequestHandler(ReadResourceRequestSchema, async (req) => {
+		const uri = req.params.uri;
+		const text = readDocResource(uri);
+		if (text === null) {
+			throw new Error(`unknown resource ${uri} — the tool references are ${DOC_URI_PREFIX}<tool>`);
+		}
+		return {contents: [{uri, mimeType: 'text/markdown', text}]};
+	});
 
 	server.setRequestHandler(CallToolRequestSchema, async (req) => {
 		const {name, arguments: args = {}} = req.params;

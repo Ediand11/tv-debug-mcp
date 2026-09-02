@@ -6,6 +6,16 @@
 // The focused widget is the DEEPEST element matching the profile's focus selectors:
 // a framework may mark the whole chain scene > container > list > tile with `_active`, so
 // the first match is the scene and tells you nothing about navigation.
+//
+// The helpers are installed on the page ONCE (`window.__tvdbg`, see helpersInstallJs) and
+// every snippet built here is a ~300-byte call into them (withHelpersJs). Sending the 4.5 KB
+// preamble with every poll made the engine re-parse it on each of the 4-10 round-trips a
+// single navigation step costs. The install self-expires like every other page-side stash of
+// this MCP (PAGE_SLOT_TTL_MS): it holds no DOM references, but a global that never goes away
+// is a false lead in a tv_heap diff either way.
+
+/** Same lifetime as every other page-side slot — kept here to avoid an import cycle. */
+const HELPERS_TTL_MS = 60000;
 
 /**
  * Shared ES5 preamble: helpers every generated snippet uses.
@@ -52,6 +62,13 @@ export function stateHelpersJs(profile) {
 			var t = el.innerText || (el.getAttribute && el.getAttribute('aria-label')) || '';
 			return String(t).replace(/\\s+/g, ' ').replace(/^\\s+|\\s+$/g, '').slice(0, n || 80);
 		}
+		// textContent, not innerText: innerText forces a layout flush on every read, and a
+		// signature that is only compared for equality does not need visible-text semantics.
+		function rawTxt(el, n){
+			if (!el) { return ''; }
+			var t = el.textContent || (el.getAttribute && el.getAttribute('aria-label')) || '';
+			return String(t).replace(/\\s+/g, ' ').replace(/^\\s+|\\s+$/g, '').slice(0, n || 60);
+		}
 		function cls(el){
 			return el && el.className && el.className.toString ? el.className.toString() : (el ? el.tagName : '');
 		}
@@ -68,9 +85,7 @@ export function stateHelpersJs(profile) {
 			}
 			return f;
 		}
-		function focusInfo(){
-			var f = focusLeaf();
-			if (!f) { return null; }
+		function focusPos(f){
 			var parent = f.parentNode;
 			var token = firstToken(f);
 			var index = -1, total = 0;
@@ -86,16 +101,30 @@ export function stateHelpersJs(profile) {
 			var path = [];
 			var n = f;
 			for (var d = 0; d < 3 && n && n.nodeType === 1; d++) { path.unshift(firstToken(n)); n = n.parentNode; }
+			return {path: path.join(' > '), index: index, total: total};
+		}
+		function focusInfo(){
+			var f = focusLeaf();
+			if (!f) { return null; }
+			var pos = focusPos(f);
 			return {
 				text: txt(f, 90),
 				className: cls(f).slice(0, 140),
 				tag: f.tagName,
 				testid: (f.getAttribute && (f.getAttribute('data-testid') || f.getAttribute('data-export-id'))) || null,
-				path: path.join(' > '),
-				index: index,
-				total: total,
+				path: pos.path,
+				index: pos.index,
+				total: pos.total,
 				visible: visible(f)
 			};
+		}
+		// Compact focus signature: "did the press land", "are we looping". Cheap on purpose —
+		// it is what every settle poll reads.
+		function focusSig(){
+			var f = focusLeaf();
+			if (!f) { return 'NONE'; }
+			var pos = focusPos(f);
+			return pos.path + '#' + pos.index + '/' + pos.total + '::' + rawTxt(f, 60);
 		}
 		function scenes(){
 			var out = [];
@@ -146,15 +175,84 @@ export function stateHelpersJs(profile) {
 	`;
 }
 
+/** Names exported by the preamble, in the order the alias line lists them. */
+const HELPER_NAMES = [
+	'FOCUS_SEL', 'SCENE_SEL', 'STRIP', 'POPUP_SEL',
+	'isOurs', 'matchesSel', 'closestSel', 'visible', 'txt', 'rawTxt', 'cls', 'firstToken',
+	'focusLeaf', 'focusPos', 'focusInfo', 'focusSig', 'scenes', 'popupList', 'rectOf', 'inViewport', 'containsEl'
+];
+
 /**
- * Full snapshot expression.
+ * Identity of an installed helper set. Changes with the profile's selectors, so an app
+ * profile edited between calls reinstalls instead of running yesterday's selectors.
  * @param {import('./appprofile.js').AppProfile} profile
  * @return {string}
  */
-export function stateJs(profile) {
-	const menu = profile.menu;
+export function helpersKey(profile) {
+	const src = JSON.stringify([profile.id, profile.focus, profile.scene, profile.popup]);
+	// djb2 — a short stable tag is all this needs.
+	let h = 5381;
+	for (let i = 0; i < src.length; i++) {
+		h = ((h * 33) ^ src.charCodeAt(i)) >>> 0;
+	}
+	return 'h' + h.toString(36);
+}
+
+/**
+ * Install (or replace) the helper set on the page. One evaluate per connection and per
+ * navigation; every snippet afterwards is a call into it.
+ * @param {import('./appprofile.js').AppProfile} profile
+ * @return {string}
+ */
+export function helpersInstallJs(profile) {
+	const key = JSON.stringify(helpersKey(profile));
 	return `(function(){
 		${stateHelpersJs(profile)}
+		var H = {v: ${key}, t: null};
+		${HELPER_NAMES.map((n) => `H.${n} = ${n};`).join('\n\t\t')}
+		// Self-expiring, refreshed on every use: idle for a minute and the install is gone,
+		// exactly like the snapshot ref store and the video sample slots.
+		H.touch = function(){
+			if (H.t) { try { clearTimeout(H.t); } catch (e) {} }
+			H.t = setTimeout(function(){
+				if (window.__tvdbg === H) { try { delete window.__tvdbg; } catch (e) { window.__tvdbg = null; } }
+			}, ${HELPERS_TTL_MS});
+		};
+		window.__tvdbg = H;
+		H.touch();
+		return {installed: 1};
+	})()`;
+}
+
+/**
+ * Wrap a snippet body so it runs against the installed helpers. When the install is missing
+ * or belongs to another profile the call answers `{__tvdbgMissing: 1}` and the host installs
+ * and retries (DeviceSession._pageCall) — one extra round-trip per navigation, not per call.
+ * @param {import('./appprofile.js').AppProfile} profile
+ * @param {string} body ES5 statements; may `return`
+ * @return {string}
+ */
+export function withHelpersJs(profile, body) {
+	const key = JSON.stringify(helpersKey(profile));
+	return `(function(){
+		var H = window.__tvdbg;
+		if (!H || H.v !== ${key}) { return {__tvdbgMissing: 1}; }
+		H.touch();
+		var ${HELPER_NAMES.map((n) => `${n} = H.${n}`).join(', ')};
+		${body}
+	})()`;
+}
+
+/**
+ * Full snapshot expression.
+ * @param {import('./appprofile.js').AppProfile} profile
+ * @param {{withSig?: boolean}} [opts] withSig adds the focus signature — what tv_menu needs
+ *   alongside the state to open the menu without a second round-trip
+ * @return {string}
+ */
+export function stateJs(profile, opts = {}) {
+	const menu = profile.menu;
+	return withHelpersJs(profile, `
 		var popups = popupList(5);
 		var f = focusInfo();
 		var inMenu = false;
@@ -173,9 +271,8 @@ export function stateJs(profile) {
 				tiles: ${profile.tile ? `document.querySelectorAll(${JSON.stringify(profile.tile)}).length` : '0'},
 				menuItems: ${menu ? `document.querySelectorAll(${JSON.stringify(menu.item)}).length` : '0'},
 				popups: popups.length
-			}
-		};
-	})()`;
+			}${opts.withSig ? ',\n\t\t\tsig: focusSig()' : ''}
+		};`);
 }
 
 /**
@@ -184,33 +281,59 @@ export function stateJs(profile) {
  * @return {string}
  */
 export function focusSignatureJs(profile) {
-	return `(function(){
-		${stateHelpersJs(profile)}
-		var f = focusInfo();
-		if (!f) { return 'NONE'; }
-		return f.path + '#' + f.index + '/' + f.total + '::' + f.text;
-	})()`;
+	return withHelpersJs(profile, 'return focusSig();');
 }
 
 /**
- * Does the FOCUSED element match a target? `tv_goto` must check the focused element itself:
- * "a matching selector exists on the page" is true while focus sits somewhere else entirely.
+ * Body of the "does the FOCUSED element match this target" check. `tv_goto` must check the
+ * focused element itself: "a matching selector exists on the page" is true while focus sits
+ * somewhere else entirely. Returns statements ending in `return {ok, detail}`, so the same
+ * check can run inline at the end of a press settle (inject.js pressJs).
+ * @param {{text?: string, selector?: string, testid?: string}} target
+ * @return {string}
+ */
+export function focusMatchesBody(target) {
+	return `
+		var f = focusLeaf();
+		if (!f) { return {ok: false, detail: 'no focus'}; }
+		var ok = true;
+		${target.text != null ? `ok = ok && txt(f, 200).toLowerCase().indexOf(${JSON.stringify(String(target.text).toLowerCase())}) >= 0;` : ''}
+		${target.selector != null ? `ok = ok && matchesSel(f, ${JSON.stringify(target.selector)});` : ''}
+		${target.testid != null ? `ok = ok && ((f.getAttribute && (f.getAttribute('data-testid') || f.getAttribute('data-export-id'))) === ${JSON.stringify(target.testid)});` : ''}
+		return {ok: ok, detail: focusInfo()};`;
+}
+
+/**
  * @param {import('./appprofile.js').AppProfile} profile
  * @param {{text?: string, selector?: string, testid?: string}} target
  * @return {string}
  */
 export function focusMatchesJs(profile, target) {
-	return `(function(){
-		${stateHelpersJs(profile)}
-		var f = focusLeaf();
-		if (!f) { return {ok: false, detail: 'no focus'}; }
-		var info = focusInfo();
-		var ok = true;
-		${target.text != null ? `ok = ok && txt(f, 200).toLowerCase().indexOf(${JSON.stringify(String(target.text).toLowerCase())}) >= 0;` : ''}
-		${target.selector != null ? `ok = ok && matchesSel(f, ${JSON.stringify(target.selector)});` : ''}
-		${target.testid != null ? `ok = ok && ((f.getAttribute && (f.getAttribute('data-testid') || f.getAttribute('data-export-id'))) === ${JSON.stringify(target.testid)});` : ''}
-		return {ok: ok, detail: info};
-	})()`;
+	return withHelpersJs(profile, focusMatchesBody(target));
+}
+
+/**
+ * Body of "is the focus inside the menu" — what tv_menu checks after every opening press.
+ * @param {{root: string}} menu
+ * @return {string}
+ */
+export function focusInMenuBody(menu) {
+	return `
+		var leaf = focusLeaf();
+		return {ok: !!(leaf && closestSel(leaf, ${JSON.stringify(menu.root)})), detail: focusInfo()};`;
+}
+
+/**
+ * One call that answers both "are we already on the target" and "where is the focus" — the
+ * opening read of tv_goto.
+ * @param {import('./appprofile.js').AppProfile} profile
+ * @param {string} matchBody from focusMatchesBody / focusIsRefBody
+ * @return {string}
+ */
+export function sigAndMatchJs(profile, matchBody) {
+	return withHelpersJs(profile, `
+		var match = (function(){ ${matchBody} })();
+		return {sig: focusSig(), match: match};`);
 }
 
 /**
@@ -221,14 +344,12 @@ export function focusMatchesJs(profile, target) {
  */
 export function menuItemsJs(profile) {
 	const menu = profile.menu;
-	return `(function(){
-		${stateHelpersJs(profile)}
+	return withHelpersJs(profile, `
 		var out = [];
 		var items = document.querySelectorAll(${JSON.stringify(menu.item)});
 		for (var i = 0; i < items.length; i++) {
 			if (!visible(items[i])) { continue; }
 			out.push(txt(${menu.title ? `items[i].querySelector(${JSON.stringify(menu.title)}) || items[i]` : 'items[i]'}, 40));
 		}
-		return out;
-	})()`;
+		return out;`);
 }

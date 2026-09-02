@@ -158,40 +158,63 @@ async function main() {
 
 	console.log('\n--- launch our own Chrome ---');
 	const launched = await s.call('tv_launch', {device: 'pc-fixture'});
-	check('tv_launch starts Chrome and attaches', !!launched.attached?.wsUrl, launched.__error);
-	check('the page is the configured URL', String(launched.attached?.href || '').startsWith(fixtureUrl),
-		launched.attached?.href);
+	check('tv_launch starts Chrome and attaches', launched.ok === true, launched.__error);
+	check('the page is the configured URL', String(launched.url || '').startsWith(fixtureUrl), launched.url);
+	check('the launch answer is compact and carries the device facts once',
+		launched.inputMode === 'trusted' && typeof launched.rttMs === 'number' && launched.freshLaunch === true &&
+		launched.attached === undefined && launched.wsUrl === undefined && JSON.stringify(launched).length < 400,
+		JSON.stringify(launched));
 	check('Chrome runs on an isolated throwaway profile', (await chromeCount()) > 0);
 
 	console.log('\n--- bootReady: launch says whether the app came up ---');
 	check('a fresh launch waits for the profile bootReady condition and reports it',
-		launched.attached?.bootReady?.ok === true && typeof launched.attached?.bootReady?.elapsedMs === 'number',
-		JSON.stringify(launched.attached?.bootReady));
+		launched.bootReady?.ok === true && typeof launched.bootReady?.elapsedMs === 'number',
+		JSON.stringify(launched.bootReady));
 	const noboot = await s.call('tv_launch', {device: 'pc-noboot'});
 	check('an app that never reaches bootReady still attaches',
-		!!noboot.attached?.wsUrl, noboot.__error);
+		noboot.ok === true, noboot.__error);
 	check('and says so with ok:false plus a warning, instead of failing the call',
-		noboot.attached?.bootReady?.ok === false && /bootReady/.test(String(noboot.attached?.warning)),
-		JSON.stringify({boot: noboot.attached?.bootReady, warn: noboot.attached?.warning}));
+		noboot.bootReady?.ok === false && /bootReady/.test(String(noboot.warning)),
+		JSON.stringify({boot: noboot.bootReady, warn: noboot.warning}));
 	const skipBoot = await s.call('tv_launch', {device: 'pc-noboot', relaunch: true, waitBoot: false});
 	check('waitBoot:false skips the wait entirely',
-		!!skipBoot.attached?.wsUrl && skipBoot.attached?.bootReady === undefined,
-		JSON.stringify(skipBoot.attached?.bootReady));
+		skipBoot.ok === true && skipBoot.bootReady === undefined,
+		JSON.stringify(skipBoot.bootReady));
 
 	console.log('\n--- navigation, unchanged from the TV path ---');
 	const booted = await s.call('tv_wait_for', {device: 'pc-fixture', selector: '.demo-tile', timeoutMs: 20000, stableMs: 300});
 	check('tv_wait_for works in the browser', booted.ok, `${booted.elapsedMs}ms`);
 
-	const st = await s.call('tv_state', {device: 'pc-fixture'});
+	const st = await s.call('tv_state', {device: 'pc-fixture', format: 'json'});
 	check('tv_state returns structured focus', !!st.focus?.path && st.counts?.tiles > 0, JSON.stringify(st.counts));
+	const stText = await s.call('tv_state', {device: 'pc-fixture'});
+	check('tv_state defaults to a text rendering that names the focus and the counts',
+		typeof stText === 'string' && /focus: "/.test(stText) && /tiles 6/.test(stText) && stText.length < JSON.stringify(st).length,
+		String(stText).slice(0, 160));
 
 	const pressed = await s.call('tv_press', {device: 'pc-fixture', key: 'RIGHT'});
-	check('trusted key events reach the app', pressed.focusChanged === true,
-		`${String(pressed.focusedBefore).slice(0, 40)} -> ${String(pressed.focusedAfter).slice(0, 40)}`);
-	check('press records its input mode', pressed.inputMode === 'trusted', pressed.inputMode);
+	check('trusted key events reach the app', pressed.changed === true,
+		`${String(pressed.before).slice(0, 40)} -> ${String(pressed.focus).slice(0, 40)}`);
+	check('the press answer is compact: focus, changed, cost — nothing repeated from launch',
+		pressed.inputMode === undefined && pressed.keyCode === undefined && pressed.before === undefined &&
+		typeof pressed.ms === 'number' && typeof pressed.evals === 'number' && JSON.stringify(pressed).length < 160,
+		JSON.stringify(pressed));
+	const edge = await s.call('tv_press', {device: 'pc-fixture', key: 'UP'});
+	check('a press that moved nothing says so and carries the focus before',
+		edge.changed === false && typeof edge.before === 'string' && edge.before === edge.focus, JSON.stringify(edge));
+	const fired = await s.call('tv_press', {device: 'pc-fixture', key: 'LEFT', settle: false});
+	check('settle:false fires and returns without a focus read', fired.settled === false && fired.focus === undefined, JSON.stringify(fired));
+	await s.call('tv_press', {device: 'pc-fixture', key: 'RIGHT'});
 
 	const goto = await s.call('tv_goto', {device: 'pc-fixture', direction: 'RIGHT', text: 'космос', maxSteps: 8});
 	check('tv_goto reaches a tile by text', goto.ok, goto.reason || `${goto.presses} presses`);
+	check('a green goto answers with a trail and the focus, not a per-press list',
+		goto.trail === `RIGHT×${goto.presses}` && goto.steps === undefined && goto.focus?.text && goto.evals <= goto.presses * 3 + 1,
+		JSON.stringify(goto));
+	const edgeGoto = await s.call('tv_goto', {device: 'pc-fixture', direction: 'RIGHT', text: 'нет-такого', maxSteps: 3});
+	check('a red goto keeps the per-press list as evidence',
+		edgeGoto.ok === false && Array.isArray(edgeGoto.steps) && edgeGoto.steps.length === edgeGoto.presses && /stopped moving|not reached/.test(edgeGoto.reason),
+		JSON.stringify(edgeGoto).slice(0, 200));
 
 	console.log('\n--- named elements and scenes, end to end ---');
 	const byName = await s.call('tv_goto', {device: 'pc-fixture', direction: 'LEFT', element: 'catalog.tile', text: 'котиков', maxSteps: 8});
@@ -219,9 +242,15 @@ async function main() {
 	console.log('\n--- tv_snapshot: one round-trip instead of press-look-press-look ---');
 	// Back to the first tile, so the assertions below have a known focus.
 	await s.call('tv_goto', {device: 'pc-fixture', direction: 'LEFT', element: 'catalog.tile', text: 'котиков', maxSteps: 8});
-	const layout = await s.call('tv_snapshot', {device: 'pc-fixture'});
+	const layoutText = await s.call('tv_snapshot', {device: 'pc-fixture'});
+	check('tv_snapshot defaults to a text rendering with refs, the focus mark and neighbours',
+		typeof layoutText === 'string' && /\[e\d+ "[^"]*"\]\*/.test(layoutText) && /neighbours: .*RIGHT e\d+/.test(layoutText) && /tier: profile/.test(layoutText),
+		String(layoutText).slice(0, 200));
+	const layout = await s.call('tv_snapshot', {device: 'pc-fixture', format: 'json'});
 	check('tv_snapshot derives rows from the profile', layout.ok && layout.tier === 'profile',
 		JSON.stringify({tier: layout.tier, warning: layout.warning}));
+	check('the text rendering is smaller than the JSON', layoutText.length < JSON.stringify(layout).length,
+		`${layoutText.length} vs ${JSON.stringify(layout).length}`);
 	const tileRow = (layout.rows || []).find((r) => r.items.some((it) => /котик/.test(it.t)));
 	const menuRow = (layout.rows || []).find((r) => r.items.some((it) => /Settings/.test(it.t)));
 	check('the catalog row carries all six tiles', tileRow?.items?.length === 6,
@@ -248,7 +277,7 @@ async function main() {
 		byRef.ok && byRef.presses === 3, byRef.reason || `${byRef.presses} presses`);
 
 	const staleRef = fourth.ref;
-	const layout2 = await s.call('tv_snapshot', {device: 'pc-fixture'});
+	const layout2 = await s.call('tv_snapshot', {device: 'pc-fixture', format: 'json'});
 	check('a second snapshot is a new generation with fresh refs',
 		layout2.g === layout.g + 1 && !JSON.stringify(layout2.rows).includes(`"${staleRef}"`),
 		JSON.stringify({g1: layout.g, g2: layout2.g}));
@@ -257,17 +286,17 @@ async function main() {
 		stale.ok === false && stale.presses === 0 && /earlier snapshot/.test(String(stale.reason)),
 		String(stale.reason).slice(0, 140));
 
-	const focusOnly = await s.call('tv_snapshot', {device: 'pc-fixture', detail: 'focus'});
+	const focusOnly = await s.call('tv_snapshot', {device: 'pc-fixture', detail: 'focus', format: 'json'});
 	check('detail:"focus" is the cheap read: no rows, still a ref',
 		focusOnly.ok && focusOnly.rows.length === 0 && !!focusOnly.focus?.ref && focusOnly.bytes < layout.bytes,
 		`bytes ${focusOnly.bytes} vs ${layout.bytes}`);
-	const capped = await s.call('tv_snapshot', {device: 'pc-fixture', maxItemsPerRow: 3});
+	const capped = await s.call('tv_snapshot', {device: 'pc-fixture', maxItemsPerRow: 3, format: 'json'});
 	const cappedTiles = (capped.rows || []).find((r) => r.items.some((it) => /котик|горах|горы|машин/.test(it.t)));
 	check('maxItemsPerRow caps the row and counts what it dropped',
 		cappedTiles?.items?.length === 3 && cappedTiles?.more === 3,
 		JSON.stringify({n: cappedTiles?.items?.length, more: cappedTiles?.more}));
 
-	const released = await s.call('tv_snapshot', {device: 'pc-fixture', release: true});
+	const released = await s.call('tv_snapshot', {device: 'pc-fixture', release: true, format: 'json'});
 	check('release drops the ref store on the page', released.released === true, JSON.stringify(released));
 	const afterRelease = await s.call('tv_goto', {device: 'pc-fixture', direction: 'RIGHT', ref: 'e1', maxSteps: 2});
 	check('and a ref afterwards is refused with an actionable reason',
@@ -284,6 +313,59 @@ async function main() {
 
 	const menu = await s.call('tv_menu', {device: 'pc-fixture', item: 'Settings'});
 	check('tv_menu selects a section', menu.ok, menu.reason || JSON.stringify(menu.items));
+	check('tv_menu reports its cost and the sections it saw',
+		typeof menu.ms === 'number' && typeof menu.evals === 'number' && (menu.items || []).length === 4, JSON.stringify(menu).slice(0, 200));
+
+	console.log('\n--- answer size: schema, sequence report, console dedup, evaluate cap ---');
+	const toolList = await s.rpc('tools/list', {});
+	const listBytes = JSON.stringify(toolList.result?.tools || []).length;
+	check('the whole tools/list stays under 10 KB', listBytes > 0 && listBytes <= 10240, `${listBytes} bytes`);
+	const resources = await s.rpc('resources/list', {});
+	check('every tool has a reference resource', (resources.result?.resources || []).length === (toolList.result?.tools || []).length,
+		String(resources.result?.resources?.length));
+	const doc = await s.rpc('resources/read', {uri: 'tv-debug://docs/tv_sequence'});
+	check('the sequence reference lists the step shapes', /expectRequest/.test(doc.result?.contents?.[0]?.text || '') && /profileStop/.test(doc.result?.contents?.[0]?.text || ''),
+		JSON.stringify(doc).slice(0, 120));
+	const badDoc = await s.rpc('resources/read', {uri: 'tv-debug://docs/nope'});
+	check('an unknown resource is an error, not an empty page', !!badDoc.error, JSON.stringify(badDoc).slice(0, 120));
+
+	await s.call('tv_goto', {device: 'pc-fixture', direction: 'LEFT', element: 'catalog.tile', text: 'котиков', maxSteps: 8});
+	const navSeq = await s.call('tv_sequence', {
+		device: 'pc-fixture',
+		steps: [{press: 'RIGHT'}, {goto: {direction: 'RIGHT', text: 'космос', maxSteps: 6}}, {expect: {focusText: 'космос'}}, {eval: '1+1'}, {press: 'LEFT'}]
+	});
+	check('a green sequence reports navigation steps as one line each and keeps readings',
+		navSeq.ok && navSeq.steps?.every((x) => typeof x.ms === 'number' && x.result === undefined || x.result !== undefined) &&
+		navSeq.steps?.[0]?.brief && navSeq.steps[0].result === undefined && /RIGHT×/.test(navSeq.steps?.[1]?.brief || '') &&
+		navSeq.steps?.[3]?.result?.value === 2 && navSeq.finalState?.focus,
+		JSON.stringify(navSeq).slice(0, 300));
+	check('a compact sequence answer of 5 steps is under 1.2 KB', JSON.stringify(navSeq).length < 1200, `${JSON.stringify(navSeq).length} bytes`);
+	const fullSeq = await s.call('tv_sequence', {device: 'pc-fixture', steps: [{press: 'RIGHT'}], report: 'full'});
+	check('report:"full" keeps every result', fullSeq.steps?.[0]?.result?.key === 'RIGHT' && fullSeq.steps[0].brief === undefined, JSON.stringify(fullSeq.steps?.[0]));
+	const redSeq = await s.call('tv_sequence', {device: 'pc-fixture', steps: [{press: 'LEFT'}, {expect: {selector: '.never-there'}, timeoutMs: 500}, {press: 'LEFT'}]});
+	check('a red step keeps its full result and stops the run',
+		redSeq.ok === false && redSeq.failedAt === 1 && redSeq.ran === 2 && redSeq.steps?.[1]?.result?.timedOut === true && redSeq.steps[1].result.state === undefined,
+		JSON.stringify(redSeq.steps?.[1]).slice(0, 200));
+
+	await s.call('tv_evaluate', {device: 'pc-fixture', expression: '(function(){for(var i=0;i<40;i++){console.error("same failure again");}console.error("once-only");return 1;})()'});
+	await sleep(300);
+	const con = await s.call('tv_console', {device: 'pc-fixture'});
+	const same = (con.console || []).find((m) => m.text === 'same failure again');
+	check('tv_console deduplicates repeated entries with a count and relative timestamps',
+		same?.count === 40 && typeof same.t === 'number' && typeof same.tLast === 'number' && (con.console || []).length < 40 && con.totals?.console >= 41,
+		JSON.stringify({same, n: con.console?.length, totals: con.totals}));
+	const once = (con.console || []).find((m) => m.text === 'once-only');
+	check('a single entry carries no count', !!once && once.count === undefined && once.tLast === undefined, JSON.stringify(once));
+	check('urls are cut to file:line', !same || /^[^/]+:\d+$/.test(same.at || 'x:1'), same?.at);
+	const bigEval = await s.call('tv_evaluate', {device: 'pc-fixture', expression: 'new Array(3000).join("0123456789")'});
+	check('tv_evaluate cuts a big answer at 16 KB and says so',
+		bigEval.truncated === true && bigEval.bytes === 29990 && bigEval.value.length === 16384 && /narrow/.test(bigEval.hint), JSON.stringify(bigEval).slice(0, 100));
+	const waitPlain = await s.call('tv_wait_for', {device: 'pc-fixture', selector: '.demo-tile', timeoutMs: 3000});
+	check('tv_wait_for carries no state unless asked', waitPlain.ok && waitPlain.state === undefined && typeof waitPlain.evals === 'number', JSON.stringify(waitPlain));
+	const waitState = await s.call('tv_wait_for', {device: 'pc-fixture', selector: '.demo-tile', timeoutMs: 3000, withState: true});
+	check('withState:true appends the snapshot', waitState.ok && !!waitState.state?.focus, JSON.stringify(waitState).slice(0, 120));
+	const burst = await s.call('tv_press', {device: 'pc-fixture', key: 'RIGHT', repeat: 3, intervalMs: 60});
+	check('a burst reports its repeat and settles once', burst.repeat === 3 && burst.changed === true && burst.evals <= 8, JSON.stringify(burst));
 
 	console.log('\n--- screenshots (the thing Tizen cannot do) ---');
 	const shotPath = join(dir, 'shot.png');
@@ -550,7 +632,7 @@ async function main() {
 	check('tv_sequence runs the long-press case in the browser', seq.ok,
 		JSON.stringify((seq.steps || []).map((x) => `${x.step}=${x.ok}`)));
 	for (const step of seq.steps || []) {
-		console.log(`        ${step.ok ? 'ok ' : 'FAIL'} ${step.elapsedMs}ms  ${step.step}`);
+		console.log(`        ${step.ok ? 'ok ' : 'FAIL'} ${step.ms}ms  ${step.step}`);
 	}
 
 	// tv_sequence holds the operation lock, so a separate tv_profile call cannot run inside a
@@ -584,12 +666,12 @@ async function main() {
 	check('start relaunched the app itself, so the recording begins where the case will replay',
 		recStart.relaunched === true && recStart.bootReady?.ok === true,
 		JSON.stringify({relaunched: recStart.relaunched, boot: recStart.bootReady}));
-	const focusAtStart = await s.call('tv_state', {device: 'pc-parity'});
+	const focusAtStart = await s.call('tv_state', {device: 'pc-parity', format: 'json'});
 	check('and the focus really is back at the start of the list', focusAtStart.focus?.index === 0,
 		JSON.stringify(focusAtStart.focus));
 	const badgeUp = await s.call('tv_evaluate', {device: 'pc-parity', expression: 'document.querySelectorAll(".__tvdbg-rec").length'});
 	check('the REC badge is on screen while recording', badgeUp.value === 1, JSON.stringify(badgeUp));
-	const badgeInvisible = await s.call('tv_snapshot', {device: 'pc-parity'});
+	const badgeInvisible = await s.call('tv_snapshot', {device: 'pc-parity', format: 'json'});
 	check('and the badge never shows up as app structure in a snapshot',
 		!JSON.stringify(badgeInvisible.rows || []).includes('REC') &&
 		!JSON.stringify(badgeInvisible.popups || []).includes('tvdbg'),
@@ -693,12 +775,16 @@ async function main() {
 	check('status after stop says there is no recording', idle.recording === false, JSON.stringify(idle));
 
 	console.log('\n--- parity run: TV-identical synthetic input ---');
-	await s.call('tv_launch', {device: 'pc-parity'});
+	const parityLaunch = await s.call('tv_launch', {device: 'pc-parity'});
 	await s.call('tv_wait_for', {device: 'pc-parity', selector: '.demo-tile', timeoutMs: 20000, stableMs: 300});
 	const parityPress = await s.call('tv_press', {device: 'pc-parity', key: 'RIGHT'});
-	check('synthetic input drives the browser too', parityPress.focusChanged === true,
-		`${String(parityPress.focusedBefore).slice(0, 40)} -> ${String(parityPress.focusedAfter).slice(0, 40)}`);
-	check('parity press is labelled synthetic', parityPress.inputMode === 'synthetic', parityPress.inputMode);
+	check('synthetic input drives the browser too', parityPress.changed === true,
+		`${String(parityPress.before).slice(0, 40)} -> ${String(parityPress.focus).slice(0, 40)}`);
+	check('the parity launch is labelled synthetic', parityLaunch.inputMode === 'synthetic', parityLaunch.inputMode);
+	check('a synthetic press is ONE page-side call (dispatch + settle + read)', parityPress.evals === 1, `evals=${parityPress.evals}`);
+	const parityGoto = await s.call('tv_goto', {device: 'pc-parity', direction: 'RIGHT', text: 'космос', maxSteps: 8});
+	check('a synthetic goto costs one call per press plus the opening read',
+		parityGoto.ok && parityGoto.evals === parityGoto.presses + 1, JSON.stringify({presses: parityGoto.presses, evals: parityGoto.evals}));
 	const paritySeq = await s.call('tv_sequence', {
 		device: 'pc-parity',
 		steps: [
@@ -712,7 +798,7 @@ async function main() {
 	if (devUp) {
 		console.log(`\n--- bonus: your dev server (${devApp} at ${devUrl}) ---`);
 		const real = await s.call('tv_launch', {device: 'pc-app'});
-		check('the app loads in our Chrome', !!real.attached?.wsUrl, real.__error);
+		check('the app loads in our Chrome', real.ok === true, real.__error);
 		const cat = await s.call('tv_wait_for', {device: 'pc-app', selector: devTile, timeoutMs: 60000, stableMs: 700});
 		check('the app catalog renders in the browser', cat.ok, `${cat.elapsedMs}ms`);
 	} else {

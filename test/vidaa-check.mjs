@@ -44,9 +44,9 @@ async function main() {
 
 	console.log('\n--- boot ---');
 	const launched = await s.call('tv_launch', {device: DEVICE});
-	check('attach derives a ws url from /json/list', !!launched.attached?.wsUrl, launched.__error);
-	check('ws url has the /devtools/page shape',
-		String(launched.attached?.wsUrl || '').includes('/devtools/page/'), launched.attached?.wsUrl);
+	check('attach derives a ws url from /json/list', launched.ok === true, launched.__error);
+	check('launch reports rttMs and a modern eval dialect',
+		typeof launched.rttMs === 'number' && launched.legacyEval === undefined, JSON.stringify(launched).slice(0, 160));
 
 	const booted = await s.call('tv_wait_for', {device: DEVICE, selector: target.tile, timeoutMs: target.bootTimeoutMs, stableMs: 700});
 	check('tv_wait_for sees the app booted', booted.ok, booted.__error || `${booted.elapsedMs}ms`);
@@ -74,7 +74,7 @@ async function main() {
 	// Tiles exist before their titles render; wait for the focused tile's text so a real
 	// move does not read as "no movement" between two identical skeletons.
 	for (let i = 0; i < 30; i++) {
-		const now = await s.call('tv_state', {device: DEVICE});
+		const now = await s.call('tv_state', {device: DEVICE, format: 'json'});
 		if (String(now.focus?.text || '').trim()) {
 			break;
 		}
@@ -82,8 +82,8 @@ async function main() {
 	}
 	const down = await s.call('tv_press', {device: DEVICE, key: 'DOWN'});
 	check('tv_press dispatches synthetic keys', !down.__error && down.keyCode === 40, down.__error);
-	check('tv_press reports focus movement', down.focusChanged === true,
-		`before=${String(down.focusedBefore).slice(0, 60)} after=${String(down.focusedAfter).slice(0, 60)}`);
+	check('tv_press reports focus movement', down.changed === true,
+		`before=${String(down.before).slice(0, 60)} after=${String(down.focus).slice(0, 60)}`);
 	await s.call('tv_press', {device: DEVICE, key: 'UP'});
 
 	const back = await s.call('tv_press', {device: DEVICE, key: 'BACK'});
@@ -115,7 +115,7 @@ async function main() {
 		// tile row; no BACK here — from the menu BACK raises the exit popup.
 		const walk = ['RIGHT', 'DOWN', 'RIGHT', 'DOWN', 'DOWN', 'RIGHT', 'DOWN', 'RIGHT'];
 		for (let i = 0; i <= walk.length; i++) {
-			const now = await s.call('tv_state', {device: DEVICE});
+			const now = await s.call('tv_state', {device: DEVICE, format: 'json'});
 			const path = String(now.focus?.path || '');
 			if (tileClasses.some((c) => path.includes(c)) && !/banner/.test(path)) {
 				onTile = true;
@@ -153,7 +153,7 @@ async function main() {
 
 	console.log('\n--- relaunch = reload in place ---');
 	const relaunched = await s.call('tv_launch', {device: DEVICE, relaunch: true});
-	check('relaunch reattaches (page reloaded in place)', !!relaunched.attached?.wsUrl, relaunched.__error);
+	check('relaunch reattaches (page reloaded in place)', relaunched.ok === true, relaunched.__error);
 	const rebooted = await s.call('tv_wait_for', {device: DEVICE, selector: target.tile, timeoutMs: target.bootTimeoutMs, stableMs: 700});
 	check('the app boots again after the reload', rebooted.ok, rebooted.__error || `${rebooted.elapsedMs}ms`);
 

@@ -39,17 +39,20 @@ import {selectRequests, toListEntry, buildCurl, buildHar, capBody, compileUrlPat
 import {pollRequests, conditionJs} from '../src/wait.js';
 import {loadAppProfile, resolveElement, resolveScene, resolveTarget, resolveCondition} from '../src/appprofile.js';
 import {snapshotJs, focusIsRefJs, snapshotReleaseJs} from '../src/snapshot.js';
-import {stateJs, focusSignatureJs, focusMatchesJs} from '../src/state.js';
+import {stateJs, focusSignatureJs, focusMatchesJs, helpersInstallJs, withHelpersJs, sigAndMatchJs, focusMatchesBody} from '../src/state.js';
 import {recorderInstallJs, recorderDrainJs, recorderStopJs, recorderStatusJs} from '../src/record-inject.js';
 import {Timeline, compileCase, renderCase, slugify} from '../src/recorder.js';
 import {reverseKeyMap, keyNameFor} from '../src/keymaps.js';
-import {videoStateJs, videoSampleStartJs, videoSampleFinishJs} from '../src/inject.js';
+import {videoStateJs, videoSampleStartJs, videoSampleFinishJs, pressJs} from '../src/inject.js';
+import {capEvalValue, renderSnapshotText, renderStateText} from '../src/render.js';
 
 /**
  * Anything page-side must stay ES5 — see the header of src/inject.js. Cheap syntactic guard,
  * not a parser: it catches the constructs that actually get reached for.
  */
-const ES6_IN_PAGE_JS = /=>|\blet\b|\bconst\b|`|\.\.\.|\bclass\b|Object\.assign|\.find\(/;
+// `class` only as a declaration/expression: the word itself is an attribute name and a
+// selector fragment (`attributeFilter: ['class']`, `[class*=popup]`).
+const ES6_IN_PAGE_JS = /=>|\blet\b|\bconst\b|`|\.\.\.|\bclass\s+[A-Za-z_$]|Object\.assign|\.find\(/;
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const serverPath = join(__dirname, '..', 'src', 'server.js');
@@ -451,10 +454,12 @@ function networkChecks() {
 	for (let i = 0; i < 1100; i++) {
 		evicting._onEvent('Network.requestWillBeSent', {requestId: String(i), request: {url: `https://tv.local/${i}`, method: 'GET'}});
 	}
-	check('the network buffer holds 1000 requests, not the console limit of 500',
-		evicting.network.length === 1000, String(evicting.network.length));
+	// Eviction runs in batches (one splice per 64 events, not per event), so the buffer may sit
+	// up to a batch over its limit — never below it, and nothing goes uncounted.
+	check('the network buffer holds ~1000 requests, not the console limit of 500',
+		evicting.network.length >= 1000 && evicting.network.length < 1000 + 64, String(evicting.network.length));
 	check('what fell out of the buffer is counted, so an assertion cannot fail silently',
-		evicting.dropped.network === 100, String(evicting.dropped.network));
+		evicting.dropped.network + evicting.network.length === 1100, String(evicting.dropped.network));
 
 	const big = new CdpSession('ws://127.0.0.1:1');
 	big._onEvent('Network.requestWillBeSent', {
@@ -917,9 +922,14 @@ function snapshotChecks() {
 		['snapshotJs(full)', snapshotJs(fx, {detail: 'full', maxRows: 3, maxItemsPerRow: 4, ttlMs: 60000})],
 		['focusIsRefJs', focusIsRefJs(fx, 'e12')],
 		['snapshotReleaseJs', snapshotReleaseJs()],
-		['stateJs', stateJs(fx)],
+		['stateJs', stateJs(fx, {withSig: true})],
 		['focusSignatureJs', focusSignatureJs(fx)],
-		['focusMatchesJs', focusMatchesJs(fx, {text: 'x', selector: '.demo-tile'})]
+		['focusMatchesJs', focusMatchesJs(fx, {text: 'x', selector: '.demo-tile'})],
+		['helpersInstallJs', helpersInstallJs(fx)],
+		['sigAndMatchJs', sigAndMatchJs(fx, focusMatchesBody({text: 'x'}))],
+		['pressJs(synthetic)', pressJs(fx, {code: 39, key: 'ArrowRight', domCode: 'ArrowRight'},
+			{dispatch: true, repeat: 2, intervalMs: 100, holdMs: 0, quietMs: 100, changeTimeoutMs: 800, matchBody: focusMatchesBody({text: 'x'})})],
+		['pressJs(settle only)', pressJs(fx, null, {dispatch: false, quietMs: 100, changeTimeoutMs: 800})]
 	]) {
 		check(`${name} is ES5`, !ES6_IN_PAGE_JS.test(js), (js.match(ES6_IN_PAGE_JS) || [])[0]);
 		try {
@@ -933,7 +943,7 @@ function snapshotChecks() {
 	// A DOM small enough to hand-build, big enough for focusLeaf/focusInfo to run.
 	const makeSandbox = (snapStore) => {
 		const leaf = {
-			nodeType: 1, tagName: 'DIV', className: 'demo-tile _active', innerText: 'Tile',
+			nodeType: 1, tagName: 'DIV', className: 'demo-tile _active', innerText: 'Tile', textContent: 'Tile',
 			offsetHeight: 10, children: [],
 			querySelector: () => null,
 			getAttribute: () => null,
@@ -941,7 +951,9 @@ function snapshotChecks() {
 		};
 		leaf.parentNode = {nodeType: 1, tagName: 'DIV', className: 'demo-list', children: [leaf], parentNode: null};
 		const sandbox = {
-			console, JSON, Math, setTimeout, clearTimeout, parseInt, isFinite, String, Number,
+			console, JSON, Math, parseInt, isFinite, String, Number, Date,
+			// Fake timers: the helpers' TTL timer must not keep this process alive for a minute.
+			setTimeout: () => 0, clearTimeout: () => {},
 			RegExp, getComputedStyle: () => ({display: 'block', visibility: 'visible'}),
 			document: {querySelectorAll: () => [leaf], body: {innerText: ''}},
 			location: {href: 'http://fixture/'}
@@ -952,8 +964,24 @@ function snapshotChecks() {
 			sandbox.window.__tvDebugSnap = snapStore;
 		}
 		createContext(sandbox);
+		// Every snippet is a call into the installed helpers — install them like _pageCall does.
+		runInContext(helpersInstallJs(fx), sandbox);
 		return {sandbox, leaf};
 	};
+
+	// The helpers contract: a snippet on a page without them says so instead of throwing, and a
+	// snippet built for another profile refuses the installed set.
+	const bare = {window: null, setTimeout: () => 0, clearTimeout: () => {}};
+	bare.window = bare;
+	createContext(bare);
+	const missing = runInContext(withHelpersJs(fx, 'return 1;'), bare);
+	check('a snippet on a page without the helpers reports __tvdbgMissing',
+		missing && missing.__tvdbgMissing === 1, JSON.stringify(missing));
+	runInContext(helpersInstallJs(fx), bare);
+	check('once installed the same snippet runs', runInContext(withHelpersJs(fx, 'return 1;'), bare) === 1);
+	const other = {...fx, id: 'other', focus: ['.focused']};
+	const wrongKey = runInContext(withHelpersJs(other, 'return 1;'), bare);
+	check('helpers of another profile are not reused', wrongKey && wrongKey.__tvdbgMissing === 1, JSON.stringify(wrongKey));
 
 	const noStore = makeSandbox(null);
 	const r0 = runInContext(focusIsRefJs(fx, 'e12'), noStore.sandbox);
@@ -989,6 +1017,34 @@ function snapshotChecks() {
 		r5.released === true && r5.g === 5 && !rel.sandbox.window.__tvDebugSnap, JSON.stringify(r5));
 	const r6 = runInContext(snapshotReleaseJs(), rel.sandbox);
 	check('releasing twice is honest about there being nothing to release', r6.released === false);
+
+	// The signature and the opening goto read run on the same sandbox DOM.
+	const sig = runInContext(focusSignatureJs(fx), live.sandbox);
+	check('focusSignatureJs reads path#index/total::text', sig === 'demo-list > demo-tile#0/1::Tile', sig);
+	const open = runInContext(sigAndMatchJs(fx, focusMatchesBody({text: 'tile'})), live.sandbox);
+	check('sigAndMatchJs answers both reads in one call', open.sig === sig && open.match?.ok === true, JSON.stringify(open));
+
+	console.log('\n--- answer renderers and caps ---');
+	const small = capEvalValue({a: 1});
+	check('a small value passes the cap untouched', small.value.a === 1 && small.truncated === undefined);
+	const big = capEvalValue('x'.repeat(40000));
+	check('a big string is cut to 16 KB and says so',
+		big.truncated === true && big.value.length === 16384 && big.bytes === 40000 && /narrow/.test(big.hint), JSON.stringify(big).slice(0, 80));
+	const bigObj = capEvalValue({list: new Array(5000).fill('item')});
+	check('a big object is cut as JSON text with a hint', bigObj.truncated === true && typeof bigObj.value === 'string' && /no longer valid/.test(bigObj.hint));
+	const snapText = renderSnapshotText({
+		ok: true, g: 2, url: 'http://x/', scenes: ['s-cat'], popups: [],
+		focus: {ref: 'e1', text: 'One', path: 'list > tile', index: 0, total: 3},
+		tier: 'profile', neighbours: {LEFT: null, RIGHT: 'e2', UP: null, DOWN: 'e4'},
+		rows: [{i: 0, focused: true, items: [{ref: 'e1', i: 0, t: 'One', focused: true}, {ref: 'e2', i: 1, t: 'Two'}], more: 2},
+			{i: 1, label: 'Menu', items: [{ref: 'e4', i: 0, t: 'Main'}]}]
+	});
+	check('the snapshot text keeps the refs and marks the focus',
+		/\[e1 "One"\]\*/.test(snapText) && /r1 "Menu": \[e4 "Main"\]/.test(snapText) && /neighbours: RIGHT e2 DOWN e4/.test(snapText) && /\+2 off-screen/.test(snapText),
+		snapText);
+	const stText = renderStateText({url: 'http://x/', title: 'T', scenes: ['s-a'], focus: {text: 'F', path: 'a > b', index: 1, total: 4}, focusInMenu: true, popups: [{className: 'pp', text: 'P'}], counts: {tiles: 3, menuItems: 2, popups: 1}});
+	check('the state text carries focus, menu flag and popups',
+		/focus: "F" a > b#1\/4 \[in menu\]/.test(stText) && /popup: pp "P"/.test(stText) && /tiles 3/.test(stText), stText);
 }
 
 /**
@@ -1057,9 +1113,12 @@ function recorderChecks() {
 	const ENTER = 13;
 	const profile = fx;
 
-	// Four DOWN presses that each moved the focus -> one goto.
-	const moved = build(({obs, key}) => {
+	// Four DOWN presses that each moved the focus -> one goto. The opening observation comes a
+	// few ms BEFORE the first key, as the install observation does in a real recording — the
+	// compiler must compare the first press against that, not against its own result.
+	const moved = build(({obs, key, idle}) => {
 		obs({f: 'sig0'});
+		idle(5);
 		for (let i = 1; i <= 4; i++) {
 			key(DOWN);
 			obs({f: `sig${i}`, fx: i === 4 ? 'Fourth row' : `Row ${i}`});

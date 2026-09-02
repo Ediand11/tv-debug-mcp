@@ -21,18 +21,20 @@ import {SyntheticInput} from './input/synthetic.js';
 import {TrustedInput} from './input/trusted.js';
 import {CdpSession, resolvePageWs, sleep, isUnsupportedMethod, MAX_POSTDATA_BYTES} from './cdp.js';
 import {resolveKey} from './keymaps.js';
-import {focusSnapshotJs, videoStateJs, videoSampleStartJs, videoSampleFinishJs, PAGE_SLOT_TTL_MS} from './inject.js';
-import {snapshotJs, focusIsRefJs, snapshotReleaseJs} from './snapshot.js';
+import {pressJs, videoStateJs, videoSampleStartJs, videoSampleFinishJs, PAGE_SLOT_TTL_MS} from './inject.js';
+import {snapshotJs, focusIsRefBody, snapshotReleaseJs} from './snapshot.js';
 import {recorderInstallJs, recorderDrainJs, recorderStopJs, recorderStatusJs} from './record-inject.js';
 import {Timeline, compileCase, renderCase, slugify} from './recorder.js';
 import {freePort} from './ports.js';
 import {loadAppProfile, requireMenu, resolveTarget, resolveCondition} from './appprofile.js';
-import {stateJs, focusSignatureJs, focusMatchesJs, menuItemsJs} from './state.js';
+import {stateJs, focusSignatureJs, focusMatchesBody, focusInMenuBody, sigAndMatchJs, menuItemsJs, helpersInstallJs} from './state.js';
 import {pollUntil, pollRequests, describeCondition} from './wait.js';
 import {selectRequests, toListEntry, buildCurl, buildHar, capBody, HAR_BODY_TOTAL_LIMIT} from './network.js';
 import {summarizeProfile, applySourceMap, saveProfile} from './profile.js';
 import {summarizeHeapSnapshot} from './heap.js';
 import {metricsToMap, metricsDiff, windowSecondsOf} from './metrics.js';
+import {capEvalValue} from './render.js';
+import {PKG_VERSION} from './version.js';
 
 /** A big profile off a slow TV takes far longer to serialise than a normal CDP round-trip. */
 const PROFILE_STOP_TIMEOUT_MS = 60000;
@@ -52,6 +54,21 @@ const HEAP_SNAPSHOT_TIMEOUT_MS = 120000;
 /** Chunks can keep arriving after `takeHeapSnapshot` answers — wait out the quiet. */
 const HEAP_DRAIN_QUIET_MS = 400;
 const HEAP_DRAIN_MAX_MS = 15000;
+/**
+ * Press settle defaults per platform: how long the focus has to stay put before a press is
+ * "done", and how long to wait for it to move at all. The app profile's `settle` block wins.
+ * A local Chrome renders the next frame in 16ms; a TV framework animates the move.
+ */
+const SETTLE_DEFAULTS = {
+	pc: {quietMs: 80, changeTimeoutMs: 800},
+	vidaa: {quietMs: 120, changeTimeoutMs: 1000},
+	default: {quietMs: 150, changeTimeoutMs: 1200}
+};
+/**
+ * Sequence steps whose RESULT is the point (a reading, a file, a measured request): they keep
+ * it in the compact report. Everything else is navigation and is reported as one line.
+ */
+const READ_STEPS = ['eval', 'videoState', 'state', 'snapshot', 'profileStart', 'profileStop', 'metrics', 'expectRequest'];
 
 /**
  * Flush and close a write stream, waiting for the OS to really have the bytes — the summary
@@ -75,6 +92,48 @@ function stepLabel(step) {
 	const value = step[key];
 	const rendered = typeof value === 'object' ? JSON.stringify(value) : String(value);
 	return `${key}: ${rendered}`.slice(0, 120);
+}
+
+/**
+ * One line about a green navigation step, for the compact sequence report.
+ * @param {object} step
+ * @param {*} result
+ * @return {?string}
+ */
+function stepBrief(step, result) {
+	if (!result || typeof result !== 'object') {
+		return null;
+	}
+	const cut = (v, n = 120) => {
+		const t = typeof v === 'string' ? v : JSON.stringify(v);
+		return t && t.length > n ? t.slice(0, n) + '…' : t;
+	};
+	if (step.launch) {
+		const a = result.attached || {};
+		const boot = a.bootReady ? ` bootReady ${a.bootReady.ok ? 'ok' : 'FAILED'} ${a.bootReady.elapsedMs}ms` : '';
+		return `${a.href || ''}${boot}${a.warning ? ' warning: ' + a.warning : ''}`;
+	}
+	if (step.press != null || step.longpress != null) {
+		return `${result.focus || ''}${result.changed === false ? ' (focus did not change)' : ''}`;
+	}
+	if (step.goto) {
+		const f = result.focus && result.focus.text != null ? ` -> ${cut(result.focus.text, 60)}` : '';
+		return `${result.trail || result.reason || ''}${f}`;
+	}
+	if (step.menu !== undefined) {
+		const f = result.state && result.state.focus ? ` focus ${cut(result.state.focus.text, 60)}` : '';
+		return `${result.chosen ? 'chose ' + result.chosen : 'opened'} (${(result.items || []).length} items)${f}`;
+	}
+	if (step.wait || step.expect) {
+		return `${result.condition || ''} ${cut(result.detail, 80)} ${result.elapsedMs}ms`;
+	}
+	if (step.networkMark !== undefined) {
+		return 'marked';
+	}
+	if (step.sleep != null) {
+		return `slept ${result.slept}ms`;
+	}
+	return cut(result, 160);
 }
 
 function makeAdapter(cfg, log) {
@@ -390,47 +449,148 @@ export class DeviceSession {
 	}
 
 	/**
-	 * Dispatch a key. For a long-press, hold = keydown, wait durationMs, keyup.
-	 * For a short press, keydown+keyup back to back. `repeat` fires the whole press N times.
-	 * @param {string|number} keyName
-	 * @param {{durationMs?: number, repeat?: number, intervalMs?: number}} [opts]
+	 * Evaluate a snippet built on the shared page-side helpers (state.js withHelpersJs).
+	 * The helpers are installed on first use and after anything that blew the page away — a
+	 * navigation, a reload, a reattach to a new V8 — which the snippet reports itself.
+	 * @param {string} js
+	 * @param {{awaitPromise?: boolean, timeoutMs?: number}} [opts]
+	 * @return {Promise<*>}
 	 */
-	async press(keyName, opts = {}) {
+	async _pageCall(js, opts = {}) {
 		const cdp = await this._cdp();
+		let res = await cdp.evaluate(js, opts);
+		if (res && res.__tvdbgMissing) {
+			await cdp.evaluate(helpersInstallJs(this.profile), {awaitPromise: false});
+			res = await cdp.evaluate(js, opts);
+			if (res && res.__tvdbgMissing) {
+				throw new Error('the page-side helpers could not be installed (is the page still loading?)');
+			}
+		}
+		return res;
+	}
+
+	/** Start of a cost window: {t0, calls} — see `_cost`. */
+	_tick() {
+		return {t0: Date.now(), calls: this.cdp ? this.cdp.calls : 0};
+	}
+
+	/**
+	 * What an operation cost: wall time and CDP calls since `_tick`. Reported as `ms` / `evals`
+	 * so a slow step can be told from a slow TV.
+	 * @param {{t0: number, calls: number}} tick
+	 * @return {{ms: number, evals: number}}
+	 */
+	_cost(tick) {
+		return {ms: Date.now() - tick.t0, evals: this.cdp ? this.cdp.calls - tick.calls : 0};
+	}
+
+	/**
+	 * Settle thresholds for this device: profile `settle` block over platform defaults.
+	 * @return {{quietMs: number, changeTimeoutMs: number}}
+	 */
+	_settleOpts() {
+		const base = SETTLE_DEFAULTS[this.platform] || SETTLE_DEFAULTS.default;
+		const prof = this.profile.settle || {};
+		return {
+			quietMs: prof.quietMs != null ? prof.quietMs : base.quietMs,
+			changeTimeoutMs: prof.changeTimeoutMs != null ? prof.changeTimeoutMs : base.changeTimeoutMs
+		};
+	}
+
+	/**
+	 * Dispatch a key and wait for the focus to settle — ONE page-side call on a synthetic-input
+	 * device (see inject.js pressJs). For a long-press, hold = keydown, wait durationMs, keyup.
+	 * `repeat` fires the whole press N times with `intervalMs` between, and only the last one
+	 * settles. `before` and `matchBody` let tv_goto / tv_menu fold their own reads into the
+	 * same call.
+	 *
+	 * Trusted input (a local Chrome by default) is the one exception: its keys go through the
+	 * CDP Input domain, so that path is keyDown/keyUp calls plus the same page-side settle.
+	 * @param {string|number} keyName
+	 * @param {{durationMs?: number, repeat?: number, intervalMs?: number, settle?: boolean,
+	 *          before?: ?string, matchBody?: ?string}} [opts]
+	 * @return {Promise<{before: ?string, after: ?string, changed: ?boolean, focus: ?object,
+	 *                   match: *, presses: number, ms: number, evals: number}>}
+	 */
+	async _press(keyName, opts = {}) {
+		const cdp = await this._cdp();
+		const tick = this._tick();
 		const spec = resolveKey(this.platform, keyName);
 		const repeat = Math.max(1, Math.floor(opts.repeat || 1));
 		const interval = opts.intervalMs != null ? Math.max(0, Math.floor(opts.intervalMs)) : 250;
 		const hold = Math.max(0, Math.floor(opts.durationMs || 0));
-		const before = await this.focus().catch(() => null);
-		for (let i = 0; i < repeat; i++) {
-			await this.input.keyDown(cdp, spec);
-			if (hold > 0) {
-				await sleep(hold);
+		const settle = opts.settle !== false;
+		const thresholds = this._settleOpts();
+		const pageSide = this.input.mode === 'synthetic';
+		let before = opts.before != null ? String(opts.before) : null;
+
+		if (!pageSide) {
+			if (settle && before === null) {
+				before = await this._pageCall(focusSignatureJs(this.profile)).catch(() => null);
 			}
-			await this.input.keyUp(cdp, spec);
-			if (i < repeat - 1) {
-				await sleep(interval);
+			for (let i = 0; i < repeat; i++) {
+				await this.input.keyDown(cdp, spec);
+				if (hold > 0) {
+					await sleep(hold);
+				}
+				await this.input.keyUp(cdp, spec);
+				if (i < repeat - 1) {
+					await sleep(interval);
+				}
+			}
+			if (!settle) {
+				return {before, after: null, changed: null, focus: null, match: null, presses: repeat, ...this._cost(tick)};
 			}
 		}
-		const after = await this.focusSettled(before).catch((e) => 'focus-read-failed: ' + e.message);
-		return {
-			key: String(keyName), keyCode: spec.code, repeat, holdMs: hold, inputMode: this.input.mode,
-			focusedBefore: before, focusedAfter: after, focusChanged: before !== after
-		};
+		// The call must outlive the burst it fires plus the settle it waits for.
+		const budget = (pageSide ? repeat * (hold + interval) : 0) +
+			(settle ? thresholds.changeTimeoutMs + 2000 : 0) + 4000;
+		const r = await this._pageCall(pressJs(this.profile, spec, {
+			dispatch: pageSide, repeat, intervalMs: interval, holdMs: hold, settle, before,
+			quietMs: thresholds.quietMs, changeTimeoutMs: thresholds.changeTimeoutMs, matchBody: opts.matchBody
+		}), {awaitPromise: true, timeoutMs: budget});
+		if (!r || typeof r !== 'object') {
+			throw new Error('the press did not report back (page navigated during the settle?)');
+		}
+		// Trusted keys were fired above, not by the page — the page-side count is 0 there.
+		return {...r, presses: pageSide ? r.presses : repeat, ...this._cost(tick)};
 	}
 
-	async focus() {
-		const cdp = await this._cdp();
-		return cdp.evaluate(focusSnapshotJs(this.profile.focus));
+	/**
+	 * tv_press: the compact answer. Focus after the press and whether it moved; the focus
+	 * before only when it did not (that is when the caller needs it); repeat/holdMs only when
+	 * they were not the defaults. inputMode/keyCode are in the tv_launch answer, once.
+	 * @param {string|number} keyName
+	 * @param {{durationMs?: number, repeat?: number, intervalMs?: number, settle?: boolean}} [opts]
+	 */
+	async press(keyName, opts = {}) {
+		const r = await this._press(keyName, opts);
+		const out = {key: String(keyName)};
+		if (opts.settle === false) {
+			out.settled = false;
+		} else {
+			out.focus = r.after;
+			out.changed = r.changed;
+			if (!r.changed) {
+				out.before = r.before;
+			}
+		}
+		if (r.presses > 1) {
+			out.repeat = r.presses;
+		}
+		if (opts.durationMs) {
+			out.holdMs = Math.floor(opts.durationMs);
+		}
+		out.ms = r.ms;
+		out.evals = r.evals;
+		return out;
 	}
 
 	/** Structured snapshot: url, title, visible scenes, focused element, popups, counts. */
-	async state() {
-		const cdp = await this._cdp();
-		return cdp.evaluate(stateJs(this.profile));
+	async state(opts = {}) {
+		return this._pageCall(stateJs(this.profile, opts));
 	}
 
-	/** Compact focus signature — used to detect movement and loops. */
 	/**
 	 * A structural read of the screen around the focus: the rows, their items, and where the
 	 * focus sits among them. One call instead of press-look-press-look.
@@ -844,45 +1004,9 @@ export class DeviceSession {
 		}
 	}
 
+	/** Compact focus signature — used to detect movement and loops. */
 	async focusSignature() {
-		const cdp = await this._cdp();
-		return cdp.evaluate(focusSignatureJs(this.profile));
-	}
-
-	/**
-	 * Focus after an action, once it has settled.
-	 *
-	 * TV navigation is asynchronous — the app moves focus on the next frame, and lists
-	 * animate. Reading focus straight after `keyup` reports the PREVIOUS tile, which made
-	 * every press look like it did nothing. So: wait for focus to differ from `before`
-	 * (or give up), then wait for it to stop changing.
-	 * @param {?string} before focus snapshot taken before the action
-	 * @param {{changeTimeoutMs?: number, stableMs?: number, intervalMs?: number}} [opts]
-	 * @return {Promise<string>}
-	 */
-	async focusSettled(before, opts = {}) {
-		const cdp = await this._cdp();
-		const js = focusSnapshotJs(this.profile.focus);
-		const changeTimeout = opts.changeTimeoutMs != null ? opts.changeTimeoutMs : 1200;
-		const stableMs = opts.stableMs != null ? opts.stableMs : 250;
-		const interval = opts.intervalMs != null ? opts.intervalMs : 100;
-
-		let current = await cdp.evaluate(js);
-		const changeDeadline = Date.now() + changeTimeout;
-		while (current === before && Date.now() < changeDeadline) {
-			await sleep(interval);
-			current = await cdp.evaluate(js);
-		}
-		let stableSince = Date.now();
-		while (Date.now() - stableSince < stableMs) {
-			await sleep(interval);
-			const next = await cdp.evaluate(js);
-			if (next !== current) {
-				current = next;
-				stableSince = Date.now();
-			}
-		}
-		return current;
+		return this._pageCall(focusSignatureJs(this.profile));
 	}
 
 	async videoState(sampleGapMs = 600) {
@@ -917,6 +1041,16 @@ export class DeviceSession {
 	async evaluate(expression, awaitPromise) {
 		const cdp = await this._cdp();
 		return cdp.evaluate(expression, {awaitPromise});
+	}
+
+	/**
+	 * tv_evaluate: the value under a size cap. One `document.body.innerHTML` used to be 50k
+	 * tokens of answer; the cut is reported and comes with a hint to narrow the expression.
+	 * @param {string} expression
+	 * @param {boolean} [awaitPromise]
+	 */
+	async evaluateCapped(expression, awaitPromise) {
+		return capEvalValue(await this.evaluate(expression, awaitPromise));
 	}
 
 	/**
@@ -1459,7 +1593,7 @@ export class DeviceSession {
 	 */
 	networkList(opts = {}) {
 		const cdp = this._networkCdp();
-		const limit = Math.max(1, Math.floor(opts.limit || 50));
+		const limit = Math.max(1, Math.floor(opts.limit || 25));
 		const matched = selectRequests(cdp.network, {
 			urlPattern: opts.urlPattern, method: opts.method, status: opts.status, since: opts.since
 		});
@@ -1607,7 +1741,7 @@ export class DeviceSession {
 				}
 			}
 		}
-		const har = buildHar(matched, {bodies, version: '0.2.0', withBodies: opts.withBodies !== false});
+		const har = buildHar(matched, {bodies, version: PKG_VERSION, withBodies: opts.withBodies !== false});
 		const outPath = opts.path
 			? resolve(opts.path)
 			: resolve(process.env.TMPDIR || '/tmp', `tv-network-${this.cfg.id}-${Date.now()}.har`);
@@ -1626,8 +1760,12 @@ export class DeviceSession {
 
 	/**
 	 * Wait until a condition holds. See wait.js for the condition shapes.
+	 *
+	 * The state snapshot is opt-in (`withState`): every `expect` of a sequence used to pay a
+	 * round-trip and 300-600 bytes for a state nobody read.
 	 * @param {object} condition
-	 * @param {{timeoutMs?: number, intervalMs?: number, stableMs?: number, startedAt?: number}} [opts]
+	 * @param {{timeoutMs?: number, intervalMs?: number, stableMs?: number, startedAt?: number,
+	 *          withState?: boolean}} [opts]
 	 */
 	async waitFor(condition, opts = {}) {
 		if (condition && condition.request) {
@@ -1636,12 +1774,17 @@ export class DeviceSession {
 		// Named forms ({element} / {elementGone} / {sceneName}) are folded into the raw ones
 		// here rather than in the tool handler, so tv_sequence steps get them for free.
 		const {condition: cond, resolvedFrom} = resolveCondition(this.profile, condition);
+		const tick = this._tick();
 		const io = {
-			evaluate: (js) => this.evaluate(js, true),
+			evaluate: (js) => this._pageCall(js),
 			videoState: (gap) => this.videoState(gap)
 		};
 		const res = await pollUntil(io, this.profile, cond, opts);
-		return {...res, ...(resolvedFrom ? {resolvedFrom} : {}), state: await this.state().catch(() => null)};
+		const out = {...res, ...(resolvedFrom ? {resolvedFrom} : {}), evals: this._cost(tick).evals};
+		if (opts.withState) {
+			out.state = await this.state().catch(() => null);
+		}
+		return out;
 	}
 
 	/**
@@ -1682,7 +1825,7 @@ export class DeviceSession {
 		// Arriving and selecting is one intent and two round-trips otherwise, and the pause
 		// between them is where a lazily-loading list moves the focus out from under you.
 		if (res.ok && opts.select) {
-			await this.press('ENTER');
+			await this._press('ENTER');
 			res.selected = true;
 			res.state = await this.state().catch(() => null);
 		}
@@ -1690,7 +1833,10 @@ export class DeviceSession {
 	}
 
 	/**
-	 * @param {{text: ?string, selector: ?string, testid: ?string}} target
+	 * One page-side call per step: press + settle + "is this the target" (see _press). The
+	 * green answer is a trail ("DOWN×3") and the final focus; the per-press `steps` list only
+	 * comes back with a red one, where it is the evidence.
+	 * @param {{text: ?string, selector: ?string, testid: ?string, ref?: string}} target
 	 * @param {{direction: string, maxSteps?: number, deadlineMs?: number}} opts
 	 */
 	async _gotoTarget(target, opts) {
@@ -1701,54 +1847,67 @@ export class DeviceSession {
 		if (target.ref == null && target.text == null && target.selector == null && target.testid == null) {
 			throw new Error('tv_goto needs a target: ref, element, text, selector or testid');
 		}
+		const tick = this._tick();
 		const maxSteps = Math.min(200, Math.max(1, Math.floor(opts.maxSteps || 30)));
 		const deadline = Date.now() + (opts.deadlineMs || 45000);
 		// A ref is checked by IDENTITY (focusLeaf() === the stashed element), which is strictly
 		// stronger than matching text: duplicate titles in a catalog are normal, and a text
 		// match silently stops on the wrong tile.
-		const matchJs = target.ref != null
-			? focusIsRefJs(this.profile, target.ref)
-			: focusMatchesJs(this.profile, target);
+		const matchBody = target.ref != null
+			? focusIsRefBody(target.ref)
+			: focusMatchesBody(target);
 		const steps = [];
 		const seen = new Set();
+		const done = (ok, presses, extra) => {
+			const out = {ok, presses, ...extra, ...this._cost(tick)};
+			if (ok) {
+				if (presses > 0) {
+					out.trail = `${direction}×${presses}`;
+				}
+			} else {
+				out.steps = steps;
+			}
+			return out;
+		};
 
-		let match = await this.evaluate(matchJs, true);
+		const first = await this._pageCall(sigAndMatchJs(this.profile, matchBody));
+		let match = first.match || {};
 		// A stale ref must fail here, not after thirty presses in the wrong direction.
-		if (match && match.refMissing) {
-			return {ok: false, reason: match.reason, presses: 0, steps};
+		if (match.refMissing) {
+			return done(false, 0, {reason: match.reason});
 		}
 		if (match.ok) {
-			return {ok: true, presses: 0, reason: 'already on target', focus: match.detail, steps};
+			return done(true, 0, {reason: 'already on target', focus: match.detail});
 		}
-		let sig = await this.focusSignature();
+		let sig = first.sig;
 		seen.add(sig);
 
 		for (let i = 0; i < maxSteps; i++) {
 			if (Date.now() > deadline) {
-				return {ok: false, reason: 'deadline reached', presses: i, steps, focus: match.detail};
+				return done(false, i, {reason: 'deadline reached', focus: match.detail});
 			}
-			await this.press(direction);
-			const nextSig = await this.focusSignature();
-			match = await this.evaluate(matchJs, true);
+			const r = await this._press(direction, {before: sig, matchBody});
+			match = r.match || {};
+			const nextSig = r.after;
 			steps.push({press: direction, focus: match.detail ? match.detail.text : null, matched: !!match.ok});
 
 			if (match.refMissing) {
 				// The page navigated under us and took the ref store with it.
-				return {ok: false, reason: match.reason, presses: i + 1, steps};
+				return done(false, i + 1, {reason: match.reason});
 			}
 			if (match.ok) {
-				return {ok: true, presses: i + 1, steps, focus: match.detail};
+				return done(true, i + 1, {focus: match.detail});
 			}
 			if (nextSig === sig) {
-				return {ok: false, reason: `focus stopped moving on ${direction} (edge of the list?)`, presses: i + 1, steps, focus: match.detail};
+				return done(false, i + 1, {reason: `focus stopped moving on ${direction} (edge of the list?)`, focus: match.detail});
 			}
 			if (seen.has(nextSig)) {
-				return {ok: false, reason: 'focus returned to a position already visited (wrapped around)', presses: i + 1, steps, focus: match.detail};
+				return done(false, i + 1, {reason: 'focus returned to a position already visited (wrapped around)', focus: match.detail});
 			}
 			seen.add(nextSig);
 			sig = nextSig;
 		}
-		return {ok: false, reason: `target not reached in ${maxSteps} presses`, presses: maxSteps, steps, focus: match.detail};
+		return done(false, maxSteps, {reason: `target not reached in ${maxSteps} presses`, focus: match.detail});
 	}
 
 	/**
@@ -1759,59 +1918,69 @@ export class DeviceSession {
 	 */
 	async menu(name, opts = {}) {
 		const menu = requireMenu(this.profile);
+		const tick = this._tick();
 		// Reaching the sidebar takes one press per column you are away from it, so a fixed
 		// small count fails as soon as the case has navigated a few tiles right. Press until
 		// focus is inside the menu, bounded the same way tv_goto is.
 		const maxOpen = Math.min(50, Math.max(1, Math.floor(opts.maxOpenPresses || 20)));
 		const openPresses = [];
-		let st = await this.state();
-		let sig = await this.focusSignature();
+		// One call for the opening read: the state (is the focus in the menu already?) and the
+		// signature the first press compares against.
+		let st = await this.state({withSig: true});
+		let sig = st.sig;
+		delete st.sig;
+		let inMenu = !!st.focusInMenu;
 		let seen = new Set([sig]);
 		// Some screens don't let the open key cross back to the sidebar at all — inside a
 		// settings-style section LEFT can do nothing and you have to leave with BACK first.
 		// One such escape press, then carry on; without it tv_menu is only usable from the
 		// catalog.
 		let escapesLeft = menu.exitKey ? 1 : 0;
+		const inMenuBody = focusInMenuBody(menu);
 
-		for (let i = 0; i < maxOpen && !st.focusInMenu; i++) {
-			await this.press(menu.openKey);
-			const nextSig = await this.focusSignature();
-			st = await this.state();
-			openPresses.push({press: menu.openKey, focus: st.focus ? st.focus.text : null, focusInMenu: !!st.focusInMenu});
-			if (st.focusInMenu) {
+		for (let i = 0; i < maxOpen && !inMenu; i++) {
+			// Press + settle + "is the focus inside the menu now" — one round-trip.
+			const r = await this._press(menu.openKey, {before: sig, matchBody: inMenuBody});
+			const m = r.match || {};
+			inMenu = !!m.ok;
+			openPresses.push({press: menu.openKey, focus: m.detail ? m.detail.text : null, focusInMenu: inMenu});
+			if (inMenu) {
 				break;
 			}
-			if (nextSig === sig || seen.has(nextSig)) {
+			if (r.after === sig || seen.has(r.after)) {
 				if (escapesLeft > 0) {
 					escapesLeft--;
-					await this.press(menu.exitKey);
-					st = await this.state();
-					sig = await this.focusSignature();
+					const esc = await this._press(menu.exitKey, {matchBody: inMenuBody});
+					const em = esc.match || {};
+					inMenu = !!em.ok;
+					sig = esc.after;
 					seen = new Set([sig]);
-					openPresses.push({press: menu.exitKey, focus: st.focus ? st.focus.text : null, focusInMenu: !!st.focusInMenu, note: 'escape from the section'});
+					openPresses.push({press: menu.exitKey, focus: em.detail ? em.detail.text : null, focusInMenu: inMenu, note: 'escape from the section'});
 					continue;
 				}
 				return {
 					ok: false,
 					reason: `focus stopped moving on ${menu.openKey} before reaching the menu`,
 					openPresses,
-					state: st
+					state: await this.state().catch(() => st),
+					...this._cost(tick)
 				};
 			}
-			seen.add(nextSig);
-			sig = nextSig;
+			seen.add(r.after);
+			sig = r.after;
 		}
-		if (!st.focusInMenu) {
+		if (!inMenu) {
 			return {
 				ok: false,
 				reason: `focus did not reach the menu within ${maxOpen}x ${menu.openKey}`,
 				openPresses,
-				state: st
+				state: await this.state().catch(() => st),
+				...this._cost(tick)
 			};
 		}
-		const items = await this.evaluate(menuItemsJs(this.profile), true).catch(() => []);
+		const items = await this._pageCall(menuItemsJs(this.profile)).catch(() => []);
 		if (!name) {
-			return {ok: true, opened: true, items, state: st};
+			return {ok: true, opened: true, items, state: await this.state(), ...this._cost(tick)};
 		}
 
 		// Match on the text AND on "this is a menu item". Text alone is not enough: a Settings
@@ -1824,13 +1993,18 @@ export class DeviceSession {
 			res = await this.goto({direction: 'UP', ...target, maxSteps: steps, deadlineMs: opts.deadlineMs});
 		}
 		if (!res.ok) {
-			return {ok: false, reason: `menu item "${name}" not found`, items, goto: res, state: await this.state()};
+			return {ok: false, reason: `menu item "${name}" not found`, items, goto: res, state: await this.state(), ...this._cost(tick)};
 		}
 		const select = opts.select !== false;
 		if (select) {
-			await this.press('ENTER');
+			await this._press('ENTER');
 		}
-		return {ok: true, chosen: name, items, selected: select, presses: res.presses, state: await this.state()};
+		return {
+			ok: true, chosen: name, items, selected: select,
+			presses: openPresses.length + res.presses,
+			state: await this.state(),
+			...this._cost(tick)
+		};
 	}
 
 	/**
@@ -1842,6 +2016,7 @@ export class DeviceSession {
 		if (!Array.isArray(steps) || !steps.length) {
 			throw new Error('tv_sequence needs a non-empty steps array');
 		}
+		const full = opts.report === 'full';
 		return this.withOperationLock(async () => {
 			const stopOnFail = opts.stopOnFail !== false;
 			const out = [];
@@ -1861,7 +2036,19 @@ export class DeviceSession {
 					ok = false;
 					result = {error: e.message};
 				}
-				out.push({index: i, step: stepLabel(step), ok, elapsedMs: Date.now() - t0, result});
+				const row = {i, step: stepLabel(step), ok, ms: Date.now() - t0};
+				// A green navigation step is one line; a reading and a red step keep their result
+				// — that is the evidence a verdict is written from.
+				const keep = full || !ok || READ_STEPS.some((k) => step[k] !== undefined);
+				if (keep) {
+					row.result = result;
+				} else {
+					const brief = stepBrief(step, result);
+					if (brief) {
+						row.brief = brief;
+					}
+				}
+				out.push(row);
 				if (!ok) {
 					failedAt = i;
 					if (stopOnFail) {
@@ -1924,7 +2111,7 @@ export class DeviceSession {
 			return this.networkMark();
 		}
 		if (step.eval != null) {
-			return {ok: true, value: await this.evaluate(step.eval, true)};
+			return {ok: true, ...(await this.evaluateCapped(step.eval, true))};
 		}
 		if (step.sleep != null) {
 			await sleep(Math.min(60000, Math.max(0, Math.floor(step.sleep))));
@@ -1980,24 +2167,85 @@ export class DeviceSession {
 	}
 
 	/**
+	 * Console output, exceptions and failed requests since launch — deduplicated.
+	 *
+	 * A TV app that throws the same exception on every focus move produces sixty identical
+	 * 1.4 KB entries; one entry with `count` and first/last timestamps says the same thing.
+	 * Timestamps are seconds since the connection was made (`t`, `tLast`), file urls are cut
+	 * to their basename (`at`). The entries reported are the most recent distinct ones.
 	 * @param {{filter?: string, levels?: Array<string>, limit?: number}} [opts]
 	 */
-	consoleReport({filter, levels, limit = 60} = {}) {
+	consoleReport({filter, levels, limit = 30} = {}) {
 		if (!this.cdp) {
 			throw new Error(`device "${this.cfg.id}" is not launched — call tv_launch first`);
 		}
 		const cdp = this.cdp;
-		const take = Math.max(1, Math.floor(limit) || 60); // slice(-0) would return everything
+		const take = Math.max(1, Math.floor(limit) || 30);
 		const needle = filter ? String(filter).toLowerCase() : null;
 		const matchText = (s) => !needle || String(s || '').toLowerCase().includes(needle);
 		const wantLevel = (m) => !levels || !levels.length || levels.includes(m.level);
-
+		const t0 = cdp.startedAt || 0;
+		const rel = (at) => (typeof at === 'number' && t0 ? Math.round((at - t0) / 100) / 10 : null);
+		const basename = (url) => {
+			if (!url) {
+				return null;
+			}
+			const u = String(url);
+			const cut = u.indexOf('?');
+			const path = cut >= 0 ? u.slice(0, cut) : u;
+			return path.slice(path.lastIndexOf('/') + 1) || path;
+		};
+		/**
+		 * Newest distinct entries, chronological, each with how often it repeated.
+		 * @param {Array<object>} list
+		 * @param {function(object): string} keyOf
+		 * @param {function(object): object} shape
+		 */
+		const dedup = (list, keyOf, shape) => {
+			const byKey = new Map();
+			for (const m of list) {
+				const k = keyOf(m);
+				const hit = byKey.get(k);
+				if (hit) {
+					hit.count++;
+					hit.tLast = rel(m.at);
+				} else {
+					byKey.set(k, {...shape(m), count: 1, t: rel(m.at), tLast: rel(m.at)});
+				}
+			}
+			const rows = [...byKey.values()].slice(-take);
+			for (const r of rows) {
+				if (r.count === 1) {
+					delete r.count;
+					delete r.tLast;
+				}
+				if (r.t === null) {
+					delete r.t;
+					delete r.tLast;
+				}
+			}
+			return rows;
+		};
+		const place = (m) => {
+			const file = basename(m.url);
+			return file ? {at: m.line != null ? `${file}:${m.line}` : file} : {};
+		};
 		return {
-			errors: cdp.exceptions.filter((m) => matchText(m.text)).slice(-take),
-			console: cdp.console.filter((m) => wantLevel(m) && matchText(m.text)).slice(-take),
-			networkFailures: cdp.networkFailures
-				.filter((n) => matchText(n.url) || matchText(n.errorText))
-				.slice(-take),
+			errors: dedup(
+				cdp.exceptions.filter((m) => matchText(m.text)),
+				(m) => m.text,
+				(m) => ({text: m.text, ...place(m)})
+			),
+			console: dedup(
+				cdp.console.filter((m) => wantLevel(m) && matchText(m.text)),
+				(m) => `${m.level}\u0000${m.text}`,
+				(m) => ({level: m.level, text: m.text, ...place(m)})
+			),
+			networkFailures: dedup(
+				cdp.networkFailures.filter((n) => matchText(n.url) || matchText(n.errorText)),
+				(n) => `${n.url}\u0000${n.errorText}\u0000${n.blocked}`,
+				(n) => ({url: n.url, errorText: n.errorText, ...(n.blocked ? {blocked: n.blocked} : {})})
+			),
 			totals: {
 				console: cdp.console.length,
 				exceptions: cdp.exceptions.length,
@@ -2008,6 +2256,39 @@ export class DeviceSession {
 			},
 			droppedFromBuffer: cdp.dropped
 		};
+	}
+
+	/**
+	 * The tv_launch answer: what an agent needs to drive this device, once. Everything about
+	 * the transport (ws url, device port) stays in the log.
+	 * @param {?object} page
+	 */
+	launchReport(page) {
+		const p = page || {};
+		const out = {
+			ok: true,
+			device: this.cfg.id,
+			engine: this.cfg.engine,
+			url: p.href,
+			title: p.title,
+			inputMode: this.input.mode,
+			freshLaunch: !!p.freshLaunch
+		};
+		if (p.localPort) {
+			out.localPort = p.localPort;
+		}
+		if (this.cdp && this.cdp.rttMs != null) {
+			out.rttMs = this.cdp.rttMs;
+		}
+		if (this.cdp && this.cdp.legacyEvalDialect) {
+			out.legacyEval = true;
+		}
+		for (const k of ['bootReady', 'warning', 'reloadSkipped']) {
+			if (p[k] !== undefined) {
+				out[k] = p[k];
+			}
+		}
+		return out;
 	}
 
 	async dispose() {

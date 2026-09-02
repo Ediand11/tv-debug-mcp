@@ -32,7 +32,8 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
  *   elements: Object<string, (string|ElementSpec)>,
  *   scenes: Object<string, string>,
  *   snapshot: ?{row?: string, item?: string, label?: string, maxRows?: number, maxItemsPerRow?: number},
- *   record: ?{watch?: Array<{urlPattern: string, method?: string, name?: string}>}
+ *   record: ?{watch?: Array<{urlPattern: string, method?: string, name?: string}>},
+ *   settle: ?{quietMs?: number, changeTimeoutMs?: number}
  * }} AppProfile
  */
 
@@ -50,7 +51,10 @@ const GENERIC = {
 	elements: {},
 	scenes: {},
 	snapshot: null,
-	record: null
+	record: null,
+	// Press settle thresholds: how long the focus must stay put after a press (quietMs) and how
+	// long to wait for it to move at all (changeTimeoutMs). Platform defaults apply when absent.
+	settle: null
 };
 
 const _cache = new Map();

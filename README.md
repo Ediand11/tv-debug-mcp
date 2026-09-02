@@ -110,6 +110,7 @@ npm link                       # из корня репозитория
 | `TV_DEBUG_CHROME` | бинарь Chrome для `platform: "pc"` | `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`; поле `chromePath` устройства перебивает и то и другое |
 | `TV_DEBUG_DEVICE` | устройство для платформенных приёмок (`check:webos2`, `check:tizen3`, `webos4-regress-probe`) | `webos2` / `tizen3` / `webos4` соответственно |
 | `TV_DEBUG_CASES_DIR` | куда `tv_record` кладёт записанные кейсы | `cases/recorded/` рядом с пакетом (в `.gitignore`) |
+| `TV_DEBUG_TIMING` | `1` — писать в stderr каждый CDP-вызов с его временем (диагностика «медленно тул или ТВ») | выключено |
 | `TV_DEV_URL` + `TV_DEV_APP` | дополнительный прогон `check:browser` против живого dev-сервера; нужны **обе** | прогон только против встроенной фикстуры |
 | `TMPDIR` | куда падают артефакты (`.cpuprofile`, `.heapsnapshot`, `.png`, HAR), когда `path` не задан явно | системный временный каталог |
 
@@ -125,20 +126,20 @@ npm link                       # из корня репозитория
 |---|---|
 | `tv_devices` | Парк из `devices.json`: доступность и **реальные** capabilities каждого устройства |
 | `tv_install` | Установка билда (`.wgt` / `.ipk`). `uninstallFirst:true` лечит «Author certificate not match» |
-| `tv_launch` | Debug-запуск + attach по CDP. Режимы: свежий старт / `reload` / `relaunch` / `attach`. Дожидается `bootReady` из app-профиля и кладёт вердикт в `attached.bootReady` |
-| `tv_press` | Клавиша пульта. `durationMs` = лонгтап; `repeat`+`intervalMs` = серия. Возвращает фокус до/после и `inputMode` |
-| `tv_state` | Структурный снимок: url, заголовок, видимые сцены, фокус (текст, класс, путь, индекс/всего), попапы, счётчики |
-| `tv_snapshot` | Раскладка экрана одним вызовом: ряды вокруг фокуса, их элементы с рефами `e1`, `e2`…, и `neighbours` — ближайший реф в каждую сторону. `tv_goto {ref}` ходит по ним точно |
+| `tv_launch` | Debug-запуск + attach по CDP. Режимы: свежий старт / `reload` / `relaunch` / `attach`. Дожидается `bootReady` из app-профиля и кладёт вердикт в `bootReady`. Один раз отдаёт факты об устройстве: `inputMode`, `rttMs` (цена одного round-trip), `legacyEval` |
+| `tv_press` | Клавиша пульта. `durationMs` = лонгтап; `repeat`+`intervalMs` = серия; `settle:false` — без ожидания фокуса. Нажатие, ожидание фокуса и его чтение — **один** page-side вызов; ответ `{key, focus, changed, ms, evals}` |
+| `tv_state` | Снимок: url, заголовок, видимые сцены, фокус (текст, путь, индекс/всего), попапы, счётчики. По умолчанию текстом, `format:"json"` — объектом |
+| `tv_snapshot` | Раскладка экрана одним вызовом: ряды вокруг фокуса, их элементы с рефами `e1`, `e2`…, и `neighbours` — ближайший реф в каждую сторону. `tv_goto {ref}` ходит по ним точно. По умолчанию текстом (`r1*: [e1 "…"]* [e2 "…"]`), `format:"json"` — объектом |
 | `tv_record` | Записать путь **физическим пультом** и скомпилировать в готовый `tv_sequence` + чек-лист. `start` перезапускает приложение, на экране горит «● REC», `stop` показывает кейс, файл создаёт `write` |
-| `tv_wait_for` | Ожидание условия вместо `sleep`: `focusText` / `element` / `elementGone` / `sceneName` / `selector` / `selectorGone` / `scene` / `text` / `expression` / `videoAdvancing` |
-| `tv_goto` | Жать направление, пока **сфокусированный** элемент не совпадёт с целью (имя из профиля, текст, селектор, testid). Ограничен `maxSteps`, дедлайном и детектом «фокус встал» / «обернулись по кругу». `select: true` — нажать ENTER по прибытии |
+| `tv_wait_for` | Ожидание условия вместо `sleep`: `focusText` / `element` / `elementGone` / `sceneName` / `selector` / `selectorGone` / `scene` / `text` / `expression` / `videoAdvancing` / `request`. Снимок `tv_state` в хвосте — только по `withState:true` |
+| `tv_goto` | Жать направление, пока **сфокусированный** элемент не совпадёт с целью (имя из профиля, текст, селектор, testid). Ограничен `maxSteps`, дедлайном и детектом «фокус встал» / «обернулись по кругу». `select: true` — нажать ENTER по прибытии. Шаг = один page-side вызов (нажатие + settle + матч); зелёный ответ — `trail: "DOWN×3"` + фокус, список нажатий только на красном |
 | `tv_menu` | Войти в меню приложения и выбрать раздел по имени; без имени — открыть и вернуть список разделов |
-| `tv_sequence` | Весь кейс одним вызовом: вердикт, время и результат по каждому шагу, под device-lock |
+| `tv_sequence` | Весь кейс одним вызовом под device-lock. Зелёный навигационный шаг — одна строка `brief`; чтения (`eval`, `state`, `snapshot`, `metrics`, `videoState`, `expectRequest`, профиль) и красные шаги несут полный `result`; `report:"full"` — всё |
 | `tv_screenshot` | PNG кадра. В браузере работает всегда; на Tizen деградирует с пометкой (secure/overlay plane). Движок, который вообще не отдаёт кадр, ловится один раз: первый вызов выжигает таймаут, все следующие в этой сессии отказывают мгновенно |
-| `tv_console` | Консоль / исключения / упавшие запросы с момента launch. Все уровни, фильтр, счётчик отброшенного буфером |
+| `tv_console` | Консоль / исключения / упавшие запросы с момента launch, **с дедупом**: повтор несёт `count` и `t`/`tLast` (секунды от подключения), url обрезан до `file:line`. Фильтр, уровни, счётчик отброшенного буфером |
 | `tv_network` | Полный лог запросов с момента launch: url, метод, статус, тело POST. Чтение тела ответа по `requestId`, экспорт в `curl` и HAR 1.2, ассерт `expectRequest` шагом кейса |
 | `tv_video_state` | Программный снимок `<video>`: тикает ли `currentTime` (два замера), readyState, размеры, MediaError. Если `<video>` на странице нет вообще — читает объектный плеер Tizen (`webapis.avplay`) теми же полями плюс `source: "avplay"`, кодек, битрейт и лестницу ABR |
-| `tv_evaluate` | Произвольный JS в странице (escape hatch). На старых ТВ — только ES5 |
+| `tv_evaluate` | Произвольный JS в странице (escape hatch). На старых ТВ — только ES5. Ответ режется на 16 КБ (`truncated`, `bytes`, подсказка сузить выражение) |
 | `tv_profile` | Запись JS CPU-профиля (`start` → действия → `stop`): файл `.cpuprofile` для DevTools + топ функций и файлов по self time. `sourceMap` деминифицирует топ на прод-сборке. Плюс метрики `Performance.getMetrics` (heap, DOM-узлы, слушатели, layout) — снимок на `start` и на `stop`, в ответе diff; `action:"metrics"` снимает их отдельно, без записи профиля |
 | `tv_heap` | Снапшот кучи на устройстве (`.heapsnapshot` для DevTools → Memory → Load) + сводка по конструкторам и счётчик detached-нод; `action:"diff"` сравнивает два файла, как Comparison view |
 
@@ -165,6 +166,12 @@ npm link                       # из корня репозитория
 ```
 
 `expect` — то же, что `wait`, но невыполнение валит шаг. `stopOnFail` по умолчанию `true`.
+
+### Подробные справки тулов — MCP-ресурсы
+
+Описания в `tools/list` умышленно короткие (весь список ≤ 10 КБ: часть клиентов шлёт его модели на каждом ходу). Полная справка каждого тула — действия, формы шагов, формы ответов — лежит ресурсом `tv-debug://docs/<tool>` (например `tv-debug://docs/tv_sequence`, `tv-debug://docs/tv_network`); агент читает её один раз через `resources/read`, когда нужна.
+
+Ответы отдаются компактным JSON без отступов. Навигационные тулы несут свою цену: `ms` (время) и `evals` (число CDP-вызовов) — по ним видно, тормозит шаг или ТВ. `TV_DEBUG_TIMING=1` дополнительно пишет в stderr каждый CDP-вызов с его временем.
 
 ### tv_press — клавиши
 
@@ -267,7 +274,7 @@ tv_network {"action": "har",  "path": "/tmp/case.har", "urlPattern": "api."}
 tv_network {"action": "mark"}                                            # сдвинуть окно ассертов
 ```
 
-**`list`** — фильтры `urlPattern` (подстрока или `/regex/`), `method`, `status` (`"failed"` \| число \| `{"min":200,"max":299}`), `limit` (по умолчанию 50, новейшие первыми). Запись: `requestId`, `receivedAt`, `method`, `url` (обрезан до 500), `status`, `mimeType`, `resourceType`, `encodedDataLength`, `postData` (обрезан до 1000, флаг `postDataTruncated`), `failed` + `errorText`, `fromCache`, `redirectFrom` / `redirectedTo`, `inFlight`. Плюс `dropped` — сколько вытеснено из кольцевого буфера: ассерт по вытесненному запросу провалился бы молча, поэтому счётчик едет в каждом ответе.
+**`list`** — фильтры `urlPattern` (подстрока или `/regex/`), `method`, `status` (`"failed"` \| число \| `{"min":200,"max":299}`), `limit` (по умолчанию 25, новейшие первыми). Запись: `requestId`, `receivedAt`, `method`, `url` (обрезан до 500), `status`, `mimeType`, `resourceType`, `encodedDataLength`, `postData` (обрезан до 1000, флаг `postDataTruncated`), `failed` + `errorText`, `fromCache`, `redirectFrom` / `redirectedTo`, `inFlight`. Плюс `dropped` — сколько вытеснено из кольцевого буфера: ассерт по вытесненному запросу провалился бы молча, поэтому счётчик едет в каждом ответе.
 
 **Ассерт в кейсе** — шаг `expectRequest` (и условие `{"request": {...}}` в `tv_wait_for`):
 
@@ -486,9 +493,12 @@ tv_heap {"action": "diff", "before": "/tmp/before.heapsnapshot", "after": "/tmp/
   "bootReady": {"selector": ".video-tile", "timeoutMs": 40000},
   "elements": {"catalog.tile": ".video-tile", "player.play": {"testid": "play-button"}},
   "scenes": {"catalog": "s-catalog", "player": "s-player"},
+  "settle": {"quietMs": 150, "changeTimeoutMs": 1200},
   "checks": {"homeSection": "Main", "popup": ".context-menu"}
 }
 ```
+
+`settle` — пороги «нажатие отработало»: `changeTimeoutMs` — сколько ждать, что фокус вообще сдвинется, `quietMs` — сколько он должен стоять на месте после (при наличии `MutationObserver` — ещё и «ни одной мутации `class` в документе»). Без блока — платформенные дефолты (pc 80/800, vidaa 120/1000, ТВ 150/1200).
 
 Два неочевидных момента, ради которых профиль вообще существует:
 
@@ -499,7 +509,7 @@ tv_heap {"action": "diff", "before": "/tmp/before.heapsnapshot", "after": "/tmp/
 
 ### `bootReady` — вердикт приезжает с launch
 
-`bootReady` дожидается `tv_launch` **сам**, сразу после аттача (только на свежем старте и на `reload` — аттач к живому приложению, которое стоит в плеере, не должен ждать плитку каталога). В ответе — `attached.bootReady: {ok, elapsedMs, condition}`, из кейсов уходит открывающий шаг `{"wait": …}`, повторяющий профиль.
+`bootReady` дожидается `tv_launch` **сам**, сразу после аттача (только на свежем старте и на `reload` — аттач к живому приложению, которое стоит в плеере, не должен ждать плитку каталога). В ответе — `bootReady: {ok, elapsedMs, condition}`, из кейсов уходит открывающий шаг `{"wait": …}`, повторяющий профиль.
 
 Приложение, которое так и не загрузилось, **вызов не валит**: аттач-то удался, а это находка — бросок отнял бы `tv_console`/`tv_network` ровно тогда, когда они нужны. Приходит `ok: false` + `warning`. Отключается `waitBoot: false` (например, чтобы посмотреть на сам процесс загрузки). Условие проверяется со `stableMs: 300`, потому что «селектор виден» ≠ «контент отрисован».
 
