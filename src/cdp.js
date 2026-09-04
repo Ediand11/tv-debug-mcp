@@ -24,7 +24,14 @@ import WebSocket from 'ws';
 const DEFAULT_CALL_TIMEOUT = 8000;
 /** `TV_DEBUG_TIMING=1`: one stderr line per CDP call with its round-trip time. */
 const TIMING = process.env.TV_DEBUG_TIMING === '1';
-/** WebSocket keepalive: a dead TV is noticed within ~20s instead of on the next 8s timeout. */
+/**
+ * WebSocket keepalive: a dead TV is noticed within ~20s instead of on the next 8s timeout.
+ * Only on a socket that reaches the inspector directly (sdb / direct port / local Chrome).
+ * An endpoint behind a proxy may not survive a ping frame at all: ares-inspect's tunnel drops
+ * every message after the first ping — no pong, no close, the session just goes silent for
+ * good (webOS 7, verified) — so the adapter that hands out such an endpoint switches the
+ * keepalive off (`keepalive: false` on the endpoint).
+ */
 const PING_INTERVAL_MS = 15000;
 const PONG_TIMEOUT_MS = 5000;
 /**
@@ -64,9 +71,12 @@ export function isUnsupportedMethod(err) {
 export class CdpSession {
 	/**
 	 * @param {string} wsUrl
+	 * @param {{keepalive?: boolean}} [opts] keepalive=false: never send WebSocket pings (see
+	 *   PING_INTERVAL_MS — an endpoint behind ares-inspect dies on the first one)
 	 */
-	constructor(wsUrl) {
+	constructor(wsUrl, opts = {}) {
 		this._wsUrl = wsUrl;
+		this._keepalive = opts.keepalive !== false;
 		/** @type {?WebSocket} */
 		this._ws = null;
 		this._id = 0;
@@ -185,7 +195,9 @@ export class CdpSession {
 				this.rttMs = Date.now() - t0;
 			})
 			.catch(() => {});
-		this._startKeepalive(ws);
+		if (this._keepalive) {
+			this._startKeepalive(ws);
+		}
 		// Last, so a socket that died during setup — including during the probe, whose own
 		// rejection is swallowed above — fails the connect instead of handing back a session
 		// that reports itself attached.

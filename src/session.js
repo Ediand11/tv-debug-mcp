@@ -59,6 +59,8 @@ const HEAP_DRAIN_MAX_MS = 15000;
  * "done", and how long to wait for it to move at all. The app profile's `settle` block wins.
  * A local Chrome renders the next frame in 16ms; a TV framework animates the move.
  */
+/** Pause before the one retry of a press that did not move the focus (see _pressMoved). */
+const PRESS_RETRY_GAP_MS = 300;
 const SETTLE_DEFAULTS = {
 	pc: {quietMs: 80, changeTimeoutMs: 800},
 	vidaa: {quietMs: 120, changeTimeoutMs: 1000},
@@ -289,12 +291,30 @@ export class DeviceSession {
 	 * - attach: don't kill a running instance; reuse its live inspector.
 	 * @param {{reload?: boolean, relaunch?: boolean, attach?: boolean, waitBoot?: boolean}} [opts]
 	 */
-	ensureConnected(opts = {}) {
-		return this._locked('_lifecycleLock', () => this._ensureConnectedLocked(opts))
+	async ensureConnected(opts = {}) {
+		const page = await this._locked('_lifecycleLock', () => this._ensureConnectedLocked(opts))
 			// OUTSIDE the lock, and it has to stay outside: the boot wait evaluates page JS,
 			// and `_cdp()` on a dropped socket reaches for `_lifecycleLock` itself. Anything
 			// touching the page from inside `_ensureConnectedLocked` deadlocks the session.
-			.then((page) => this._waitBootReady(page, opts));
+			.then((p) => this._waitBootReady(p, opts));
+		// A fresh launch that never reached bootReady gets ONE more kill+launch before the
+		// verdict stands. On some sets a cold start hangs every other time regardless of what
+		// attaches to it (webOS 7: tiles never appear, the page answers nothing — old and new
+		// host code alike), and a whole case burning its budget on that is worse than 40s on
+		// a retry. Attach never retries: a running app is the caller's to keep.
+		if (page && page.bootReady && page.bootReady.ok === false && page.freshLaunch &&
+			!opts.attach && !opts._bootRetried && page.bootReady.reason === undefined) {
+			const first = page.bootReady;
+			this._log(`bootReady not reached in ${first.elapsedMs}ms — relaunching once`);
+			const again = await this.ensureConnected({...opts, relaunch: true, _bootRetried: true});
+			if (again) {
+				again.bootRetries = 1;
+				again.warning = `first launch did not reach bootReady (${first.condition}) in ${first.elapsedMs}ms; relaunched once` +
+					(again.bootReady && again.bootReady.ok ? '' : ` — ${again.warning || 'still not ready'}`);
+			}
+			return again;
+		}
+		return page;
 	}
 
 	/**
@@ -389,7 +409,7 @@ export class DeviceSession {
 			relaunch: opts.relaunch
 		});
 		const wsUrl = inspector.wsUrl || (await resolvePageWs(inspector.httpBase));
-		const cdp = new CdpSession(wsUrl);
+		const cdp = new CdpSession(wsUrl, {keepalive: inspector.keepalive !== false});
 		await cdp.connect();
 		this.cdp = cdp;
 		this._everConnected = true;
@@ -554,6 +574,28 @@ export class DeviceSession {
 		}
 		// Trusted keys were fired above, not by the page — the page-side count is 0 there.
 		return {...r, presses: pageSide ? r.presses : repeat, ...this._cost(tick)};
+	}
+
+	/**
+	 * A press that is expected to MOVE the focus — the unit of tv_goto and of opening the
+	 * menu. When the focus did not move, one more press after a short pause before taking
+	 * "did not move" at face value: a TV app busy with a scroll animation or a lazy-loading row
+	 * drops or defers a key now and then (webOS 7, 2 of 12 presses), and reading that as "edge
+	 * of the list" ends a navigation three tiles short. A real edge costs one extra harmless
+	 * press.
+	 * @param {string} direction
+	 * @param {{before: ?string, matchBody?: ?string}} opts
+	 * @return {Promise<object>} the last press result, `presses` = presses actually sent
+	 */
+	async _pressMoved(direction, opts) {
+		let r = await this._press(direction, opts);
+		if (r.after === opts.before && !(r.match && r.match.ok)) {
+			await sleep(PRESS_RETRY_GAP_MS);
+			const again = await this._press(direction, {...opts, before: r.after});
+			r = {...again, presses: (r.presses || 1) + (again.presses || 1), retried: true,
+				ms: r.ms + again.ms + PRESS_RETRY_GAP_MS, evals: (r.evals || 0) + (again.evals || 0)};
+		}
+		return r;
 	}
 
 	/**
@@ -1882,32 +1924,35 @@ export class DeviceSession {
 		let sig = first.sig;
 		seen.add(sig);
 
+		let presses = 0;
 		for (let i = 0; i < maxSteps; i++) {
 			if (Date.now() > deadline) {
-				return done(false, i, {reason: 'deadline reached', focus: match.detail});
+				return done(false, presses, {reason: 'deadline reached', focus: match.detail});
 			}
-			const r = await this._press(direction, {before: sig, matchBody});
+			const r = await this._pressMoved(direction, {before: sig, matchBody});
+			presses += r.presses || 1;
 			match = r.match || {};
 			const nextSig = r.after;
-			steps.push({press: direction, focus: match.detail ? match.detail.text : null, matched: !!match.ok});
+			steps.push({press: direction, focus: match.detail ? match.detail.text : null, matched: !!match.ok,
+				...(r.retried ? {retried: true} : {})});
 
 			if (match.refMissing) {
 				// The page navigated under us and took the ref store with it.
-				return done(false, i + 1, {reason: match.reason});
+				return done(false, presses, {reason: match.reason});
 			}
 			if (match.ok) {
-				return done(true, i + 1, {focus: match.detail});
+				return done(true, presses, {focus: match.detail});
 			}
 			if (nextSig === sig) {
-				return done(false, i + 1, {reason: `focus stopped moving on ${direction} (edge of the list?)`, focus: match.detail});
+				return done(false, presses, {reason: `focus stopped moving on ${direction} (edge of the list?)`, focus: match.detail});
 			}
 			if (seen.has(nextSig)) {
-				return done(false, i + 1, {reason: 'focus returned to a position already visited (wrapped around)', focus: match.detail});
+				return done(false, presses, {reason: 'focus returned to a position already visited (wrapped around)', focus: match.detail});
 			}
 			seen.add(nextSig);
 			sig = nextSig;
 		}
-		return done(false, maxSteps, {reason: `target not reached in ${maxSteps} presses`, focus: match.detail});
+		return done(false, presses, {reason: `target not reached in ${maxSteps} presses`, focus: match.detail});
 	}
 
 	/**
@@ -1939,8 +1984,9 @@ export class DeviceSession {
 		const inMenuBody = focusInMenuBody(menu);
 
 		for (let i = 0; i < maxOpen && !inMenu; i++) {
-			// Press + settle + "is the focus inside the menu now" — one round-trip.
-			const r = await this._press(menu.openKey, {before: sig, matchBody: inMenuBody});
+			// Press + settle + "is the focus inside the menu now" — one round-trip (two when the
+			// app dropped the key, see _pressMoved).
+			const r = await this._pressMoved(menu.openKey, {before: sig, matchBody: inMenuBody});
 			const m = r.match || {};
 			inMenu = !!m.ok;
 			openPresses.push({press: menu.openKey, focus: m.detail ? m.detail.text : null, focusInMenu: inMenu});
@@ -2283,7 +2329,7 @@ export class DeviceSession {
 		if (this.cdp && this.cdp.legacyEvalDialect) {
 			out.legacyEval = true;
 		}
-		for (const k of ['bootReady', 'warning', 'reloadSkipped']) {
+		for (const k of ['bootReady', 'bootRetries', 'warning', 'reloadSkipped']) {
 			if (p[k] !== undefined) {
 				out[k] = p[k];
 			}

@@ -17,6 +17,10 @@ import {promisify} from 'node:util';
 
 import {spawnUntilMatch, stopChild} from './spawn-until-match.js';
 
+/** How long `close()` waits for the app to leave `ares-launch --running` (see _waitClosed). */
+const CLOSE_WAIT_MS = 8000;
+const CLOSE_POLL_MS = 400;
+
 const execFileP = promisify(execFile);
 
 export class WebosAdapter {
@@ -81,7 +85,31 @@ export class WebosAdapter {
 	async close(appId) {
 		this._stopInspectChild();
 		const out = await this._ares('ares-launch', [...this._dev(), '--close', appId], 30000);
-		return !/error|failed/i.test(out);
+		const ok = !/error|failed/i.test(out);
+		if (ok) {
+			await this._waitClosed(appId);
+		}
+		return ok;
+	}
+
+	/**
+	 * `--close` returns before the app is gone. A launch that lands while the old instance is
+	 * still tearing down (a healthy one, mid-trailer, takes a while) resumes the dying process
+	 * and the app never renders — on webOS 7 that was every other cold start, 40s each. Poll
+	 * the running list until the id is absent; give up quietly after CLOSE_WAIT_MS and let
+	 * the launch (and its bootReady retry) take it from there.
+	 * @param {string} appId
+	 */
+	async _waitClosed(appId) {
+		const deadline = Date.now() + CLOSE_WAIT_MS;
+		while (Date.now() < deadline) {
+			const out = await this._ares('ares-launch', [...this._dev(), '--running'], 10000);
+			if (!out.split('\n').some((l) => l.trim() === appId || l.trim().startsWith(appId + ' '))) {
+				return;
+			}
+			await new Promise((r) => setTimeout(r, CLOSE_POLL_MS));
+		}
+		this._log(`${appId} still listed as running ${CLOSE_WAIT_MS}ms after --close; launching anyway`);
 	}
 
 	/** Alias so the session layer can treat both adapters identically. */
@@ -104,7 +132,7 @@ export class WebosAdapter {
 	/**
 	 * @param {import('../config.js').DeviceConfig} cfg
 	 * @param {{attach?: boolean}} [opts]
-	 * @return {Promise<{wsUrl?: string, httpBase?: string, freshLaunch: boolean}>}
+	 * @return {Promise<{wsUrl?: string, httpBase?: string, freshLaunch: boolean, keepalive: false}>}
 	 */
 	async acquireEndpoint(cfg, opts = {}) {
 		const appId = cfg.appId;
@@ -138,7 +166,11 @@ export class WebosAdapter {
 		);
 		// The tunnel lives as long as this child does.
 		this._inspectChild = child;
-		return {...value, freshLaunch: fresh};
+		// keepalive: false — the ares-inspect tunnel is a node proxy, not a port forward, and it
+		// does not survive a WebSocket ping frame: after the first one every message on that
+		// session is silently dropped (no pong, no close), while a fresh session to the same
+		// page works. Verified on webOS 7; the CdpSession ping would kill every session 15s in.
+		return {...value, freshLaunch: fresh, keepalive: false};
 	}
 
 	async dispose() {

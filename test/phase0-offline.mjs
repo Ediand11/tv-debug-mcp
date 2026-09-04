@@ -35,6 +35,7 @@ import {summarizeProfile, applySourceMap} from '../src/profile.js';
 import {summarizeHeapSnapshot, diffHeapSummaries} from '../src/heap.js';
 import {metricsToMap, metricsDiff, windowSecondsOf} from '../src/metrics.js';
 import {CdpSession} from '../src/cdp.js';
+import {WebSocketServer} from 'ws';
 import {selectRequests, toListEntry, buildCurl, buildHar, capBody, compileUrlPattern} from '../src/network.js';
 import {pollRequests, conditionJs} from '../src/wait.js';
 import {loadAppProfile, resolveElement, resolveScene, resolveTarget, resolveCondition} from '../src/appprofile.js';
@@ -374,6 +375,38 @@ function heapChecks() {
 		JSON.stringify({nodes: legacy.totalNodes, size: legacy.totalSize}));
 	check('without the column only the named detached nodes are counted', legacy.detachedCount === 4,
 		String(legacy.detachedCount));
+}
+
+/**
+ * Keepalive gating. A tiny local inspector answers every command, and counts ping frames:
+ * a session opened with keepalive:false must never arm the ping timer (an endpoint behind
+ * ares-inspect dies on the first ping), the default one must.
+ */
+async function keepaliveChecks() {
+	console.log('\n--- keepalive: off behind a proxy, on by default ---');
+	const wss = new WebSocketServer({host: '127.0.0.1', port: 0});
+	await new Promise((r) => wss.once('listening', r));
+	let pings = 0;
+	wss.on('connection', (ws) => {
+		ws.on('ping', () => { pings++; });
+		ws.on('message', (raw) => {
+			const m = JSON.parse(raw.toString());
+			ws.send(JSON.stringify({id: m.id, result: {result: {type: 'number', value: 1}}}));
+		});
+	});
+	const url = `ws://127.0.0.1:${wss.address().port}`;
+	const off = new CdpSession(url, {keepalive: false});
+	await off.connect();
+	check('keepalive:false — no ping timer armed after connect', off._pingTimer === null);
+	check('keepalive:false — the session still evaluates', (await off.evaluate('1', {awaitPromise: false})) === 1);
+	const on = new CdpSession(url);
+	await on.connect();
+	check('default — the ping timer is armed', on._pingTimer !== null);
+	await new Promise((r) => setTimeout(r, 50));
+	check('no ping frame is sent at connect (they start 15s in)', pings === 0, String(pings));
+	off.close();
+	on.close();
+	await new Promise((r) => wss.close(r));
 }
 
 /** 9: the network log. The CDP session is fed events by hand — no socket, no TV. */
@@ -1282,6 +1315,7 @@ async function main() {
 	profileChecks();
 	metricsChecks();
 	heapChecks();
+	await keepaliveChecks();
 	networkChecks();
 	await requestWaitChecks();
 	await legacyEvaluateChecks();

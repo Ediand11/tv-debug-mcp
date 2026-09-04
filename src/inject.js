@@ -75,6 +75,8 @@ export function keyEventJs(type, spec) {
 
 /** Settle poll period, page-side. */
 const SETTLE_POLL_MS = 50;
+/** How many quietMs of a still focus outweigh a DOM that never stops mutating (see tick). */
+const SETTLE_DOM_PATIENCE = 3;
 /** Hard cap on the settle after the change window, so a page that never goes quiet still answers. */
 const SETTLE_EXTRA_MS = 1000;
 
@@ -154,8 +156,14 @@ export function pressJs(profile, spec, opts) {
 					var s = focusSig();
 					if (s !== cur) { cur = s; stableSince = n; changed = changed || cur !== before; }
 					if (!changed && n - t0 < CHANGE) { setTimeout(tick, POLL); return; }
-					var quietOk = (n - stableSince >= QUIET) && (!mo || n - lastMut >= QUIET);
-					if (quietOk || n - t0 > CHANGE + EXTRA) { finish(cur); return; }
+					var focusOk = n - stableSince >= QUIET;
+					// DOM quiet is advisory, not a gate: an app that mutates continuously at idle
+					// (a stats overlay rewriting a counter 40 times a second — webOS 7, verified)
+					// never shows a QUIET gap, and waiting for one costs the whole CHANGE+EXTRA
+					// ceiling on every press. Once the focus has stood still for 3×QUIET the
+					// mutations are not about the press any more.
+					var domOk = !mo || n - lastMut >= QUIET || n - stableSince >= QUIET * ${SETTLE_DOM_PATIENCE};
+					if ((focusOk && domOk) || n - t0 > CHANGE + EXTRA) { finish(cur); return; }
 					setTimeout(tick, POLL);
 				}
 				setTimeout(tick, POLL);

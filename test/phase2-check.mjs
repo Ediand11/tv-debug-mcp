@@ -213,7 +213,10 @@ async function main() {
 		JSON.stringify(goto));
 	const edgeGoto = await s.call('tv_goto', {device: 'pc-fixture', direction: 'RIGHT', text: 'нет-такого', maxSteps: 3});
 	check('a red goto keeps the per-press list as evidence',
-		edgeGoto.ok === false && Array.isArray(edgeGoto.steps) && edgeGoto.steps.length === edgeGoto.presses && /stopped moving|not reached/.test(edgeGoto.reason),
+		edgeGoto.ok === false && Array.isArray(edgeGoto.steps) &&
+			// the edge step is pressed twice (one retry before "stopped moving" is believed)
+			edgeGoto.presses === edgeGoto.steps.length + edgeGoto.steps.filter((st) => st.retried).length &&
+			edgeGoto.steps.filter((st) => st.retried).length === 1 && /stopped moving|not reached/.test(edgeGoto.reason),
 		JSON.stringify(edgeGoto).slice(0, 200));
 
 	console.log('\n--- named elements and scenes, end to end ---');

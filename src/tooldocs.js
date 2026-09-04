@@ -49,6 +49,10 @@ Modes:
 * \`attach:true\` — reuse the inspector of an app already running in debug, keeping its state;
 * \`waitBoot:false\` — do not wait for the profile's \`bootReady\` condition (e.g. to watch the boot).
 
+A fresh launch that does not reach \`bootReady\` is killed and launched once more before the
+verdict stands (\`bootRetries: 1\` + a warning naming the first attempt): some sets hang every
+other cold start. \`attach\` never retries.
+
 Answer: \`{ok, device, engine, url, title, inputMode, freshLaunch, localPort?, rttMs, legacyEval?,
 bootReady?: {ok, elapsedMs, condition}, warning?, reloadSkipped?}\`.
 * \`inputMode\` — \`synthetic\` (page-side KeyboardEvent, always on a TV) or \`trusted\` (CDP Input
