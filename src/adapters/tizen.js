@@ -20,6 +20,11 @@ import {spawnUntilMatch, stopChild} from './spawn-until-match.js';
 
 const execFileP = promisify(execFile);
 
+/** `sdb devices` answers are trusted for this long — two spawns per acquire were 300-600ms. */
+const CONNECT_CACHE_MS = 10000;
+/** After `was_kill`, how long to give the launcher before the one retry of `debug`. */
+const KILL_SETTLE_MS = 1500;
+
 /**
  * Parse `sdb devices` into rows. The header line ("List of devices attached") is why a
  * naive `stdout.includes('device')` is always true.
@@ -51,6 +56,8 @@ export class TizenAdapter {
 		this._log = opts.log || (() => {});
 		/** Device-side inspector port of the last successful debug launch. */
 		this._lastDevicePort = null;
+		/** @type {?{at: number, row: object}} last good `connect()` answer. */
+		this._connected = null;
 	}
 
 	/** Operations this adapter really supports (surfaced by tv_devices). */
@@ -93,14 +100,21 @@ export class TizenAdapter {
 	 * Ensure sdb is connected to this device.
 	 */
 	async connect() {
-		const before = await this._sdb(['devices'], {global: true, tolerant: true});
-		if (!parseSdbDevices(before).some((d) => d.serial === this.serial)) {
+		if (this._connected && Date.now() - this._connected.at < CONNECT_CACHE_MS) {
+			return this._connected.row;
+		}
+		// One `sdb devices` when the device is already there; the second read only after an
+		// actual `sdb connect`.
+		let rows = parseSdbDevices(await this._sdb(['devices'], {global: true, tolerant: true}));
+		let row = rows.find((d) => d.serial === this.serial);
+		if (!row || row.state !== 'device') {
 			this._log(`sdb connect ${this.serial}`);
 			await this._sdb(['connect', this.serial], {global: true, tolerant: true});
+			rows = parseSdbDevices(await this._sdb(['devices'], {global: true, tolerant: true}));
+			row = rows.find((d) => d.serial === this.serial);
 		}
-		const rows = parseSdbDevices(await this._sdb(['devices'], {global: true, tolerant: true}));
-		const row = rows.find((d) => d.serial === this.serial);
 		if (!row || row.state !== 'device') {
+			this._connected = null;
 			throw new Error(
 				`sdb could not connect to ${this.serial} (state: ${row ? row.state : 'absent'}). Is the TV on and in Developer Mode?`
 			);
@@ -110,6 +124,7 @@ export class TizenAdapter {
 			// of `sdb devices`. Deriving it beats making every config entry carry it.
 			this._cliTarget = row.name;
 		}
+		this._connected = {at: Date.now(), row};
 		return row;
 	}
 
@@ -170,6 +185,17 @@ export class TizenAdapter {
 	}
 
 	/**
+	 * Is this a "closed" answer from the launchpad — the app is still going down, or already in
+	 * debug. The message is built in launchDebug; matched here so the retry decision has one
+	 * source of truth.
+	 * @param {?Error} e
+	 * @return {boolean}
+	 */
+	static isClosed(e) {
+		return !!e && /returned "closed"/.test(e.message || '');
+	}
+
+	/**
 	 * Debug-launch the app and return the on-device inspector port. The streaming sdb child
 	 * is stopped once the port is parsed — the inspector outlives it.
 	 * @param {string} appId
@@ -216,11 +242,18 @@ export class TizenAdapter {
 	 */
 	async forward(localPort, devicePort) {
 		// Exactly one rule per device: stale rules from earlier runs (different random local
-		// port) would otherwise pile up and confuse the attach lookup below.
-		for (const {local} of await this._forwardRules()) {
+		// port) would otherwise pile up and confuse the attach lookup below. When the one rule
+		// that exists is already the one wanted (the common reattach), nothing is spawned.
+		const rules = await this._forwardRules();
+		if (rules.length === 1 && rules[0].local === localPort && rules[0].device === devicePort) {
+			return `http://127.0.0.1:${localPort}`;
+		}
+		for (const {local} of rules) {
 			await this._sdb(['forward', '--remove', `tcp:${local}`], {tolerant: true});
 		}
-		await this._sdb(['forward', '--remove', `tcp:${localPort}`], {tolerant: true});
+		if (!rules.some((r) => r.local === localPort)) {
+			await this._sdb(['forward', '--remove', `tcp:${localPort}`], {tolerant: true});
+		}
 		await this._sdb(['forward', `tcp:${localPort}`, `tcp:${devicePort}`]);
 		return `http://127.0.0.1:${localPort}`;
 	}
@@ -292,10 +325,21 @@ export class TizenAdapter {
 			return {httpBase, devicePort, freshLaunch: true};
 		}
 
-		if (await this.kill(appId)) {
-			await new Promise((r) => setTimeout(r, 1500));
+		// `debug` straight after `was_kill`, and the settle sleep only when the launcher says
+		// "closed" (the app is still going down) — most firmware takes the launch at once, and
+		// the flat 1.5s was paid on every relaunch.
+		const killed = await this.kill(appId);
+		let devicePort;
+		try {
+			devicePort = await this.launchDebug(appId);
+		} catch (e) {
+			if (!killed || !TizenAdapter.isClosed(e)) {
+				throw e;
+			}
+			this._log(`debug answered "closed" right after was_kill — waiting ${KILL_SETTLE_MS}ms and retrying once`);
+			await new Promise((r) => setTimeout(r, KILL_SETTLE_MS));
+			devicePort = await this.launchDebug(appId);
 		}
-		const devicePort = await this.launchDebug(appId);
 		const httpBase = await this.forward(localPort, devicePort);
 		return {httpBase, devicePort, freshLaunch: true};
 	}

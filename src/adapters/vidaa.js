@@ -90,11 +90,16 @@ export class VidaaAdapter {
 	 * @return {Promise<number>}
 	 */
 	async _discoverPort(host) {
-		for (const port of SCAN_PORTS) {
-			if (await probeInspector(`http://${host}:${port}`)) {
-				this._log(`vidaa: found inspector on port ${port}`);
-				return port;
-			}
+		// All candidates at once — sequentially, nine 2.5s timeouts were a 22s worst case on the
+		// first connect. The preferred port is listed first, and wins ties.
+		const hits = await Promise.all(SCAN_PORTS.map(async (port) => {
+			const ok = await probeInspector(`http://${host}:${port}`);
+			return ok ? port : null;
+		}));
+		const port = hits.find((p) => p != null);
+		if (port != null) {
+			this._log(`vidaa: found inspector on port ${port}`);
+			return port;
 		}
 		throw new Error(
 			`no vidaa inspector found on ${host} (scanned ports ${SCAN_PORTS.join(', ')}) — ` +

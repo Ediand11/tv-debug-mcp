@@ -23,6 +23,43 @@
 // the writable fields, passes instanceof, and the engine dispatches it like any Event.
 // Verified on a live webOS 2.2 (LG 40UF771V).
 
+import {withHelpersJs} from './state.js';
+
+/**
+ * ES5 statements defining `tvdDispatch(type)` — one synthetic key event for `spec`.
+ * @param {import('./keymaps.js').KeySpec} spec
+ * @return {string}
+ */
+function keyDispatchFnJs(spec) {
+	const code = spec.code;
+	const key = spec.key || '';
+	const domCode = spec.domCode || '';
+	return `
+		function tvdDispatch(type){
+			var e;
+			var legacy = false;
+			try {
+				e = new KeyboardEvent(type, {bubbles:true, cancelable:true, view:window});
+			} catch (err) {
+				legacy = true;
+				e = document.createEvent('Event');
+				e.initEvent(type, true, true);
+			}
+			function def(name, value){
+				try { Object.defineProperty(e, name, {get: function(){ return value; }}); } catch (err) {}
+			}
+			def('keyCode', ${JSON.stringify(code)});
+			def('which', ${JSON.stringify(code)});
+			${key ? `def('key', ${JSON.stringify(key)});` : ''}
+			${domCode ? `def('code', ${JSON.stringify(domCode)});` : ''}
+			if (legacy) {
+				try { e.__proto__ = KeyboardEvent.prototype; } catch (err) {}
+			}
+			document.dispatchEvent(e);
+			return true;
+		}`;
+}
+
 /**
  * Build a page-side expression that dispatches one key event of a given type.
  * @param {'keydown'|'keyup'} type
@@ -30,68 +67,132 @@
  * @return {string} a JS expression string for Runtime.evaluate
  */
 export function keyEventJs(type, spec) {
-	const code = spec.code;
-	const key = spec.key || '';
-	const domCode = spec.domCode || '';
 	return `(function(){
-		var e;
-		var legacy = false;
-		try {
-			e = new KeyboardEvent(${JSON.stringify(type)}, {bubbles:true, cancelable:true, view:window});
-		} catch (err) {
-			legacy = true;
-			e = document.createEvent('Event');
-			e.initEvent(${JSON.stringify(type)}, true, true);
-		}
-		function def(name, value){
-			try { Object.defineProperty(e, name, {get: function(){ return value; }}); } catch (err) {}
-		}
-		def('keyCode', ${JSON.stringify(code)});
-		def('which', ${JSON.stringify(code)});
-		${key ? `def('key', ${JSON.stringify(key)});` : ''}
-		${domCode ? `def('code', ${JSON.stringify(domCode)});` : ''}
-		if (legacy) {
-			try { e.__proto__ = KeyboardEvent.prototype; } catch (err) {}
-		}
-		document.dispatchEvent(e);
-		return true;
+		${keyDispatchFnJs(spec)}
+		return tvdDispatch(${JSON.stringify(type)});
 	})()`;
+}
+
+/** Settle poll period, page-side. */
+const SETTLE_POLL_MS = 50;
+/** How many quietMs of a still focus outweigh a DOM that never stops mutating (see tick). */
+const SETTLE_DOM_PATIENCE = 3;
+/** Hard cap on the settle after the change window, so a page that never goes quiet still answers. */
+const SETTLE_EXTRA_MS = 1000;
+
+/**
+ * Press + settle (+ match) as ONE page-side call.
+ *
+ * The old path was six round-trips per press: read focus, keydown, keyup, then a 100ms host
+ * poll until the focus changed and a further 250ms of "did it stop changing". On a TV every
+ * one of those is 30-80ms of sdb/ares forwarding, and a 10-step tv_goto came out at 6-8s. Here
+ * the whole thing runs inside the page and resolves once — modern engines await the promise,
+ * pre-M54 engines settle it through the host poll in cdp.js `_evaluateAwaited`.
+ *
+ * Semantics kept on purpose:
+ *   * keydown and keyup are separate macrotasks (`setTimeout(keyup, hold)`, hold 0 included):
+ *     the app's long-press timer and auto-repeat live on timers between the two;
+ *   * "settled" = the focus signature changed from `before` (or the change window passed),
+ *     and then nothing moved for `quietMs`. With a MutationObserver "nothing moved" is "no
+ *     class mutation anywhere" — the frame-late focus class of TV frameworks is exactly what
+ *     it watches; without one (WebKit 538) it is the signature staying equal, polled.
+ *   * `dispatch:false` only settles: the trusted-input path fires its keys through the CDP
+ *     Input domain and then calls this for the wait.
+ *
+ * Strict ES5. `Promise` is native from Chrome 32, but the fallback thenable keeps the
+ * expression alive on an engine without one — `_evaluateAwaited` only needs `.then`.
+ * @param {import('./appprofile.js').AppProfile} profile
+ * @param {?import('./keymaps.js').KeySpec} spec null with dispatch:false
+ * @param {{dispatch: boolean, repeat?: number, intervalMs?: number, holdMs?: number,
+ *          settle?: boolean, before?: ?string, quietMs: number, changeTimeoutMs: number,
+ *          matchBody?: ?string}} opts
+ * @return {string}
+ */
+export function pressJs(profile, spec, opts) {
+	const repeat = Math.max(1, Math.floor(opts.repeat || 1));
+	const interval = Math.max(0, Math.floor(opts.intervalMs != null ? opts.intervalMs : 250));
+	const hold = Math.max(0, Math.floor(opts.holdMs || 0));
+	const quiet = Math.max(20, Math.floor(opts.quietMs));
+	const change = Math.max(0, Math.floor(opts.changeTimeoutMs));
+	const matchBody = opts.matchBody || 'return null;';
+	return withHelpersJs(profile, `
+		${opts.dispatch ? keyDispatchFnJs(spec) : 'function tvdDispatch(){ return false; }'}
+		var REPEAT = ${repeat}, INTERVAL = ${interval}, HOLD = ${hold};
+		var QUIET = ${quiet}, CHANGE = ${change}, POLL = ${SETTLE_POLL_MS}, EXTRA = ${SETTLE_EXTRA_MS};
+		var DISPATCH = ${opts.dispatch ? 'true' : 'false'};
+		var SETTLE = ${opts.settle === false ? 'false' : 'true'};
+		var before = ${opts.before != null ? JSON.stringify(String(opts.before)) : 'null'};
+		function tvdMatch(){ ${matchBody} }
+		function now(){ return Date.now ? Date.now() : (new Date()).getTime(); }
+		var tStart = now();
+		if (before === null) { before = focusSig(); }
+
+		function run(resolve){
+			var pressed = 0;
+			var mo = null, lastMut = 0;
+			function finish(sig){
+				if (mo) { try { mo.disconnect(); } catch (e) {} }
+				var m;
+				try { m = tvdMatch(); } catch (e) { m = {ok: false, detail: 'ERR: ' + e.message}; }
+				var after = sig === undefined ? focusSig() : sig;
+				resolve({before: before, after: after, changed: after !== before, focus: focusInfo(),
+					match: m, presses: pressed, ms: now() - tStart});
+			}
+			function settle(){
+				var t0 = now();
+				lastMut = t0;
+				try {
+					if (typeof MutationObserver === 'function') {
+						mo = new MutationObserver(function(){ lastMut = now(); });
+						mo.observe(document.documentElement || document,
+							{attributes: true, attributeFilter: ['class'], childList: true, subtree: true});
+					}
+				} catch (e) { mo = null; }
+				var cur = focusSig();
+				var stableSince = t0;
+				var changed = cur !== before;
+				function tick(){
+					var n = now();
+					var s = focusSig();
+					if (s !== cur) { cur = s; stableSince = n; changed = changed || cur !== before; }
+					if (!changed && n - t0 < CHANGE) { setTimeout(tick, POLL); return; }
+					var focusOk = n - stableSince >= QUIET;
+					// DOM quiet is advisory, not a gate: an app that mutates continuously at idle
+					// (a stats overlay rewriting a counter 40 times a second — webOS 7, verified)
+					// never shows a QUIET gap, and waiting for one costs the whole CHANGE+EXTRA
+					// ceiling on every press. Once the focus has stood still for 3×QUIET the
+					// mutations are not about the press any more.
+					var domOk = !mo || n - lastMut >= QUIET || n - stableSince >= QUIET * ${SETTLE_DOM_PATIENCE};
+					if ((focusOk && domOk) || n - t0 > CHANGE + EXTRA) { finish(cur); return; }
+					setTimeout(tick, POLL);
+				}
+				setTimeout(tick, POLL);
+			}
+			function one(){
+				if (DISPATCH) { tvdDispatch('keydown'); }
+				setTimeout(function(){
+					if (DISPATCH) { tvdDispatch('keyup'); }
+					pressed++;
+					if (pressed < REPEAT) { setTimeout(one, INTERVAL); return; }
+					if (!SETTLE) { finish(); return; }
+					settle();
+				}, HOLD);
+			}
+			if (DISPATCH) { one(); } else { settle(); }
+		}
+
+		if (typeof Promise === 'function') { return new Promise(run); }
+		// No Promise on this engine: a minimal thenable is all the host-side settle needs.
+		var cbs = [], value, done = false;
+		run(function(v){ value = v; done = true; for (var i = 0; i < cbs.length; i++) { try { cbs[i](v); } catch (e) {} } cbs = []; });
+		return {then: function(onOk){ if (done) { onOk(value); } else { cbs.push(onOk); } }};
+	`);
 }
 
 /** Default focus markers. Some TV frameworks put `_active` on the WHOLE focus chain — scene,
  * container, list, tile — so a plain querySelector returns the scene, not the focused
  * widget. `_focused` is here for the frameworks that use that marker instead. */
 export const DEFAULT_FOCUS_SELECTORS = ['._focused', '._active', '.focused', '[data-focused="true"]'];
-
-/**
- * Page-side expression returning a compact snapshot of the currently focused element, so a
- * caller can tell whether a key press moved focus.
- *
- * The element we want is the DEEPEST match — the leaf of the focus chain. Taking the first
- * match returned `NONE` or the scene container on apps that mark the whole chain, which is
- * why `tv_press.focusedAfter` never reported real movement.
- * @param {Array<string>} [focusSelectors] from the app profile
- * @return {string}
- */
-export function focusSnapshotJs(focusSelectors) {
-	const sel = (focusSelectors && focusSelectors.length ? focusSelectors : DEFAULT_FOCUS_SELECTORS).join(', ');
-	return `(function(){
-		try{
-			var sel = ${JSON.stringify(sel)};
-			var all = document.querySelectorAll(sel);
-			var f = null;
-			for (var i = 0; i < all.length; i++) {
-				// a match with no matching descendant is a leaf of the focus chain
-				if (!all[i].querySelector(sel)) { f = all[i]; }
-			}
-			if(!f){ f = document.activeElement; }
-			if(!f || f === document.body){ return 'NONE'; }
-			var cls = (f.className && f.className.toString ? f.className.toString() : '') || f.tagName;
-			var txt = (f.innerText || (f.getAttribute && f.getAttribute('aria-label')) || '').replace(/\\s+/g,' ').trim().slice(0,60);
-			return (cls.slice(0,100)) + (txt ? ' :: ' + txt : '');
-		}catch(err){ return 'ERR:'+err.message; }
-	})()`;
-}
 
 /**
  * Page-side helpers for the Tizen object player (`webapis.avplay`).

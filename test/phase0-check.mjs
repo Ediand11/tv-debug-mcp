@@ -101,9 +101,9 @@ async function main() {
 	check('tv_devices exposes capabilities', !!dev?.capabilities, JSON.stringify(dev?.capabilities));
 
 	const launched = await a.call('tv_launch', {});
-	check('tv_launch attaches', !!launched.attached?.wsUrl, launched.__error || JSON.stringify(launched).slice(0, 200));
-	check('tv_launch reports a fresh launch', launched.attached?.freshLaunch === true);
-	check('tv_launch allocated a local port', !!launched.attached?.localPort, String(launched.attached?.localPort));
+	check('tv_launch attaches', launched.ok === true, launched.__error || JSON.stringify(launched).slice(0, 200));
+	check('tv_launch reports a fresh launch', launched.freshLaunch === true);
+	check('tv_launch allocated a local port', !!launched.localPort, String(launched.localPort));
 
 	const stray = await new Promise((res) => {
 		const p = spawn('bash', ['-lc', 'pgrep -fl "sdb .*shell 0 debug" | wc -l']);
@@ -119,9 +119,9 @@ async function main() {
 	const before = await a.call('tv_press', {key: 'RIGHT'});
 	await sleep(800);
 	const after = await a.call('tv_press', {key: 'RIGHT'});
-	check('keys move focus', before.focusedAfter !== after.focusedAfter,
-		`${String(before.focusedAfter).slice(0, 50)} -> ${String(after.focusedAfter).slice(0, 50)}`);
-	check('press reports its input mode', after.inputMode === 'synthetic');
+	check('keys move focus', before.focus !== after.focus,
+		`${String(before.focus).slice(0, 50)} -> ${String(after.focus).slice(0, 50)}`);
+	check('launch reports the input mode', launched.inputMode === 'synthetic', launched.inputMode);
 
 	const vs = await a.call('tv_video_state', {sampleGapMs: 300});
 	check('tv_video_state runs the ES5 probe', !vs.__error && typeof vs.found === 'number', vs.__error || JSON.stringify(vs).slice(0, 120));
@@ -142,8 +142,8 @@ async function main() {
 	const b = startServer('B');
 	await b.ready;
 	const attached = await b.call('tv_launch', {attach: true});
-	check('attach succeeds from a new process', !!attached.attached?.wsUrl, attached.__error || JSON.stringify(attached).slice(0, 200));
-	check('attach did NOT relaunch the app', attached.attached?.freshLaunch === false, `freshLaunch=${attached.attached?.freshLaunch}`);
+	check('attach succeeds from a new process', attached.ok === true, attached.__error || JSON.stringify(attached).slice(0, 200));
+	check('attach did NOT relaunch the app', attached.freshLaunch === false, `freshLaunch=${attached.freshLaunch}`);
 
 	const stillThere = await b.call('tv_evaluate', {expression: `localStorage.getItem('${MARKER}')`});
 	check('app state survived (same instance)', stillThere.value === '1', JSON.stringify(stillThere));
@@ -151,7 +151,7 @@ async function main() {
 	console.log('\n--- socket drop mid-session ---');
 	// Pull the forward out from under the live CDP socket: this is what a TV going to sleep
 	// or dropping off wifi looks like. It used to kill the whole MCP process.
-	const local = attached.attached?.localPort;
+	const local = attached.localPort;
 	await new Promise((res) => spawn('sdb', ['forward', '--remove', `tcp:${local}`]).on('exit', res));
 	await sleep(1200);
 	const afterDrop = await b.call('tv_evaluate', {expression: '1+1'});

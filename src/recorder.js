@@ -190,6 +190,26 @@ function obsAfter(obs, ts) {
 }
 
 /**
+ * The last observation strictly BEFORE a moment — the state a press started from. Falls back
+ * to the first one at/after it for a timeline that starts on the key itself. Reading the
+ * "before" as the first observation at-or-after the keydown compared the press against its
+ * own result: the first press of every run counted as "did not move".
+ * @param {Array<RecEvent>} obs
+ * @param {number} ts
+ * @return {?RecEvent}
+ */
+function obsBefore(obs, ts) {
+	let last = null;
+	for (const o of obs) {
+		if (o.ts >= ts) {
+			break;
+		}
+		last = o;
+	}
+	return last || obsAfter(obs, ts);
+}
+
+/**
  * P2: collapse a run of identical d-pad presses into one goto — but only while the focus
  * actually moved. The guard is the whole value of this pass.
  * @param {Array<object>} presses
@@ -223,7 +243,7 @@ function collapseRuns(presses, obs, profile) {
 		// Did the focus move on EVERY press of the run?
 		let moved = 0;
 		let prevSig = null;
-		const before = obsAfter(obs, run[0].downTs - 1);
+		const before = obsBefore(obs, run[0].downTs);
 		prevSig = before ? before.f : null;
 		for (const step of run) {
 			const after = obsAfter(obs, step.upTs);

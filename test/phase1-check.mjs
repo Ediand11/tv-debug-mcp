@@ -29,13 +29,13 @@ async function main() {
 
 	console.log('\n--- boot ---');
 	const launched = await s.call('tv_launch', {});
-	check('fresh launch', !!launched.attached?.wsUrl, launched.__error);
+	check('fresh launch', launched.ok === true, launched.__error);
 	// The profile's bootReady is now waited on by launch itself, so the answer to "did the app
 	// come up" arrives with the attach instead of taking a second round-trip per case.
 	check('launch reports bootReady from the app profile',
-		launched.attached?.bootReady?.ok === true,
-		JSON.stringify(launched.attached?.bootReady) + (launched.attached?.warning ? ` warn=${launched.attached.warning}` : ''));
-	console.log(`        (bootReady took ${launched.attached?.bootReady?.elapsedMs}ms — the old cases slept a flat 22000)`);
+		launched.bootReady?.ok === true,
+		JSON.stringify(launched.bootReady) + (launched.warning ? ` warn=${launched.warning}` : ''));
+	console.log(`        (bootReady took ${launched.bootReady?.elapsedMs}ms — the old cases slept a flat 22000)`);
 
 	const booted = await s.call('tv_wait_for', {selector: target.tile, timeoutMs: 60000, stableMs: 700});
 	check('tv_wait_for replaces the boot sleep', booted.ok, `${booted.elapsedMs}ms, ${booted.polls} polls`);
@@ -56,7 +56,7 @@ async function main() {
 	}
 
 	console.log('\n--- state ---');
-	const st = await s.call('tv_state');
+	const st = await s.call('tv_state', {format: 'json'});
 	check('tv_state returns a structured focus',
 		!!st.focus && typeof st.focus.index === 'number' && !!st.focus.path,
 		JSON.stringify(st.focus).slice(0, 140));
@@ -86,8 +86,8 @@ async function main() {
 		console.log(`        target: "${needle}"`);
 		const goto = await s.call('tv_goto', {direction: 'RIGHT', text: needle, maxSteps: 12});
 		check('tv_goto reaches a tile by text', goto.ok, goto.reason || `${goto.presses} presses`);
-		check('tv_goto reports every press', Array.isArray(goto.steps) && goto.steps.length === goto.presses,
-			`steps=${goto.steps?.length} presses=${goto.presses}`);
+		check('tv_goto reports the trail, not a per-press list, when green', goto.trail === `RIGHT×${goto.presses}` && goto.steps === undefined,
+			`trail=${goto.trail} presses=${goto.presses}`);
 	}
 
 	const nowhere = await s.call('tv_goto', {direction: 'RIGHT', text: 'no-such-tile-anywhere-zzz', maxSteps: 6});
@@ -111,7 +111,7 @@ async function main() {
 	}
 
 	console.log('\n--- snapshot ---');
-	const layout = await s.call('tv_snapshot', {});
+	const layout = await s.call('tv_snapshot', {format: 'json'});
 	check('tv_snapshot derives rows on a real TV', layout.ok && (layout.rows || []).length > 0,
 		layout.warning || layout.__error || `tier=${layout.tier}`);
 	console.log(`        tier=${layout.tier} rows=${layout.rows?.length} items=${layout.counts?.items} bytes=${layout.bytes}` +
@@ -135,7 +135,7 @@ async function main() {
 			byRef.reason || `${byRef.presses} presses`);
 		// The guarantee that makes refs safe at all: a ref from a previous generation is
 		// refused, never re-resolved onto whatever now sits in that slot.
-		await s.call('tv_snapshot', {});
+		await s.call('tv_snapshot', {format: 'json'});
 		const stale = await s.call('tv_goto', {direction: dir, ref: nb[dir], maxSteps: 3});
 		check('a ref from the previous snapshot is refused, not re-resolved',
 			stale.ok === false && stale.presses === 0 && /snapshot/.test(String(stale.reason)),
@@ -210,7 +210,7 @@ async function main() {
 	check('tv_sequence: longtap opens the tile context menu', seq.ok,
 		JSON.stringify(seq.steps?.map((x) => `${x.step}=${x.ok}`)));
 	for (const st2 of seq.steps || []) {
-		console.log(`        ${st2.ok ? 'ok ' : 'FAIL'} ${st2.elapsedMs}ms  ${st2.step}`);
+		console.log(`        ${st2.ok ? 'ok ' : 'FAIL'} ${st2.ms}ms  ${st2.step}`);
 	}
 
 	s.stop();

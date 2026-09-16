@@ -20,7 +20,7 @@
 //
 // Strict ES5, like every page-side builder here (webOS 3 is Chrome 38).
 
-import {stateHelpersJs} from './state.js';
+import {withHelpersJs} from './state.js';
 
 /** Refs are handed out as e1, e2, … and NEVER reused across snapshots — see refStoreJs. */
 export const REF_PREFIX = 'e';
@@ -90,8 +90,7 @@ export function snapshotJs(profile, opts) {
 	const maxItems = Math.max(1, Math.floor(opts.maxItemsPerRow || snap.maxItemsPerRow || 12));
 	const textMax = Math.max(8, Math.floor(opts.textMax || 32));
 
-	return `(function(){
-		${stateHelpersJs(profile)}
+	return withHelpersJs(profile, `
 		${refStoreJs(opts.ttlMs)}
 		var DETAIL = ${JSON.stringify(detail)};
 		var ROW_SEL = ${JSON.stringify(sel.row)};
@@ -281,8 +280,7 @@ export function snapshotJs(profile, opts) {
 			popups: out.popups.length
 		};
 		snapCommit();
-		return out;
-	})()`;
+		return out;`);
 }
 
 /**
@@ -293,8 +291,16 @@ export function snapshotJs(profile, opts) {
  * @return {string}
  */
 export function focusIsRefJs(profile, ref) {
-	return `(function(){
-		${stateHelpersJs(profile)}
+	return withHelpersJs(profile, focusIsRefBody(ref));
+}
+
+/**
+ * Statements of the ref check, for inlining into a press settle (see state.js focusMatchesBody).
+ * @param {string} ref
+ * @return {string}
+ */
+export function focusIsRefBody(ref) {
+	return `
 		var K = ${JSON.stringify(String(ref))};
 		var s = window.__tvDebugSnap;
 		if (!s || !s.refs) {
@@ -315,8 +321,7 @@ export function focusIsRefJs(profile, ref) {
 				reason: 'ref ' + K + ' points at an element that has left the DOM — take a fresh tv_snapshot'};
 		}
 		var f = focusLeaf();
-		return {ok: f === el, detail: focusInfo()};
-	})()`;
+		return {ok: f === el, detail: focusInfo()};`;
 }
 
 /**

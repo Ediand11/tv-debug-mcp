@@ -22,7 +22,7 @@
 // `stableMs` additionally requires the condition to keep holding for that long, which is
 // what stops a case from acting on a half-rendered frame.
 
-import {stateHelpersJs} from './state.js';
+import {withHelpersJs} from './state.js';
 
 /**
  * Build the page-side predicate. Returns null for conditions evaluated outside the page.
@@ -68,11 +68,9 @@ export function conditionJs(profile, cond) {
 			var t = (document.body.innerText || '').toLowerCase();
 			return {ok: t.indexOf(NEEDLE) >= 0, detail: t.length + ' chars of text'};`;
 	} else if (cond.expression != null) {
-		return `(function(){
-			${stateHelpersJs(profile)}
+		return withHelpersJs(profile, `
 			try { var v = (${cond.expression}); return {ok: !!v, detail: String(v).slice(0, 120)}; }
-			catch (e) { return {ok: false, detail: 'ERR: ' + e.message}; }
-		})()`;
+			catch (e) { return {ok: false, detail: 'ERR: ' + e.message}; }`);
 	} else {
 		throw new Error(
 			'wait condition must be one of: focusText, selector, selectorGone, scene, text, expression, ' +
@@ -84,13 +82,11 @@ export function conditionJs(profile, cond) {
 	const raw = String(cond.selector ?? cond.selectorGone ?? '');
 	// Set only by a named element that carries a text qualifier (see resolveCondition).
 	const withText = cond.withText != null ? String(cond.withText).toLowerCase() : '';
-	return `(function(){
-		${stateHelpersJs(profile)}
+	return withHelpersJs(profile, `
 		var NEEDLE = ${JSON.stringify(needle)};
 		var NEEDLE_RAW = ${JSON.stringify(raw)};
 		var WITH_TEXT = ${JSON.stringify(withText)};
-		${body}
-	})()`;
+		${body}`);
 }
 
 /**

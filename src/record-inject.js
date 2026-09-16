@@ -11,9 +11,12 @@
 //   * capture phase on `window`. That listener runs FIRST in the chain even for an event
 //     dispatched straight into `document` — which is how this MCP's own synthetic presses are
 //     delivered. So a recording can be exercised with zero TVs involved.
-//   * two observations per key, at +150ms and +600ms. "Right after" and "settled" are different
-//     facts; focusSettled already proved focus lands a frame late. A 1000ms heartbeat catches
-//     what the app does on its own.
+//   * three observations per key, at +30ms, +150ms and +600ms. "Right after", "a frame later"
+//     and "settled" are different facts; the press settle already proved focus lands a frame
+//     late. The +30 exists because a synthetic press from tv_press settles in ~100ms now, and
+//     the next key can arrive before +150 — a popup that opened during a hold and was closed
+//     by the very next press would otherwise never be observed. A 1000ms heartbeat catches what
+//     the app does on its own.
 //   * deduplication by identity. An event is only pushed when something actually changed, so
 //     thirty seconds of nobody touching the remote cost ~0 events.
 //
@@ -126,10 +129,11 @@ export function recorderInstallJs(profile, opts) {
 			var code = e.keyCode || e.which || 0;
 			if (!code) { return; }
 			push({k: 'u', c: code});
-			// Right after, and settled.
+			// Right after, a frame later, and settled.
+			rec.timers.push(setTimeout(snapObs, 30));
 			rec.timers.push(setTimeout(snapObs, 150));
 			rec.timers.push(setTimeout(snapObs, 600));
-			if (rec.timers.length > 40) { rec.timers = rec.timers.slice(-20); }
+			if (rec.timers.length > 60) { rec.timers = rec.timers.slice(-30); }
 		}
 		// Attach ONCE per page. Re-assigning the handlers on every install would leave the
 		// previously attached closures in place with nothing able to remove them, and they

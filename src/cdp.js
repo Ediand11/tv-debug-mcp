@@ -22,6 +22,23 @@
 import WebSocket from 'ws';
 
 const DEFAULT_CALL_TIMEOUT = 8000;
+/** `TV_DEBUG_TIMING=1`: one stderr line per CDP call with its round-trip time. */
+const TIMING = process.env.TV_DEBUG_TIMING === '1';
+/**
+ * WebSocket keepalive: a dead TV is noticed within ~20s instead of on the next 8s timeout.
+ * Only on a socket that reaches the inspector directly (sdb / direct port / local Chrome).
+ * An endpoint behind a proxy may not survive a ping frame at all: ares-inspect's tunnel drops
+ * every message after the first ping — no pong, no close, the session just goes silent for
+ * good (webOS 7, verified) — so the adapter that hands out such an endpoint switches the
+ * keepalive off (`keepalive: false` on the endpoint).
+ */
+const PING_INTERVAL_MS = 15000;
+const PONG_TIMEOUT_MS = 5000;
+/**
+ * Ring-buffer eviction runs in batches: an overflowing buffer is cut back to its limit only
+ * once it is this far over, so a chatty page pays one splice per batch instead of one per event.
+ */
+const EVICT_BATCH = 64;
 /** How often the legacy promise-settling path re-reads the page-side result slot. */
 const EVAL_POLL_MS = 50;
 /** Leak insurance for a slot whose promise never settles (see `_evaluateAwaited`). */
@@ -54,9 +71,12 @@ export function isUnsupportedMethod(err) {
 export class CdpSession {
 	/**
 	 * @param {string} wsUrl
+	 * @param {{keepalive?: boolean}} [opts] keepalive=false: never send WebSocket pings (see
+	 *   PING_INTERVAL_MS — an endpoint behind ares-inspect dies on the first one)
 	 */
-	constructor(wsUrl) {
+	constructor(wsUrl, opts = {}) {
 		this._wsUrl = wsUrl;
+		this._keepalive = opts.keepalive !== false;
 		/** @type {?WebSocket} */
 		this._ws = null;
 		this._id = 0;
@@ -114,6 +134,15 @@ export class CdpSession {
 		 * @type {?string}
 		 */
 		this.screenshotDead = null;
+		/** Round-trip of the probe evaluate at connect — the cost of one call on this device. */
+		this.rttMs = null;
+		/** Every CDP call sent on this connection; tools report the delta as `evals`. */
+		this.calls = 0;
+		/** Host clock at connect; console entries carry a timestamp relative to it. */
+		this.startedAt = 0;
+		this._pingTimer = null;
+		this._pongTimer = null;
+		this._pongSeen = false;
 	}
 
 	/** @return {boolean} */
@@ -143,24 +172,32 @@ export class CdpSession {
 			ws.once('error', onError);
 		});
 
+		this.startedAt = Date.now();
 		// Runtime is the one domain everything else here depends on.
 		await this.call('Runtime.enable', {}, 4000);
-		for (const m of ['Page.enable', 'Console.enable', 'Log.enable', 'Network.enable']) {
-			try {
-				await this.call(m, {}, 4000);
-			} catch (e) {
-				if (!isUnsupportedMethod(e)) {
-					// Not "old engine doesn't have it" — if the socket died, say so instead of
-					// handing back a nominally attached session.
-					if (!this.isOpen) {
-						throw e;
-					}
-				}
+		// The optional domains go out together: four sequential round-trips on a TV are a
+		// visible part of every launch, and none of them depends on another.
+		const optional = ['Page.enable', 'Console.enable', 'Log.enable', 'Network.enable'];
+		const settled = await Promise.allSettled(optional.map((m) => this.call(m, {}, 4000)));
+		for (const r of settled) {
+			if (r.status === 'rejected' && !isUnsupportedMethod(r.reason) && !this.isOpen) {
+				// Not "old engine doesn't have it" — if the socket died, say so instead of
+				// handing back a nominally attached session.
+				throw r.reason;
 			}
 		}
 		// Dialect probe — sets `legacyEvalDialect` before the first real caller needs it.
 		// A failure here is not fatal: `evaluate()` re-runs the detection on every call.
-		await this.evaluate('1', {awaitPromise: false, timeoutMs: 4000}).catch(() => {});
+		// Timed, because it is also the one clean measurement of a round-trip on this device.
+		const t0 = Date.now();
+		await this.evaluate('1', {awaitPromise: false, timeoutMs: 4000})
+			.then(() => {
+				this.rttMs = Date.now() - t0;
+			})
+			.catch(() => {});
+		if (this._keepalive) {
+			this._startKeepalive(ws);
+		}
 		// Last, so a socket that died during setup — including during the probe, whose own
 		// rejection is swallowed above — fails the connect instead of handing back a session
 		// that reports itself attached.
@@ -168,6 +205,51 @@ export class CdpSession {
 			throw this._deadReason || new Error('CDP socket closed during setup');
 		}
 		return this;
+	}
+
+	/**
+	 * Protocol-level ping every 15s. A TV that went to sleep or lost Wi-Fi leaves the socket
+	 * half-open: without this the first tool call after the idle burns its full 8s timeout
+	 * before anyone learns the connection is gone.
+	 *
+	 * The pong deadline is only armed once this peer has answered a ping at all — an inspector
+	 * that never pongs (old WebKit builds are not verified either way) must not have a live
+	 * connection cut every 20s over a frame it does not implement.
+	 * @param {WebSocket} ws
+	 */
+	_startKeepalive(ws) {
+		ws.on('pong', () => {
+			this._pongSeen = true;
+			if (this._pongTimer) {
+				clearTimeout(this._pongTimer);
+				this._pongTimer = null;
+			}
+		});
+		this._pingTimer = setInterval(() => {
+			if (!this.isOpen) {
+				return;
+			}
+			try {
+				ws.ping();
+			} catch {
+				return;
+			}
+			if (this._pongSeen && !this._pongTimer) {
+				this._pongTimer = setTimeout(() => {
+					this._pongTimer = null;
+					this._disconnect(new Error(`CDP peer stopped answering pings (${PONG_TIMEOUT_MS}ms)`));
+					try {
+						ws.terminate();
+					} catch {
+						// ignore
+					}
+				}, PONG_TIMEOUT_MS);
+			}
+		}, PING_INTERVAL_MS);
+		// Never hold the process open for a keepalive.
+		if (this._pingTimer.unref) {
+			this._pingTimer.unref();
+		}
 	}
 
 	/**
@@ -179,6 +261,14 @@ export class CdpSession {
 			return;
 		}
 		this._deadReason = err;
+		if (this._pingTimer) {
+			clearInterval(this._pingTimer);
+			this._pingTimer = null;
+		}
+		if (this._pongTimer) {
+			clearTimeout(this._pongTimer);
+			this._pongTimer = null;
+		}
 		for (const {reject, timer} of this._pending.values()) {
 			clearTimeout(timer);
 			reject(err);
@@ -259,26 +349,26 @@ export class CdpSession {
 				this._push('console', {
 					level: params.type === 'warn' ? 'warning' : params.type,
 					text: argsToText(params.args).slice(0, 1000),
-					url: loc.url, line: loc.lineNumber, ts: params.timestamp
+					url: loc.url, line: loc.lineNumber, at: Date.now()
 				});
 				break;
 			}
 			case 'Runtime.exceptionThrown': {
 				const d = params.exceptionDetails || {};
 				const text = (d.exception && (d.exception.description || d.exception.value)) || d.text || 'Uncaught exception';
-				this._push('exceptions', {text: String(text).slice(0, 1400), url: d.url, line: d.lineNumber, ts: params.timestamp});
+				this._push('exceptions', {text: String(text).slice(0, 1400), url: d.url, line: d.lineNumber, at: Date.now()});
 				break;
 			}
 			// legacy Chrome 38 (webOS 3)
 			case 'Console.messageAdded': {
 				const m = params.message || {};
 				const bucket = m.level === 'error' ? 'exceptions' : 'console';
-				this._push(bucket, {level: m.level, text: String(m.text || '').slice(0, 1000), url: m.url, line: m.line, source: m.source});
+				this._push(bucket, {level: m.level, text: String(m.text || '').slice(0, 1000), url: m.url, line: m.line, source: m.source, at: Date.now()});
 				break;
 			}
 			case 'Log.entryAdded': {
 				const e = params.entry || {};
-				this._push('console', {level: e.level, text: String(e.text || '').slice(0, 1000), url: e.url, line: e.lineNumber, source: e.source});
+				this._push('console', {level: e.level, text: String(e.text || '').slice(0, 1000), url: e.url, line: e.lineNumber, source: e.source, at: Date.now()});
 				break;
 			}
 			case 'Network.requestWillBeSent':
@@ -329,7 +419,8 @@ export class CdpSession {
 				this._push('networkFailures', {
 					url: rec ? rec.url : undefined,
 					errorText: params.errorText,
-					blocked: params.blockedReason || null
+					blocked: params.blockedReason || null,
+					at: Date.now()
 				});
 				break;
 			}
@@ -458,7 +549,9 @@ export class CdpSession {
 		const arr = this[bucket];
 		const limit = bucket === 'network' ? MAX_NETWORK_BUFFER : MAX_BUFFER;
 		arr.push(item);
-		if (arr.length > limit) {
+		// Batched: a buffer is allowed to run EVICT_BATCH over its limit and is then cut back to
+		// the limit in one splice. `dropped` still accounts for every evicted entry.
+		if (arr.length > limit + EVICT_BATCH) {
 			const cut = arr.length - limit;
 			arr.splice(0, cut);
 			this.dropped[bucket] += cut;
@@ -479,7 +572,25 @@ export class CdpSession {
 			return Promise.reject(new Error('CDP not connected'));
 		}
 		const id = ++this._id;
+		this.calls++;
+		const t0 = TIMING ? Date.now() : 0;
+		if (TIMING) {
+			const expr = params && typeof params.expression === 'string' ? params.expression : '';
+			console.error(`[tv-debug-mcp timing] > ${method}#${id}${expr ? ' ' + expr.replace(/\s+/g, ' ').slice(0, 70) : ''}`);
+		}
 		return new Promise((resolve, reject) => {
+			if (TIMING) {
+				const done = resolve;
+				const fail = reject;
+				resolve = (v) => {
+					console.error(`[tv-debug-mcp timing] < ${method}#${id} ${Date.now() - t0}ms`);
+					done(v);
+				};
+				reject = (e) => {
+					console.error(`[tv-debug-mcp timing] ! ${method}#${id} ${Date.now() - t0}ms ${e && e.message}`);
+					fail(e);
+				};
+			}
 			const timer = setTimeout(() => {
 				this._pending.delete(id);
 				const err = new Error(`CDP call ${method} timed out after ${timeoutMs}ms`);
@@ -656,26 +767,18 @@ export class CdpSession {
 		if (!this._ws) {
 			return Promise.resolve({loaded: false});
 		}
+		// Through the event bus, not a second `message` listener: during a boot the socket
+		// carries hundreds of Network events, and a private listener parsed every one of them
+		// a second time.
 		return new Promise((resolve) => {
-			const ws = this._ws;
+			let off = () => {};
 			const finish = (loaded) => {
 				clearTimeout(timer);
-				ws.removeListener('message', onMessage);
+				off();
 				resolve({loaded});
 			};
-			const onMessage = (raw) => {
-				let msg;
-				try {
-					msg = JSON.parse(raw.toString());
-				} catch {
-					return;
-				}
-				if (msg.method === 'Page.loadEventFired') {
-					finish(true);
-				}
-			};
 			const timer = setTimeout(() => finish(false), waitMs);
-			ws.on('message', onMessage);
+			off = this.onEvent('Page.loadEventFired', () => finish(true));
 		});
 	}
 

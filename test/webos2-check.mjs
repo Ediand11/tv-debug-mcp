@@ -31,9 +31,9 @@ async function main() {
 
 	console.log('\n--- boot ---');
 	const launched = await s.call('tv_launch', {device: DEVICE});
-	check('fresh launch attaches over /pagelist.json', !!launched.attached?.wsUrl, launched.__error);
-	check('derived ws url has the /devtools/page shape',
-		String(launched.attached?.wsUrl || '').includes('/devtools/page/'), launched.attached?.wsUrl);
+	check('fresh launch attaches over /pagelist.json', launched.ok === true, launched.__error);
+	check('launch reports the legacy eval dialect (WebKit 538 has no awaitPromise)',
+		launched.legacyEval === true, JSON.stringify(launched).slice(0, 160));
 
 	const booted = await s.call('tv_wait_for', {device: DEVICE, selector: target.tile, timeoutMs: target.bootTimeoutMs, stableMs: 700});
 	check('tv_wait_for sees the app boot', booted.ok, booted.__error || `${booted.elapsedMs}ms`);
@@ -56,13 +56,13 @@ async function main() {
 		entries.slice(-3).map((e) => e.text).join(' | ').slice(0, 140));
 
 	console.log('\n--- state & press ---');
-	const st = await s.call('tv_state', {device: DEVICE});
+	const st = await s.call('tv_state', {device: DEVICE, format: 'json'});
 	check('tv_state returns a structured focus', !!st.focus && !!st.focus.path, JSON.stringify(st.focus).slice(0, 140));
 
 	// Tiles exist before their titles render; two skeleton tiles produce identical focus
 	// snapshots and a real move reads as "no movement". Wait for the focused tile's text.
 	for (let i = 0; i < 30; i++) {
-		const now = await s.call('tv_state', {device: DEVICE});
+		const now = await s.call('tv_state', {device: DEVICE, format: 'json'});
 		if (String(now.focus?.text || '').trim()) {
 			break;
 		}
@@ -71,8 +71,8 @@ async function main() {
 
 	const press = await s.call('tv_press', {device: DEVICE, key: 'RIGHT'});
 	check('tv_press dispatches through the createEvent fallback', !press.__error && press.keyCode === 39, press.__error);
-	check('tv_press reports focus movement', press.focusChanged === true,
-		`before=${String(press.focusedBefore).slice(0, 60)} after=${String(press.focusedAfter).slice(0, 60)}`);
+	check('tv_press reports focus movement', press.changed === true,
+		`before=${String(press.before).slice(0, 60)} after=${String(press.focus).slice(0, 60)}`);
 	await s.call('tv_press', {device: DEVICE, key: 'LEFT'});
 
 	console.log('\n--- video state ---');

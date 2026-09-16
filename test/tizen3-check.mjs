@@ -43,7 +43,7 @@ async function main() {
 
 	console.log('\n--- boot ---');
 	const launched = await s.call('tv_launch', {device: DEVICE});
-	check('fresh launch attaches', !!launched.attached?.wsUrl, launched.__error);
+	check('fresh launch attaches', launched.ok === true, launched.__error);
 
 	const booted = await s.call('tv_wait_for', {
 		device: DEVICE, selector: target.tile, timeoutMs: target.bootTimeoutMs, stableMs: 700
