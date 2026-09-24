@@ -21,6 +21,8 @@
 //      one round-trip, a promise is settled host-side, a statement falls back unwrapped
 //  12. the AVPlay branch of the video probes, against a fake `webapis.avplay` — including the
 //      negative control that a stream which failed to open is "found, not advancing"
+//  13. tv_resources: the `ares-device -r -s` CSV parsers (new and old `free`, foreign ids, a pid
+//      change), the summary, and the refusals (non-webOS device, missing ares CLI, no monitor)
 //
 // Run: node test/phase0-offline.mjs
 import {spawn} from 'node:child_process';
@@ -46,6 +48,7 @@ import {Timeline, compileCase, renderCase, slugify} from '../src/recorder.js';
 import {reverseKeyMap, keyNameFor} from '../src/keymaps.js';
 import {videoStateJs, videoSampleStartJs, videoSampleFinishJs, pressJs} from '../src/inject.js';
 import {capEvalValue, renderSnapshotText, renderStateText} from '../src/render.js';
+import {splitCsvLine, parseSystemCsv, parseAppCsv, seriesStats, summarizeResources} from '../src/resources.js';
 
 /**
  * Anything page-side must stay ES5 — see the header of src/inject.js. Cheap syntactic guard,
@@ -1311,6 +1314,79 @@ function recorderChecks() {
 	check('and the drop counter is carried through', skewed.dropped === 3, String(skewed.dropped));
 }
 
+/** 13: tv_resources parsers — CSV exactly as `ares-device -r -s` (csv-writer) writes it. */
+function resourcesChecks() {
+	console.log('\n--- resource monitor CSV ---');
+	const SYS_HEADER = 'time,(%),overall,usermode,kernelmode,others,(KB),total,used,free,shared,buff/cache,available';
+	const sysRow = (t, cpu, used, free, avail) => [
+		`${t},cpu,${cpu},${cpu - 5},4,1,,,,,,,`,
+		`${t},cpu0,${cpu + 3},${cpu - 2},4,1,,,,,,,`,
+		`${t},,,,,,memory,1500000,${used},${free},12000,300000,${avail}`,
+		`${t},,,,,,swap,0,0,0,,,`
+	].join('\n');
+	const newFree = [SYS_HEADER,
+		sysRow('2026-09-24 12:00:01', 20, 900000, 100000, 512000),
+		sysRow('2026-09-24 12:00:02', 85.5, 1000000, 50000, 409600),
+		sysRow('2026-09-24 12:00:03', 30, 950000, 60000, 460800)
+	].join('\n') + '\n';
+	const sys = parseSystemCsv(newFree);
+	check('one system sample per tick, header skipped', sys.length === 3, String(sys.length));
+	check('overall CPU comes from the aggregate `cpu` row, not a core',
+		sys[1].cpuPct === 85.5, JSON.stringify(sys[1]));
+	check('memory columns land in the right fields', sys[0].memTotalKb === 1500000 && sys[0].memAvailableKb === 512000 && sys[0].swapUsedKb === 0,
+		JSON.stringify(sys[0]));
+
+	// Old procps/busybox `free`: no `available`, a "-/+ buffers/cache" line instead.
+	const oldFree = [SYS_HEADER,
+		'2026-09-24 12:00:01,cpu,10,5,4,1,,,,,,,',
+		'2026-09-24 12:00:01,,,,,,memory,800000,700000,100000,0,,',
+		'2026-09-24 12:00:01,,,,,,buffers,,300000,500000,,,'
+	].join('\n');
+	check('an old `free` falls back to the buffers/cache free for memAvailable',
+		parseSystemCsv(oldFree)[0].memAvailableKb === 500000, JSON.stringify(parseSystemCsv(oldFree)[0]));
+
+	const APP_HEADER = 'TIME,PID,ID,DISPLAY ID,CPU(%),MEMORY(%),MEMORY(KB)';
+	const appCsv = [APP_HEADER,
+		'2026-09-24 12:00:01,1234,com.app,0,12.5,8.10,204800',
+		'2026-09-24 12:00:01,999,com.other,0,50,1,1000',
+		'2026-09-24 12:00:02,1234,com.app,0,40,9.00,256000',
+		'2026-09-24 12:00:03,1300,com.app,0,5,5.00,153600'
+	].join('\n');
+	const app = parseAppCsv(appCsv, 'com.app');
+	check('app rows of other ids are dropped', app.length === 3 && app.every((a) => a.pids[0] !== 999), JSON.stringify(app));
+
+	// Seen on webOS 7: the ares timer drifted and two ticks carry the same second.
+	const dupSecond = parseAppCsv([APP_HEADER,
+		'2026-09-24 11:46:32,6822,com.app,0,3.89,10.96,80984',
+		'2026-09-24 11:46:32,6822,com.app,0,3.53,10.04,73476',
+		'2026-09-24 11:46:32,7000,com.app,1,1,1,1000'
+	].join('\n'), 'com.app');
+	check('two ticks in one second stay two samples; a second pid in a tick is summed',
+		dupSecond.length === 2 && dupSecond[0].rssKb === 80984 && dupSecond[1].rssKb === 74476 && dupSecond[1].pids.join() === '6822,7000',
+		JSON.stringify(dupSecond));
+	check('system ticks split on the `cpu` row, not on the timestamp',
+		parseSystemCsv([SYS_HEADER, sysRow('2026-09-24 11:46:32', 10, 1, 1, 1), sysRow('2026-09-24 11:46:32', 20, 2, 2, 2)].join('\n')).length === 2);
+
+	const st = seriesStats(app, 'rssKb', 1024);
+	check('series stats in MB with growth and the tick of the peak',
+		st.min === 150 && st.max === 250 && st.first === 200 && st.last === 150 && st.delta === -50 && st.maxAt === '12:00:02',
+		JSON.stringify(st));
+	check('a series with no numbers is null, not zeros', seriesStats([{time: 'x', v: null}], 'v') === null);
+	check('quoted CSV fields keep their commas', splitCsvLine('a,"b,c",""d""').length === 3 && splitCsvLine('a,"b,c",x')[1] === 'b,c');
+
+	const sum = summarizeResources({systemCsv: newFree, appCsv, appId: 'com.app'});
+	check('summary: system window and CPU peak',
+		sum.window?.from === '2026-09-24 12:00:01' && sum.system.cpuPct.max === 85.5 && sum.system.memAvailableMb.min === 400,
+		JSON.stringify(sum.system));
+	check('summary: a pid change is reported as a restart',
+		sum.app.pids.join() === '1234,1300' && (sum.warnings || []).some((w) => /changed pid/.test(w)),
+		JSON.stringify(sum.warnings));
+	const none = summarizeResources({systemCsv: newFree, appCsv: APP_HEADER, appId: 'com.app'});
+	check('summary: an app that never showed up is a warning, not empty numbers',
+		none.app.samples === 0 && none.app.rssMb === null && (none.warnings || []).some((w) => /no samples/.test(w)),
+		JSON.stringify(none.app));
+}
+
 async function main() {
 	profileChecks();
 	metricsChecks();
@@ -1323,6 +1399,7 @@ async function main() {
 	namedTargetChecks();
 	snapshotChecks();
 	recorderChecks();
+	resourcesChecks();
 
 	console.log('\n--- config and failure isolation ---');
 	// A PATH with node but no `sdb`/`tizen`, so tool calls have to fail gracefully.
@@ -1394,6 +1471,31 @@ async function main() {
 	check('tv_heap diff needs no device and no sdb', heapDiff.delta?.totalSize === 420 && heapDiff.topGrowth?.[0]?.name === 'MovieTile',
 		JSON.stringify(heapDiff.delta || heapDiff.__error));
 	check('server survived a device-less tool call', s.alive());
+
+	// tv_resources: webOS-only, and an ares failure fails the call. PATH is node's own bin dir,
+	// which may or may not hold the ares CLI — both an absent binary and an unknown ares device
+	// have to come back as an error naming the cause.
+	writeCfg({
+		defaultDevice: 'ghost',
+		devices: [
+			{id: 'ghost', platform: 'tizen', name: 'Not plugged in', appId: 'x.y', host: '10.255.255.1'},
+			{id: 'lg', platform: 'webos', name: 'No ares on PATH', appId: 'com.app', device: 'nowhere'}
+		]
+	});
+	await sleep(50);
+	const resTizen = await s.call('tv_resources', {action: 'start'});
+	check('tv_resources refuses a non-webOS device and points to the CDP tools',
+		!!resTizen.__error && /webOS-only/.test(resTizen.__error) && /tv_heap/.test(resTizen.__error), resTizen.__error);
+	const resNoAres = await s.call('tv_resources', {action: 'start', device: 'lg'});
+	check('tv_resources on an unusable ares setup fails the call with the cause, not the process',
+		!!resNoAres.__error && /ares-device not found|did not start on "lg": .*nowhere/s.test(resNoAres.__error) && s.alive(),
+		resNoAres.__error);
+	const resRead = await s.call('tv_resources', {action: 'read', device: 'lg'});
+	check('tv_resources read without a running monitor says to start one',
+		!!resRead.__error && /action:"start" first/.test(resRead.__error), resRead.__error);
+	const resBad = await s.call('tv_resources', {action: 'start', device: 'lg', intervalSec: 0});
+	check('tv_resources rejects an interval under a second',
+		!!resBad.__error && /intervalSec/.test(resBad.__error), resBad.__error);
 
 	s.stop();
 	console.log(`\n${passed} passed, ${failed} failed\n`);

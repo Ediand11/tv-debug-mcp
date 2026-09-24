@@ -3,7 +3,7 @@
 //
 // Tools: tv_devices, tv_install, tv_launch, tv_press, tv_screenshot, tv_console, tv_network,
 // tv_video_state, tv_state, tv_snapshot, tv_record, tv_wait_for, tv_goto, tv_menu,
-// tv_sequence, tv_evaluate, tv_profile, tv_heap.
+// tv_sequence, tv_evaluate, tv_profile, tv_heap, tv_resources.
 // The park is described in devices.json (or TV_DEBUG_CONFIG) and can also contain a `pc`
 // device — the same case run against a local Chrome. One persistent CDP session per device
 // is kept across calls so console/exceptions accumulate from launch. All progress goes to
@@ -25,6 +25,7 @@ import {resolve} from 'node:path';
 import {loadConfig, getDevice} from './config.js';
 import {DeviceSession, deviceCapabilities} from './session.js';
 import {diffHeapSummaries} from './heap.js';
+import {resourcesStart, resourcesRead, resourcesStop, stopAllResourceMonitors} from './resources.js';
 import {knownKeys} from './keymaps.js';
 import {parseSdbDevices} from './adapters/tizen.js';
 import {listDocResources, readDocResource, DOC_URI_PREFIX} from './tooldocs.js';
@@ -153,7 +154,7 @@ const TOOLS = [
 			overlay: bool('REC badge (default true).')
 		}),
 	tool('tv_wait_for',
-		'Wait for exactly one condition instead of sleeping. element/elementGone/sceneName take names from the app profile.',
+		'Wait for exactly one condition instead of sleeping.',
 		{
 			focusText: str('Focused text contains.'),
 			element: str('Visible profile element NAME.'),
@@ -172,7 +173,7 @@ const TOOLS = [
 			withState: bool('Append tv_state.')
 		}),
 	tool('tv_goto',
-		'Press a direction until the FOCUSED element matches the target (ref | element | text | selector | testid); stops at edges/wrap-around. select:true = ENTER on arrival.',
+		'Press a direction until the FOCUSED element matches the target; stops at edges/wrap-around.',
 		{
 			direction: en(['UP', 'DOWN', 'LEFT', 'RIGHT'], 'Direction to travel.'),
 			ref: str('tv_snapshot ref.'),
@@ -224,6 +225,15 @@ const TOOLS = [
 			after: str('diff: later file.'),
 			topN: int(1, 200, 'Default 20.'),
 			timeoutMs: int(5000, 600000, 'Default 120000.')
+		},
+		['action']),
+	tool('tv_resources',
+		'webOS: TV + app CPU/memory sampled on-device. start, act, read|stop.',
+		// appId and path (CSV dir) are accepted too, documented only in tv-debug://docs/tv_resources:
+		// rare overrides, and the whole tools/list has to stay under 10 KB.
+		{
+			action: en(['start', 'read', 'stop'], ''),
+			intervalSec: int(1, 60)
 		},
 		['action'])
 ];
@@ -527,6 +537,21 @@ async function handleCall(name, args) {
 			}
 			return errorResult(`tv_heap needs action "snapshot" or "diff", got ${JSON.stringify(args.action)}`);
 		}
+		case 'tv_resources': {
+			// No DeviceSession: the samplers talk to the TV over their own SSH, not CDP, and must
+			// not launch the app or wait for a debug attach.
+			const cfg = getDevice(args.device);
+			if (args.action === 'start') {
+				return textResult(await resourcesStart(cfg, {appId: args.appId, intervalSec: args.intervalSec, path: args.path}));
+			}
+			if (args.action === 'read') {
+				return textResult(resourcesRead(cfg));
+			}
+			if (args.action === 'stop') {
+				return textResult(await resourcesStop(cfg));
+			}
+			return errorResult(`tv_resources needs action "start", "read" or "stop", got ${JSON.stringify(args.action)}`);
+		}
 		default:
 			return errorResult(`unknown tool ${name}`);
 	}
@@ -570,6 +595,7 @@ async function main() {
 	});
 
 	const cleanup = async () => {
+		await stopAllResourceMonitors().catch(() => {});
 		for (const s of sessions.values()) {
 			await s.dispose().catch(() => {});
 		}

@@ -399,6 +399,39 @@ Leak hunt: \`snapshot\` (before) → do the scenario (tv_press / tv_menu / tv_se
 Retainer paths ("who holds this") and retained/dominator sizes are deliberately NOT computed —
 load the saved files in DevTools for those. Needs the HeapProfiler domain (fine on modern Tizen /
 webOS / pc, best-effort on webOS 3).
+${COMMON}`,
+
+	tv_resources: `# tv_resources
+
+webOS only. CPU % and memory of the whole TV and of the app under test, sampled on the TV — the
+half tv_profile / tv_heap cannot see: the renderer's RSS (decoded images, layer textures, <video>
+buffers on top of the JS heap) and how much memory the system has left before it starts killing
+apps. Same data as LG's Resource Monitor: it runs \`ares-device --resource-monitor\` over the
+dev-mode SSH. Needs no tv_launch and does not touch the CDP session.
+
+* \`start\` — spawns two background samplers (\`ares-device -r\` and \`-r -id <appId>\`), each writing
+  a CSV (\`path\` = directory, default TMPDIR), and returns once the first system sample is in, with
+  the current reading. \`intervalSec\` 1..60 (default 1); \`appId\` defaults to the device's appId.
+  (\`appId\` and \`path\` are not in the tool schema — it is kept under 10 KB — but are accepted.)
+  An unreachable TV fails here with the ares error.
+* \`read\` — summary so far; sampling continues. Use it for checkpoints in a long scenario.
+* \`stop\` — stops the samplers and returns the final summary. The CSVs stay on disk.
+
+Scenario: \`start\` → act (tv_press / tv_menu / tv_sequence, or a human with the remote) → \`stop\`.
+Pair it with tv_profile metrics: a JS heap that stays flat while \`app.rssMb.delta\` keeps growing
+is native memory (images, video), not a JS leak.
+
+Answer of read/stop: \`{ok, device, intervalSec, elapsedSec, running, window: {from, to},
+system: {samples, memTotalMb, cpuPct, memAvailableMb, memUsedMb, swapUsedMb},
+app: {id, samples, pids, cpuPct, rssMb}, csv: {system, app}, warnings?}\` where each series is
+\`{min, max, avg, first, last, delta, maxAt}\` (MB for memory, maxAt = HH:MM:SS on the TV clock).
+
+How to read the numbers: CPU % is a share of ALL cores (100 = every core busy), app memory is RSS,
+system memory is \`free -k\` (memAvailableMb falls back to the "-/+ buffers/cache" free on an old
+\`free\`). Resolution is one second. The per-app sampler reads every /proc/<pid>/stat each tick —
+that load lands in the system CPU, not the app's. More than one entry in \`app.pids\` means the app
+was restarted or killed mid-window. No app samples means it was not running, or
+applicationManager/dev/running (the only way ares maps an app id to a pid) does not list it.
 ${COMMON}`
 };
 
