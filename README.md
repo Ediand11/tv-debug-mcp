@@ -375,6 +375,21 @@ tv_profile {"action": "stop", "collectGarbage": true}
 - **`collectGarbage` по умолчанию выключен.** Форсированный GC — это пауза: внутри записи она искажает и профиль, и поведение слабого ТВ. Включать под охоту за утечкой, где несобранный мусор как раз и подделывает рост heap. Метод, которого на движке нет, даёт `warning`, а не ошибку;
 - снимок на `start` берётся **до** `Profiler.start`, на `stop` — **после** `Profiler.disable`, чтобы сами вызовы метрик не попали в запись, которую они описывают.
 
+#### `pressure` — сбросить кэши перед замером
+
+GC освобождает только JS-объекты. Декодированные картинки, GPU-текстуры и прочие кэши рендерера Chromium отпускает по сигналу нехватки памяти. Без этого кэш, который ушёл бы под реальным давлением, в `tv_resources` выглядит как утечка.
+
+```
+tv_resources {"action": "start"}
+tv_sequence  {"steps": [...]}                         # сценарий ×N
+tv_profile   {"action": "metrics", "pressure": true}  # GC + critical pressure + 8 с
+tv_resources {"action": "stop"}                       # смотреть last у rssMb / gpuMb
+```
+
+`pressure: true` работает в `metrics`, `start` и `stop` (и в шаге `tv_sequence` `{"metrics": {"pressure": true}}`): `HeapProfiler.collectGarbage`, затем `Memory.simulatePressureNotification {level: "critical"}`, затем 8 с ожидания, потом снимок. В ответе `stop` — `metrics.collectedGarbage: true`. Рост, который пережил `pressure`, — кандидат в утечку. Рост, который после него ушёл, — кэш. Движок без `simulatePressureNotification` даёт `warning`, а не ошибку.
+
+На Tizen 5.5 каждый второй такой сигнал подряд закрывает сокет инспектора. Приложение при этом живёт, pid тот же. Снимок метрик всегда берётся на свежей сессии (реаттач делается сам). Сокет иногда закрывается и позже, уже после ответа. Тогда следующий вызов, попавший на этот момент, один раз падает с `CDP connection closed`, а следующий за ним снова переподключается сам.
+
 **Платформы**: tizen55 (Chromium 69) ✓ и pc ✓ — полный набор из `Performance.getMetrics`. Движок без этого домена (Chromium ≤ 53: webos4, tizen3, webos3) не падает, а переключается на `Memory.getDOMCounters`: `Nodes`, `Documents`, `JSEventListeners` и `Timestamp` из `performance.now()` — именно те счётчики, на которых держится охота за утечкой DOM. В ответе — `warning` о том, что это фолбэк. Чего в нём нет намеренно: `JSHeapUsedSize` (единственный источник — квантованный по 100 КБ `performance.memory`, то есть стабильная ложь вместо честного отсутствия) и layout/style-счётчики (их пришлось бы выводить из счёта событий `Tracing` — другое измерение под тем же именем). Если и `getDOMCounters` нет, `action:"metrics"` честно падает с сообщением, а `start`/`stop` возвращают `metrics: null` плюс `warning` — потерять CPU-профиль из-за отсутствующих метрик нельзя.
 
 В `tv_sequence` — шаг `{"metrics": true}`: им можно обрамить любой кусок сценария, не только тот, что покрыт записью профиля. Diff между двумя такими шагами считает вызывающий.

@@ -47,6 +47,11 @@ const RECORDED_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'cases'
 /** A forced GC on a weak TV with a full heap is not an 8-second operation. */
 const GC_TIMEOUT_MS = 30000;
 /**
+ * After a critical memory-pressure notification the renderer drops its caches asynchronously;
+ * the manual recipe used on Tizen 5.5 / 8.0 waited ~8 s before reading RSS and GPU memory.
+ */
+const PRESSURE_SETTLE_MS = 8000;
+/**
  * A heap snapshot is a full GC plus serialising the whole heap through the socket in
  * thousands of chunks. On a TV with a 100-300MB heap that legitimately takes a minute.
  */
@@ -1102,17 +1107,18 @@ export class DeviceSession {
 	 * it — and not `Performance.getMetrics` or `Tracing` — is what the park gets profiled with.
 	 * Metrics ride along where the engine has them, but their absence must never cost the
 	 * recording: on Chrome 38 the profile is the whole point and metrics are the bonus.
-	 * @param {{samplingIntervalUs?: number, collectGarbage?: boolean}} [opts]
+	 * @param {{samplingIntervalUs?: number, collectGarbage?: boolean, pressure?: boolean}} [opts]
 	 */
 	async profileStart(opts = {}) {
 		if (this._profiling) {
 			const heldMs = Date.now() - this._profiling.startedAt;
 			throw new Error(`profiling already in progress (started ${heldMs}ms ago) — call tv_profile action:stop first`);
 		}
+		// Before taking the connection: pressure may close it (see _applyPressure).
+		const warnings = opts.pressure ? await this._applyPressure() : [];
 		const cdp = await this._cdp();
 		this._profilingLost = false;
 		const interval = Math.min(1000000, Math.max(50, Math.floor(opts.samplingIntervalUs || 1000)));
-		const warnings = [];
 
 		// Before Profiler.start, deliberately: enabling the Performance domain and reading it
 		// takes CDP round-trips, and anything done after `start` lands inside the recording.
@@ -1152,7 +1158,7 @@ export class DeviceSession {
 
 	/**
 	 * Stop the recording, write the raw `.cpuprofile` and return a summary of it.
-	 * @param {{path?: string, sourceMap?: string, topN?: number, collectGarbage?: boolean}} [opts]
+	 * @param {{path?: string, sourceMap?: string, topN?: number, collectGarbage?: boolean, pressure?: boolean}} [opts]
 	 */
 	async profileStopAndSave(opts = {}) {
 		if (!this._profiling) {
@@ -1188,8 +1194,14 @@ export class DeviceSession {
 		const warnings = [];
 
 		// After Profiler.disable, for the same reason the opening snapshot is taken before start:
-		// these round-trips have no business being inside the window they describe.
-		const metricsAfter = await this._metricsOn(cdp, {collectGarbage: opts.collectGarbage})
+		// these round-trips have no business being inside the window they describe. Pressure may
+		// close the socket — the profile is already in hand, so the reading goes to a reattach.
+		let metricsCdp = cdp;
+		if (opts.pressure) {
+			warnings.push(...await this._applyPressure().catch((e) => [`memory pressure failed: ${e.message}`]));
+			metricsCdp = await this._cdp().catch(() => cdp);
+		}
+		const metricsAfter = await this._metricsOn(metricsCdp, {collectGarbage: opts.collectGarbage})
 			.catch((e) => {
 				warnings.push(`metrics unavailable, CPU profile unaffected: ${e.message}`);
 				return null;
@@ -1202,13 +1214,13 @@ export class DeviceSession {
 			const diff = metricsDiff(started.metricsBefore.metrics, metricsAfter.metrics);
 			metrics = {
 				windowSec: windowSecondsOf(diff),
-				collectedGarbage: !!opts.collectGarbage,
+				collectedGarbage: !!(opts.collectGarbage || opts.pressure),
 				values: diff
 			};
 		} else if (metricsAfter) {
 			// Only the closing reading survived — a diff would be a lie, the numbers still aren't.
 			warnings.push('no opening metrics reading, only the final absolute values are reported');
-			metrics = {windowSec: null, collectedGarbage: !!opts.collectGarbage, after: metricsAfter.metrics};
+			metrics = {windowSec: null, collectedGarbage: !!(opts.collectGarbage || opts.pressure), after: metricsAfter.metrics};
 		}
 
 		const saved = saveProfile(profile, {path: opts.path, deviceId: this.cfg.id, now: Date.now()});
@@ -1264,11 +1276,44 @@ export class DeviceSession {
 	 * heavier after browsing" into a number. The full set needs Chromium 60+; an engine without
 	 * the Performance domain (Chromium 47 and down) falls back to DOM counters and says so in a
 	 * warning. Heap bytes are never faked from the quantized `performance.memory`.
-	 * @param {{collectGarbage?: boolean}} [opts]
+	 * @param {{collectGarbage?: boolean, pressure?: boolean}} [opts]
 	 */
 	async metricsSnapshot(opts = {}) {
+		const pressureWarnings = opts.pressure ? await this._applyPressure() : [];
 		const cdp = await this._cdp();
-		return this._metricsOn(cdp, opts);
+		const out = await this._metricsOn(cdp, opts);
+		return pressureWarnings.length ? {...out, warnings: [...pressureWarnings, ...(out.warnings || [])]} : out;
+	}
+
+	/**
+	 * GC, then a critical memory-pressure notification, then the settle wait. GC frees JS objects
+	 * only; decoded images, GPU textures and other renderer caches are let go on pressure —
+	 * without it a cache Chromium would drop reads as a leak in tv_resources.
+	 *
+	 * On Tizen 5.5 every second notification in a row closes the inspector socket (the app lives
+	 * on). So this runs on its own and callers take `this._cdp()` afresh afterwards, which
+	 * reattaches — never read metrics on a connection held from before the call.
+	 * @return {Promise<Array<string>>} warnings
+	 */
+	async _applyPressure() {
+		const cdp = await this._cdp();
+		const warnings = [];
+		try {
+			await cdp.call('HeapProfiler.collectGarbage', {}, GC_TIMEOUT_MS);
+		} catch (e) {
+			warnings.push(`collectGarbage failed (${e.message}) — the numbers still include garbage not yet collected`);
+		}
+		try {
+			await cdp.call('Memory.simulatePressureNotification', {level: 'critical'});
+		} catch (e) {
+			if (cdp.isOpen) {
+				warnings.push(`memory pressure failed (${e.message}) — caches Chromium drops under pressure are still counted`);
+				return warnings;
+			}
+			// The socket closed under the notification: it was delivered, see above.
+		}
+		await sleep(PRESSURE_SETTLE_MS);
+		return warnings;
 	}
 
 	/**

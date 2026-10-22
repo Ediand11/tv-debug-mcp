@@ -206,14 +206,15 @@ const TOOLS = [
 		{expression: str(''), awaitPromise: bool('Default true.')},
 		['expression']),
 	tool('tv_profile',
-		'CPU profile: start, act, stop (.cpuprofile + top functions + metrics diff); action metrics = one reading.',
+		'CPU profile: start, act, stop (.cpuprofile, top functions, metrics diff); metrics = one reading.',
 		{
 			action: en(['start', 'stop', 'metrics'], ''),
 			samplingIntervalUs: int(50, 1000000, 'start: default 1000.'),
 			path: str('stop: .cpuprofile path.'),
 			sourceMap: str('stop: .map of the build.'),
 			topN: int(1, 200, 'stop: default 20.'),
-			collectGarbage: bool('GC first.')
+			collectGarbage: bool('GC first.'),
+			pressure: bool()
 		},
 		['action']),
 	tool('tv_heap',
@@ -507,18 +508,19 @@ async function handleCall(name, args) {
 			const s = sessionFor(args.device);
 			if (args.action === 'start') {
 				return textResult(await s.profileStart({
-					samplingIntervalUs: args.samplingIntervalUs, collectGarbage: args.collectGarbage
+					samplingIntervalUs: args.samplingIntervalUs, collectGarbage: args.collectGarbage, pressure: args.pressure
 				}));
 			}
 			if (args.action === 'stop') {
 				// Deliberately only the file path + the summary: the raw profile is hundreds of
 				// kilobytes of JSON and has no business in a tool response.
 				return textResult(await s.profileStopAndSave({
-					path: args.path, sourceMap: args.sourceMap, topN: args.topN, collectGarbage: args.collectGarbage
+					path: args.path, sourceMap: args.sourceMap, topN: args.topN,
+					collectGarbage: args.collectGarbage, pressure: args.pressure
 				}));
 			}
 			if (args.action === 'metrics') {
-				return textResult(await s.metricsSnapshot({collectGarbage: args.collectGarbage}));
+				return textResult(await s.metricsSnapshot({collectGarbage: args.collectGarbage, pressure: args.pressure}));
 			}
 			return errorResult(`tv_profile needs action "start", "stop" or "metrics", got ${JSON.stringify(args.action)}`);
 		}

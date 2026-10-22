@@ -329,7 +329,7 @@ Steps are objects, one key each:
     {"snapshot": {"detail": "focus"}}
     {"profileStart": {"samplingIntervalUs": 1000}}
     {"profileStop": {"path": "…", "sourceMap": "…", "topN": 20}}
-    {"metrics": true}                              or {"collectGarbage": true}
+    {"metrics": true}                              or {"collectGarbage": true} / {"pressure": true}
 
 \`wait\` / \`expect\` also take \`{"element": …}\` / \`{"elementGone": …}\` / \`{"sceneName": …}\` — names
 from the app profile registry, echoed back as \`resolvedFrom\`. \`expect\` defaults to a 5s timeout
@@ -366,6 +366,12 @@ Record a JS CPU profile on the device, and/or read memory & layout metrics.
   (\`topN\`, default 20). On a minified production build pass \`sourceMap\` (the app.js.map of THAT
   build) to get readable names.
 * \`metrics\` — one Performance.getMetrics reading, no recording.
+* \`pressure:true\` (metrics, start, stop) — before the reading: GC, then
+  Memory.simulatePressureNotification critical, then an 8 s wait. Renderer caches (decoded
+  images, GPU textures) go on pressure, not on GC — read tv_resources after it: growth that
+  survives is a leak candidate, growth that went away was cache. On Tizen 5.5 every other
+  notification closes the inspector socket (the app lives on): the reading is taken on a fresh
+  reattach, but a close that lands later can fail the next call once with "CDP connection closed".
 
 start and stop each take a Performance.getMetrics reading, so stop reports before/after/diff per
 metric (JSHeapUsedSize, Nodes, JSEventListeners, LayoutCount, RecalcStyleCount, cumulative Duration
@@ -420,7 +426,8 @@ Tizen section below.
 
 Scenario: \`start\` → act (tv_press / tv_menu / tv_sequence, or a human with the remote) → \`stop\`.
 Pair it with tv_profile metrics: a JS heap that stays flat while \`app.rssMb.delta\` keeps growing
-is native memory (images, video), not a JS leak.
+is native memory (images, video), not a JS leak. To tell a leak from a cache, end the scenario
+with tv_profile action:"metrics" pressure:true and look at \`last\`: caches drop under pressure.
 
 Answer of read/stop: \`{ok, device, intervalSec, elapsedSec, running, window: {from, to},
 system: {samples, memTotalMb, cpuPct, memAvailableMb, memUsedMb, swapUsedMb},
