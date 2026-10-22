@@ -87,6 +87,23 @@ export function windowSecondsOf(diff) {
 	return t && typeof t.diff === 'number' ? round(t.diff, 3) : null;
 }
 
+/**
+ * The per-session counters — LayoutCount, RecalcStyleCount and every *Duration — start from zero
+ * on a new CDP session (seen on Tizen 5.5: TaskDuration 3.34 → 0.007 after a reattach), so a
+ * diff across a reattach is garbage. Their diff becomes null; before/after stay as reported.
+ * Absolute readings (Nodes, JSHeapUsedSize, Timestamp…) are untouched.
+ * @param {Object<string, {before: *, after: *, diff: ?number}>} diff output of metricsDiff
+ * @return {Object<string, {before: *, after: *, diff: ?number}>}
+ */
+export function dropSessionCounters(diff) {
+	/** @type {Object<string, {before: *, after: *, diff: ?number}>} */
+	const out = {};
+	for (const [name, v] of Object.entries(diff || {})) {
+		out[name] = /(Count|Duration)$/.test(name) ? {...v, diff: null} : v;
+	}
+	return out;
+}
+
 function round(n, digits) {
 	const f = Math.pow(10, digits);
 	return Math.round((Number(n) || 0) * f) / f;

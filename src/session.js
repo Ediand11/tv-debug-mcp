@@ -32,7 +32,7 @@ import {pollUntil, pollRequests, describeCondition} from './wait.js';
 import {selectRequests, toListEntry, buildCurl, buildHar, capBody, HAR_BODY_TOTAL_LIMIT} from './network.js';
 import {summarizeProfile, applySourceMap, saveProfile} from './profile.js';
 import {summarizeHeapSnapshot} from './heap.js';
-import {metricsToMap, metricsDiff, windowSecondsOf} from './metrics.js';
+import {metricsToMap, metricsDiff, windowSecondsOf, dropSessionCounters} from './metrics.js';
 import {capEvalValue} from './render.js';
 import {PKG_VERSION} from './version.js';
 
@@ -1211,7 +1211,11 @@ export class DeviceSession {
 		}
 		let metrics = null;
 		if (started.metricsBefore && metricsAfter) {
-			const diff = metricsDiff(started.metricsBefore.metrics, metricsAfter.metrics);
+			let diff = metricsDiff(started.metricsBefore.metrics, metricsAfter.metrics);
+			if (metricsCdp !== cdp) {
+				diff = dropSessionCounters(diff);
+				warnings.push('pressure closed the CDP session, the closing reading is from a reattach: *Count / *Duration counters restarted from zero, their diff is null');
+			}
 			metrics = {
 				windowSec: windowSecondsOf(diff),
 				collectedGarbage: !!(opts.collectGarbage || opts.pressure),

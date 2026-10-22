@@ -372,6 +372,8 @@ Record a JS CPU profile on the device, and/or read memory & layout metrics.
   survives is a leak candidate, growth that went away was cache. On Tizen 5.5 every other
   notification closes the inspector socket (the app lives on): the reading is taken on a fresh
   reattach, but a close that lands later can fail the next call once with "CDP connection closed".
+  When that reattach happens in stop, the per-session *Count / *Duration counters restarted from
+  zero: their diff is null (with a warning); absolute metrics and windowSec stay valid.
 
 start and stop each take a Performance.getMetrics reading, so stop reports before/after/diff per
 metric (JSHeapUsedSize, Nodes, JSEventListeners, LayoutCount, RecalcStyleCount, cumulative Duration

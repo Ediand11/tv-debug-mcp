@@ -35,7 +35,7 @@ import {SourceMapGenerator} from 'source-map-js';
 
 import {summarizeProfile, applySourceMap} from '../src/profile.js';
 import {summarizeHeapSnapshot, diffHeapSummaries} from '../src/heap.js';
-import {metricsToMap, metricsDiff, windowSecondsOf} from '../src/metrics.js';
+import {metricsToMap, metricsDiff, windowSecondsOf, dropSessionCounters} from '../src/metrics.js';
 import {CdpSession} from '../src/cdp.js';
 import {WebSocketServer} from 'ws';
 import {selectRequests, toListEntry, buildCurl, buildHar, capBody, compileUrlPattern} from '../src/network.js';
@@ -275,6 +275,13 @@ function metricsChecks() {
 		Object.keys(diff).length === 8, Object.keys(diff).join(','));
 	check('the window length comes from the engine Timestamp',
 		windowSecondsOf(diff) === 11.75, String(windowSecondsOf(diff)));
+	const reattached = dropSessionCounters(metricsDiff(
+		{LayoutCount: 5, TaskDuration: 3.34, Nodes: 1200, Timestamp: 10},
+		{LayoutCount: 0, TaskDuration: 0.007, Nodes: 1100, Timestamp: 20}));
+	check('across a reattach: per-session *Count / *Duration lose the diff, absolutes and the window keep it',
+		reattached.LayoutCount.diff === null && reattached.TaskDuration.diff === null && reattached.TaskDuration.after === 0.007 &&
+		reattached.Nodes.diff === -100 && windowSecondsOf(reattached) === 10,
+		JSON.stringify(reattached));
 	check('no Timestamp means no invented window',
 		windowSecondsOf(metricsDiff({Nodes: 1}, {Nodes: 2})) === null);
 	check('an empty pair of readings diffs to nothing instead of throwing',
