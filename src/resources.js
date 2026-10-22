@@ -1,9 +1,14 @@
 // tv_resources — CPU and memory of the whole TV and of the app under test, sampled on the TV
-// itself (webOS only). This is the half the CDP side cannot see: tv_profile/tv_heap report the
-// JS heap and the DOM, while the renderer's RSS also holds decoded images, layer textures and
+// itself (webOS and Tizen). This is the half the CDP side cannot see: tv_profile/tv_heap report
+// the JS heap and the DOM, while the renderer's RSS also holds decoded images, layer textures and
 // <video> buffers, and the TV's free memory is what decides when the system kills the app.
 //
-// Same data source as LG's Resource Monitor GUI: `ares-device --resource-monitor` keeps one
+// Tizen has no resource monitor to drive, but the app can read its own /proc through
+// `tizen.filesystem.openFile` (Tizen 5.0+; the older `resolve().readAsText` returns '' on /proc,
+// XHR on file:///proc fails). So there the sampler is a host timer doing one Runtime.evaluate per
+// tick over the app's CDP session — see the Tizen section at the bottom.
+//
+// webOS: same data source as LG's Resource Monitor GUI: `ares-device --resource-monitor` keeps one
 // dev-mode SSH session and reads /proc/stat, /proc/<pid>/stat, `ps` and `free -k` every
 // interval; the app's pid comes from `applicationManager/dev/running` (`webprocessid` for a
 // web app). ares prints the system and the per-app view in separate modes, so two children are
@@ -288,20 +293,28 @@ function childNote(c) {
 /**
  * @param {import('./config.js').DeviceConfig} cfg
  * @param {{appId?: string, intervalSec?: number, path?: string}} [opts]
+ * @param {?function(string): Promise<*>} [evaluate] Tizen only: runs JS in the app's page
  */
-export async function resourcesStart(cfg, opts = {}) {
-	if (cfg.platform !== 'webos') {
-		throw new Error(`tv_resources is webOS-only (it drives \`ares-device --resource-monitor\` over the dev-mode SSH); "${cfg.id}" is ${cfg.platform}. For JS heap / DOM use tv_profile action:"metrics" or tv_heap`);
+export async function resourcesStart(cfg, opts = {}, evaluate = null) {
+	if (cfg.platform !== 'webos' && cfg.platform !== 'tizen') {
+		throw new Error(`tv_resources supports webOS and Tizen only; "${cfg.id}" is ${cfg.platform}. For JS heap / DOM use tv_profile action:"metrics" or tv_heap`);
 	}
 	const running = monitors.get(cfg.id);
 	if (running) {
 		throw new Error(`a resource monitor is already running on "${cfg.id}" since ${new Date(running.startedAt).toISOString()} — read or stop it first`);
 	}
-	const intervalSec = opts.intervalSec === undefined ? 1 : Number(opts.intervalSec);
+	const intervalSec = opts.intervalSec === undefined
+		? (cfg.platform === 'tizen' ? TIZEN_DEFAULT_INTERVAL_SEC : 1)
+		: Number(opts.intervalSec);
 	if (!(intervalSec >= MIN_INTERVAL_SEC && intervalSec <= MAX_INTERVAL_SEC)) {
 		throw new Error(`intervalSec must be ${MIN_INTERVAL_SEC}..${MAX_INTERVAL_SEC}, got ${opts.intervalSec}`);
 	}
 	const appId = opts.appId || cfg.appId;
+	if (cfg.platform === 'tizen') {
+		// /proc/self is whatever app the CDP session is attached to — an appId override would
+		// only relabel it.
+		return tizenStart(cfg, cfg.appId, intervalSec, evaluate);
+	}
 	const dir = resolve(opts.path || process.env.TMPDIR || '/tmp');
 	mkdirSync(dir, {recursive: true});
 	const stamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -378,11 +391,16 @@ function report(mon, extra) {
 
 /** Summary so far; the samplers keep running. */
 export function resourcesRead(cfg) {
-	return report(monitorFor(cfg), {running: true});
+	const mon = monitorFor(cfg);
+	return mon.tizen ? tizenReport(mon, true) : report(mon, {running: true});
 }
 
 export async function resourcesStop(cfg) {
 	const mon = monitorFor(cfg);
+	if (mon.tizen) {
+		await stopMonitor(mon);
+		return tizenReport(mon, false);
+	}
 	const notes = [childNote(mon.system), childNote(mon.app)];
 	await stopMonitor(mon);
 	const out = report(mon, {running: false, stopped: true});
@@ -396,7 +414,254 @@ export async function resourcesStop(cfg) {
 
 async function stopMonitor(mon) {
 	monitors.delete(mon.deviceId);
+	if (mon.tizen) {
+		clearInterval(mon.tizen.timer);
+		return;
+	}
 	await Promise.all([stopChild(mon.system.proc), stopChild(mon.app.proc)]);
+}
+
+// --- Tizen ---------------------------------------------------------------------------------
+//
+// One Runtime.evaluate per tick returns the raw text of the app's own /proc files and of the
+// Mali GPU table; the host parses it (pure, tested offline). Checked on Tizen 5.5 and 8.0:
+// - PSS comes from /proc/self/smaps_rollup — Tizen 8 has it, 5.5 does not. Summing
+//   /proc/self/smaps instead is ~8 MB of text per read, not something for a timer, so on 5.5
+//   PSS is simply missing.
+// - GPU memory is not in the process's smaps at all: /sys/kernel/debug/mali0/gpu_memory lists
+//   it per pid, in KB. It is reported next to RSS/PSS because that is where Tizen video and
+//   texture growth shows up.
+// - CPU % is utime+stime of /proc/self/stat against the aggregate `cpu` line of /proc/stat, both
+//   in clock ticks — a share of ALL cores, like ares on webOS. The first sample has no CPU.
+// - Other processes' /proc/<pid> are closed to the app, so this is the app plus system totals.
+// The read runs on the app's main thread (a few tens of KB of text), hence the 2 s default, and
+// timestamps are the host clock.
+
+const TIZEN_DEFAULT_INTERVAL_SEC = 2;
+
+const TIZEN_FILES = [
+	['status', '/proc/self/status', 4000],
+	['stat', '/proc/self/stat', 1000],
+	['cpu', '/proc/stat', 300],
+	['meminfo', '/proc/meminfo', 6000],
+	['gpu', '/sys/kernel/debug/mali0/gpu_memory', 20000],
+	['rollup', '/proc/self/smaps_rollup', 3000]
+];
+
+/** Page-side, ES5. A file that cannot be read comes back null: PSS and GPU are optional. */
+export const TIZEN_READ_JS = '(function(){var fs=window.tizen&&tizen.filesystem;' +
+	'if(!fs||!fs.openFile)return JSON.stringify({noOpenFile:true});' +
+	'var f=' + JSON.stringify(TIZEN_FILES) + ',o={},i,h;' +
+	'for(i=0;i<f.length;i++){h=null;' +
+	'try{h=fs.openFile(f[i][1],"r");o[f[i][0]]=h.readString(f[i][2]);}catch(e){o[f[i][0]]=null;}' +
+	'if(h){try{h.close();}catch(e){}}}' +
+	'return JSON.stringify(o);})()';
+
+/** `Name:   123 kB` / `Pid:	123` → 123 */
+function procField(text, name) {
+	const m = new RegExp(`^${name}:\\s*(\\d+)`, 'm').exec(text || '');
+	return m ? +m[1] : null;
+}
+
+/**
+ * The app's row of mali0/gpu_memory: `name  pid  gpu_mem  max_gpu_mem  [tid]`, KB. The leftmost
+ * run of three numbers is pid/gpu/max whether or not the trailing column is there.
+ * @param {?string} text
+ * @param {?number} pid
+ * @return {?number}
+ */
+export function maliGpuKb(text, pid) {
+	if (!text || pid === null) {
+		return null;
+	}
+	for (const line of text.split('\n')) {
+		const m = /\s(\d+)\s+(\d+)\s+(\d+)(?:\s+\d+)?\s*$/.exec(line);
+		if (m && +m[1] === pid) {
+			return +m[2];
+		}
+	}
+	return null;
+}
+
+/**
+ * One tick of TIZEN_READ_JS output → numbers (KB, clock ticks).
+ * @param {Object<string, ?string>} raw
+ * @param {string} time `YYYY-MM-DD HH:MM:SS`
+ */
+export function parseTizenSample(raw, time) {
+	const status = raw.status || '';
+	const mem = raw.meminfo || '';
+	const pid = procField(status, 'Pid');
+	const memTotalKb = procField(mem, 'MemTotal');
+	const memAvailableKb = procField(mem, 'MemAvailable');
+	const swapTotal = procField(mem, 'SwapTotal');
+	const swapFree = procField(mem, 'SwapFree');
+	// user nice system idle iowait irq softirq steal; guest time is already inside user
+	const cpuLine = /^cpu\s+(.*)$/m.exec(raw.cpu || '');
+	const cpu = cpuLine ? cpuLine[1].trim().split(/\s+/).map(Number) : [];
+	// comm may hold spaces and parens, so fields are counted from the last ')': utime and stime
+	// are fields 14 and 15, i.e. 11 and 12 after it (state is field 3)
+	const stat = raw.stat || '';
+	const rest = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+	return {
+		time, pid,
+		rssKb: procField(status, 'VmRSS'),
+		swapKb: procField(status, 'VmSwap'),
+		pssKb: procField(raw.rollup, 'Pss'),
+		pssAnonKb: procField(raw.rollup, 'Pss_Anon'),
+		gpuKb: maliGpuKb(raw.gpu, pid),
+		appTicks: rest.length > 12 ? +rest[11] + +rest[12] : null,
+		cpuTotal: cpu.length >= 4 ? cpu.slice(0, 8).reduce((a, b) => a + b, 0) : null,
+		cpuIdle: cpu.length >= 4 ? cpu[3] + (cpu[4] || 0) : null,
+		memTotalKb, memAvailableKb,
+		memUsedKb: memTotalKb !== null && memAvailableKb !== null ? memTotalKb - memAvailableKb : null,
+		swapUsedKb: swapTotal !== null && swapFree !== null ? swapTotal - swapFree : null,
+		cmaFreeKb: procField(mem, 'CMAFree')
+	};
+}
+
+/**
+ * The answer of read/stop on Tizen, in the webOS shape plus pssMb/pssAnonMb/gpuMb/swapMb (app)
+ * and cmaFreeMb (system — the pool the hardware video decoder allocates from).
+ * @param {{samples: Array<object>, appId: string}} input parseTizenSample outputs, in order
+ */
+export function summarizeTizen({samples, appId}) {
+	const t = samples.map((s, i) => {
+		const p = samples[i - 1];
+		const dt = p && s.cpuTotal !== null && p.cpuTotal !== null ? s.cpuTotal - p.cpuTotal : 0;
+		return {
+			...s,
+			cpuPct: dt > 0 ? round(100 * (dt - (s.cpuIdle - p.cpuIdle)) / dt) : null,
+			appCpuPct: dt > 0 && s.pid === p.pid && s.appTicks !== null && p.appTicks !== null
+				? round(100 * (s.appTicks - p.appTicks) / dt)
+				: null
+		};
+	});
+	const pids = [...new Set(t.map((s) => s.pid).filter((p) => p !== null))];
+	const last = t[t.length - 1];
+	const out = {
+		window: t.length ? {from: t[0].time, to: last.time} : null,
+		system: {
+			samples: t.length,
+			memTotalMb: last && last.memTotalKb !== null ? round(last.memTotalKb / 1024) : null,
+			cpuPct: seriesStats(t, 'cpuPct'),
+			memAvailableMb: seriesStats(t, 'memAvailableKb', 1024),
+			memUsedMb: seriesStats(t, 'memUsedKb', 1024),
+			swapUsedMb: seriesStats(t, 'swapUsedKb', 1024),
+			cmaFreeMb: seriesStats(t, 'cmaFreeKb', 1024)
+		},
+		app: {
+			id: appId,
+			samples: t.length,
+			pids,
+			cpuPct: seriesStats(t, 'appCpuPct'),
+			rssMb: seriesStats(t, 'rssKb', 1024),
+			pssMb: seriesStats(t, 'pssKb', 1024),
+			pssAnonMb: seriesStats(t, 'pssAnonKb', 1024),
+			gpuMb: seriesStats(t, 'gpuKb', 1024),
+			swapMb: seriesStats(t, 'swapKb', 1024)
+		}
+	};
+	const warnings = [];
+	if (pids.length > 1) {
+		warnings.push(`${appId} changed pid during the window (${pids.join(' → ')}): the app was restarted or killed — figures span two processes`);
+	}
+	if (t.length && out.app.pssMb === null) {
+		warnings.push('no /proc/self/smaps_rollup on this firmware (Tizen 5.5 has none, 8.0 has) — pssMb is missing, RSS and GPU are not');
+	}
+	if (t.length && out.app.gpuMb === null) {
+		warnings.push('no GPU figure: /sys/kernel/debug/mali0/gpu_memory is not readable here or has no row for the app pid');
+	}
+	if (warnings.length) {
+		out.warnings = warnings;
+	}
+	return out;
+}
+
+const hostTime = () => {
+	const d = new Date();
+	return new Date(d - d.getTimezoneOffset() * 60000).toISOString().slice(0, 19).replace('T', ' ');
+};
+
+/**
+ * @param {object} mon
+ * @param {boolean} [strict] throw instead of counting the failure — the first tick, inside start
+ */
+async function tizenTick(mon, strict = false) {
+	const t = mon.tizen;
+	if (t.busy) {
+		return; // a slow TV: skip the tick rather than pile evaluates up
+	}
+	t.busy = true;
+	try {
+		const raw = JSON.parse(await t.evaluate(TIZEN_READ_JS));
+		if (raw.noOpenFile) {
+			throw new Error('tizen.filesystem.openFile is missing — reading /proc from the page needs Tizen 5.0+');
+		}
+		if (!raw.status) {
+			throw new Error('/proc/self/status is not readable from the page');
+		}
+		t.samples.push(parseTizenSample(raw, hostTime()));
+	} catch (e) {
+		if (strict) {
+			throw e;
+		}
+		t.failed++;
+		t.lastError = e.message;
+	} finally {
+		t.busy = false;
+	}
+}
+
+async function tizenStart(cfg, appId, intervalSec, evaluate) {
+	if (!evaluate) {
+		throw new Error('tv_resources on Tizen reads the app page over CDP, but no page session was given');
+	}
+	const mon = {
+		deviceId: cfg.id, appId, intervalSec, startedAt: Date.now(),
+		tizen: {timer: null, samples: [], failed: 0, lastError: null, busy: false, evaluate}
+	};
+	// Claimed before the first await so two concurrent starts cannot both pass the check.
+	monitors.set(cfg.id, mon);
+	try {
+		await tizenTick(mon, true);
+	} catch (e) {
+		if (monitors.get(cfg.id) === mon) {
+			monitors.delete(cfg.id);
+		}
+		throw new Error(`resource monitor did not start on "${cfg.id}": ${e.message}`);
+	}
+	if (monitors.get(cfg.id) !== mon) {
+		// stop arrived during the first tick: arming the timer now would orphan it
+		throw new Error(`resource monitor on "${cfg.id}" was stopped while starting`);
+	}
+	mon.tizen.timer = setInterval(() => tizenTick(mon), intervalSec * 1000);
+	mon.tizen.timer.unref();
+	const now = mon.tizen.samples[0];
+	const mb = (kb) => (kb === null ? null : round(kb / 1024));
+	return {
+		ok: true, device: cfg.id, appId, intervalSec,
+		now: {
+			memAvailableMb: mb(now.memAvailableKb), memTotalMb: mb(now.memTotalKb),
+			rssMb: mb(now.rssKb), pssMb: mb(now.pssKb), gpuMb: mb(now.gpuKb)
+		},
+		note: 'sampling over the app\'s CDP session; act, then tv_resources read (keeps going) or stop'
+	};
+}
+
+function tizenReport(mon, running) {
+	const t = mon.tizen;
+	const summary = summarizeTizen({samples: t.samples, appId: mon.appId});
+	if (t.failed) {
+		// A TV that went away mid-window leaves a summary that silently ends early — say so.
+		summary.warnings = [...(summary.warnings || []), `${t.failed} sample(s) failed, last: ${t.lastError}`];
+	}
+	return {
+		ok: true, device: mon.deviceId, intervalSec: mon.intervalSec,
+		elapsedSec: Math.round((Date.now() - mon.startedAt) / 1000),
+		running,
+		...summary
+	};
 }
 
 /** For server shutdown: no ares-device (and its SSH session to the TV) outlives the MCP. */
@@ -408,6 +673,9 @@ export async function stopAllResourceMonitors() {
 // kill is synchronous and still allowed in an 'exit' handler.
 process.on('exit', () => {
 	for (const mon of monitors.values()) {
+		if (mon.tizen) {
+			continue; // a host timer, gone with the process
+		}
 		for (const c of [mon.system, mon.app]) {
 			try {
 				c.proc.kill('SIGTERM');

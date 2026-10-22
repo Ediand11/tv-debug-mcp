@@ -228,7 +228,7 @@ const TOOLS = [
 		},
 		['action']),
 	tool('tv_resources',
-		'webOS: TV + app CPU/memory sampled on-device. start, act, read|stop.',
+		'TV + app CPU/memory on-device (webOS, Tizen). start, act, read|stop.',
 		// appId and path (CSV dir) are accepted too, documented only in tv-debug://docs/tv_resources:
 		// rare overrides, and the whole tools/list has to stay under 10 KB.
 		{
@@ -538,11 +538,21 @@ async function handleCall(name, args) {
 			return errorResult(`tv_heap needs action "snapshot" or "diff", got ${JSON.stringify(args.action)}`);
 		}
 		case 'tv_resources': {
-			// No DeviceSession: the samplers talk to the TV over their own SSH, not CDP, and must
-			// not launch the app or wait for a debug attach.
+			// webOS: no DeviceSession — the samplers talk to the TV over their own SSH and must not
+			// launch the app or wait for a debug attach. Tizen reads /proc from the launched app's
+			// page; the session is looked up per tick so a devices.json reload cannot strand it.
 			const cfg = getDevice(args.device);
 			if (args.action === 'start') {
-				return textResult(await resourcesStart(cfg, {appId: args.appId, intervalSec: args.intervalSec, path: args.path}));
+				const evaluate = cfg.platform === 'tizen' ? (js) => {
+					// Never reconnect from a tick: attach falls back to a debug launch when the app
+					// is gone, and the sampler would cold-restart the app whose death it measures.
+					const s = sessionFor(cfg.id);
+					if (!s.cdp || !s.cdp.isOpen) {
+						throw new Error(`no live CDP session on "${cfg.id}" — tv_launch first (the sampler never reconnects or relaunches by itself)`);
+					}
+					return s.evaluate(js, false);
+				} : null;
+				return textResult(await resourcesStart(cfg, {appId: args.appId, intervalSec: args.intervalSec, path: args.path}, evaluate));
 			}
 			if (args.action === 'read') {
 				return textResult(resourcesRead(cfg));

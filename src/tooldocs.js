@@ -403,11 +403,12 @@ ${COMMON}`,
 
 	tv_resources: `# tv_resources
 
-webOS only. CPU % and memory of the whole TV and of the app under test, sampled on the TV — the
-half tv_profile / tv_heap cannot see: the renderer's RSS (decoded images, layer textures, <video>
-buffers on top of the JS heap) and how much memory the system has left before it starts killing
-apps. Same data as LG's Resource Monitor: it runs \`ares-device --resource-monitor\` over the
-dev-mode SSH. Needs no tv_launch and does not touch the CDP session.
+webOS and Tizen. CPU % and memory of the whole TV and of the app under test, sampled on the TV —
+the half tv_profile / tv_heap cannot see: the renderer's RSS (decoded images, layer textures,
+<video> buffers on top of the JS heap) and how much memory the system has left before it starts
+killing apps. webOS: same data as LG's Resource Monitor — it runs \`ares-device --resource-monitor\`
+over the dev-mode SSH, needs no tv_launch and does not touch the CDP session. Tizen: see the
+Tizen section below.
 
 * \`start\` — spawns two background samplers (\`ares-device -r\` and \`-r -id <appId>\`), each writing
   a CSV (\`path\` = directory, default TMPDIR), and returns once the first system sample is in, with
@@ -432,6 +433,26 @@ system memory is \`free -k\` (memAvailableMb falls back to the "-/+ buffers/cach
 that load lands in the system CPU, not the app's. More than one entry in \`app.pids\` means the app
 was restarted or killed mid-window. No app samples means it was not running, or
 applicationManager/dev/running (the only way ares maps an app id to a pid) does not list it.
+
+## Tizen
+
+Needs tv_launch first: a host timer runs one Runtime.evaluate per tick on the app's page, which
+reads its own /proc through \`tizen.filesystem.openFile\` (Tizen 5.0+; below that \`start\` fails).
+\`intervalSec\` defaults to 2 — the read runs on the app's main thread and lands in its CPU. No CSV:
+samples stay in the MCP, \`csv\` is absent from the answer. The sampler never reconnects or relaunches:
+while the CDP session is down its ticks fail (counted in \`warnings\`) until any other tool call
+reattaches. \`appId\` is ignored — /proc/self is the app the session is attached to.
+
+Same answer shape, plus \`app: {pssMb, pssAnonMb, gpuMb, swapMb}\` and \`system.cmaFreeMb\`:
+* rssMb / swapMb — /proc/self/status. pssMb / pssAnonMb — /proc/self/smaps_rollup, which Tizen 8
+  has and 5.5 does not (then null, with a warning).
+* gpuMb — the app's row of /sys/kernel/debug/mali0/gpu_memory. GPU memory is NOT in RSS/PSS:
+  texture and video growth on Tizen shows up here.
+* cmaFreeMb — /proc/meminfo CMAFree, the pool the hardware video decoder allocates from.
+* memUsedMb = MemTotal − MemAvailable. CPU % = utime+stime of /proc/self/stat (app) and busy ticks
+  of the \`cpu\` line of /proc/stat (system) over all ticks of all cores; the first sample has none.
+* Times are the host clock. A relaunch shows as a second pid; ticks that failed mid-window (session
+  lost, TV off) are counted in \`warnings\`.
 ${COMMON}`
 };
 

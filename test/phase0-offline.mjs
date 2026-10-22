@@ -48,7 +48,10 @@ import {Timeline, compileCase, renderCase, slugify} from '../src/recorder.js';
 import {reverseKeyMap, keyNameFor} from '../src/keymaps.js';
 import {videoStateJs, videoSampleStartJs, videoSampleFinishJs, pressJs} from '../src/inject.js';
 import {capEvalValue, renderSnapshotText, renderStateText} from '../src/render.js';
-import {splitCsvLine, parseSystemCsv, parseAppCsv, seriesStats, summarizeResources} from '../src/resources.js';
+import {
+	splitCsvLine, parseSystemCsv, parseAppCsv, seriesStats, summarizeResources,
+	maliGpuKb, parseTizenSample, summarizeTizen, TIZEN_READ_JS, resourcesStart, resourcesStop
+} from '../src/resources.js';
 
 /**
  * Anything page-side must stay ES5 — see the header of src/inject.js. Cheap syntactic guard,
@@ -1385,6 +1388,78 @@ function resourcesChecks() {
 	check('summary: an app that never showed up is a warning, not empty numbers',
 		none.app.samples === 0 && none.app.rssMb === null && (none.warnings || []).some((w) => /no samples/.test(w)),
 		JSON.stringify(none.app));
+
+	console.log('\n--- resource monitor: Tizen /proc ---');
+	// Text as a Tizen 5.5 TV returns it, trimmed to the lines that matter.
+	const tzStatus = (pid, rss) => `Name:\tcom.app\nState:\tR (running)\nPid:\t${pid}\nPPid:\t369\nTracerPid:\t0\nVmHWM:\t  200288 kB\nVmRSS:\t  ${rss} kB\nVmSwap:\t    8412 kB\n`;
+	const tzStat = (pid, utime, stime) => `${pid} (com.app) R 369 ${pid} ${pid} 0 -1 4194560 123286 1647 2404 0 ${utime} ${stime} 0 2 20 0 63 0\n`;
+	const tzCpu = (busy, idle) => `cpu  ${busy} 0 0 ${idle} 0 0 0 0 0 0\ncpu0 1 0 0 1 0 0 0 0 0 0\n`;
+	const tzMem = (avail) => `MemTotal:        1474732 kB\nMemFree:          201004 kB\nMemAvailable:     ${avail} kB\nSwapTotal:        958400 kB\nSwapFree:         220572 kB\nCMATotal:         200704 kB\nCMAFree:          116828 kB\n`;
+	const tzGpu = (pid, kb) => '  Name (:Kbytes)             pid         gpu_mem     max_gpu_mem    \n' +
+		'===================================================================\n' +
+		`com.app                      ${pid}        ${kb}       43496            3777      \n` +
+		'launchpad-loade              1213        480         480              1213      \n' +
+		'  gpu_mem_total         160120         \n';
+	const raw = (o) => ({status: tzStatus(o.pid, o.rss), stat: tzStat(o.pid, o.ut, o.st), cpu: tzCpu(o.busy, o.idle),
+		meminfo: tzMem(o.avail), gpu: tzGpu(o.pid, o.gpu), rollup: o.rollup || null});
+	const s1 = parseTizenSample(raw({pid: 3651, rss: 184320, ut: 3346, st: 629, busy: 1000, idle: 9000, avail: 487060, gpu: 43080}), '2026-10-22 12:00:01');
+	check('Tizen: status / meminfo / stat fields land in the right places',
+		s1.pid === 3651 && s1.rssKb === 184320 && s1.swapKb === 8412 && s1.appTicks === 3975 && s1.cpuTotal === 10000 &&
+		s1.cpuIdle === 9000 && s1.memAvailableKb === 487060 && s1.memUsedKb === 1474732 - 487060 &&
+		s1.swapUsedKb === 958400 - 220572 && s1.cmaFreeKb === 116828,
+		JSON.stringify(s1));
+	check('Tizen: the GPU row is matched by pid, not by position', s1.gpuKb === 43080 && maliGpuKb(tzGpu(3651, 1), 1213) === 480,
+		String(s1.gpuKb));
+	check('Tizen: no GPU row for the pid, an unreadable table or no pid is null',
+		maliGpuKb(tzGpu(1, 1), 99) === null && maliGpuKb(null, 1) === null && maliGpuKb(tzGpu(1, 1), null) === null);
+	check('Tizen: a comm with spaces and parens does not shift utime/stime',
+		parseTizenSample({stat: '42 (a (b) c) S 1 2 3 4 5 6 7 8 9 10 100 50 0'}, 't').appTicks === 150);
+	check('Tizen: PSS comes from smaps_rollup and Pss_Anon is not mistaken for Pss',
+		parseTizenSample({rollup: 'Rss:  9000 kB\nPss:   7000 kB\nPss_Anon:  5000 kB\n'}, 't').pssKb === 7000 &&
+		parseTizenSample({rollup: 'Pss_Anon:  5000 kB\nPss:   7000 kB\n'}, 't').pssAnonKb === 5000);
+
+	const s2 = parseTizenSample(raw({pid: 3651, rss: 204800, ut: 3446, st: 629, busy: 1300, idle: 9700, avail: 435200, gpu: 53320}), '2026-10-22 12:00:03');
+	const s3 = parseTizenSample(raw({pid: 4000, rss: 102400, ut: 10, st: 0, busy: 1400, idle: 10600, avail: 600000, gpu: 10240}), '2026-10-22 12:00:05');
+	const tz = summarizeTizen({samples: [s1, s2], appId: 'com.app'});
+	// tick 1→2: 1000 ticks total, 300 busy, app 100
+	check('Tizen: CPU is busy ticks over all ticks, from the second sample on',
+		tz.system.cpuPct.first === 30 && tz.system.cpuPct.max === 30 && tz.app.cpuPct.first === 10,
+		JSON.stringify([tz.system.cpuPct, tz.app.cpuPct]));
+	check('Tizen: memory series in MB — RSS, GPU, CMA, system',
+		tz.app.rssMb.first === 180 && tz.app.rssMb.delta === 20 && tz.app.gpuMb.delta === 10 &&
+		tz.system.cmaFreeMb.last === 114.1 && tz.system.memAvailableMb.last === 425 && tz.system.memTotalMb === 1440.2,
+		JSON.stringify(tz.app));
+	check('Tizen: no smaps_rollup is a PSS warning, not zeros',
+		tz.app.pssMb === null && (tz.warnings || []).some((w) => /smaps_rollup/.test(w)), JSON.stringify(tz.warnings));
+	const restarted = summarizeTizen({samples: [s1, s2, s3], appId: 'com.app'});
+	check('Tizen: a new pid is a restart warning, and no app CPU is computed across it',
+		restarted.app.pids.join() === '3651,4000' && (restarted.warnings || []).some((w) => /changed pid/.test(w)) &&
+		restarted.app.cpuPct.last === 10 && restarted.system.cpuPct.last === 10,
+		JSON.stringify([restarted.app.cpuPct, restarted.system.cpuPct]));
+	const empty = summarizeTizen({samples: [], appId: 'com.app'});
+	check('Tizen: no samples is an empty summary without fake warnings',
+		empty.window === null && empty.app.rssMb === null && !empty.warnings, JSON.stringify(empty));
+	check('Tizen: the page-side reader is ES5 and closes every handle',
+		!/=>|\b(let|const)\b|`/.test(TIZEN_READ_JS) && /h\.close\(\)/.test(TIZEN_READ_JS));
+}
+
+/** tv_resources on Tizen: a stop that lands during start's first tick must not orphan the timer. */
+async function tizenStartStopRaceChecks() {
+	const cfg = {id: 'race', platform: 'tizen', appId: 'com.app'};
+	let calls = 0;
+	const evaluate = async () => {
+		calls++;
+		await sleep(150);
+		return JSON.stringify({status: 'Pid:\t1\nVmRSS:\t1024 kB\n'});
+	};
+	const starting = resourcesStart(cfg, {intervalSec: 1}, evaluate).then(() => null, (e) => e);
+	await sleep(20);
+	await resourcesStop(cfg);
+	const err = await starting;
+	const after = calls;
+	await sleep(1300);
+	check('Tizen: stop during the first tick fails the start and leaves no timer behind',
+		!!err && /stopped while starting/.test(err.message) && calls === after, `${err && err.message}; calls ${after} → ${calls}`);
 }
 
 async function main() {
@@ -1400,6 +1475,7 @@ async function main() {
 	snapshotChecks();
 	recorderChecks();
 	resourcesChecks();
+	await tizenStartStopRaceChecks();
 
 	console.log('\n--- config and failure isolation ---');
 	// A PATH with node but no `sdb`/`tizen`, so tool calls have to fail gracefully.
@@ -1472,20 +1548,27 @@ async function main() {
 		JSON.stringify(heapDiff.delta || heapDiff.__error));
 	check('server survived a device-less tool call', s.alive());
 
-	// tv_resources: webOS-only, and an ares failure fails the call. PATH is node's own bin dir,
+	// tv_resources: webOS and Tizen, and an ares failure fails the call. PATH is node's own bin dir,
 	// which may or may not hold the ares CLI — both an absent binary and an unknown ares device
 	// have to come back as an error naming the cause.
 	writeCfg({
 		defaultDevice: 'ghost',
 		devices: [
 			{id: 'ghost', platform: 'tizen', name: 'Not plugged in', appId: 'x.y', host: '10.255.255.1'},
-			{id: 'lg', platform: 'webos', name: 'No ares on PATH', appId: 'com.app', device: 'nowhere'}
+			{id: 'lg', platform: 'webos', name: 'No ares on PATH', appId: 'com.app', device: 'nowhere'},
+			{id: 'laptop', platform: 'pc', name: 'Chrome on this laptop', url: 'http://localhost:1337'}
 		]
 	});
 	await sleep(50);
 	const resTizen = await s.call('tv_resources', {action: 'start'});
-	check('tv_resources refuses a non-webOS device and points to the CDP tools',
-		!!resTizen.__error && /webOS-only/.test(resTizen.__error) && /tv_heap/.test(resTizen.__error), resTizen.__error);
+	check('tv_resources on Tizen before tv_launch says to launch, and leaves no monitor behind',
+		!!resTizen.__error && /tv_launch/.test(resTizen.__error), resTizen.__error);
+	const resTizenRead = await s.call('tv_resources', {action: 'read'});
+	check('…so a read after the failed start has nothing to report',
+		!!resTizenRead.__error && /action:"start" first/.test(resTizenRead.__error), resTizenRead.__error);
+	const resPc = await s.call('tv_resources', {action: 'start', device: 'laptop'});
+	check('tv_resources refuses other platforms and points to the CDP tools',
+		!!resPc.__error && /webOS and Tizen only/.test(resPc.__error) && /tv_heap/.test(resPc.__error), resPc.__error);
 	const resNoAres = await s.call('tv_resources', {action: 'start', device: 'lg'});
 	check('tv_resources on an unusable ares setup fails the call with the cause, not the process',
 		!!resNoAres.__error && /ares-device not found|did not start on "lg": .*nowhere/s.test(resNoAres.__error) && s.alive(),
