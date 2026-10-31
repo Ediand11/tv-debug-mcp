@@ -25,15 +25,17 @@ const DEFAULT_CALL_TIMEOUT = 8000;
 /** `TV_DEBUG_TIMING=1`: one stderr line per CDP call with its round-trip time. */
 const TIMING = process.env.TV_DEBUG_TIMING === '1';
 /**
- * WebSocket keepalive: a dead TV is noticed within ~20s instead of on the next 8s timeout.
- * Only on a socket that reaches the inspector directly (sdb / direct port / local Chrome).
- * An endpoint behind a proxy may not survive a ping frame at all: ares-inspect's tunnel drops
- * every message after the first ping — no pong, no close, the session just goes silent for
- * good (webOS 7, verified) — so the adapter that hands out such an endpoint switches the
- * keepalive off (`keepalive: false` on the endpoint).
+ * Keepalive: a dead TV is noticed within ~25s instead of on the next 8s timeout.
+ * It is a CDP call, not a WebSocket ping frame: inspectors do not survive ping frames.
+ * Tizen 5.5 (Chromium 69) closes the socket with 1006 on the first ping, never pongs (verified
+ * 2026-10-22, two parallel sessions); ares-inspect's tunnel (webOS 7) silently drops every message
+ * after it. A CDP call is an ordinary message — every inspector answers it. The webOS adapter
+ * still switches keepalive off (`keepalive: false` on the endpoint): CDP keepalive through
+ * ares-inspect is not verified yet.
  */
 const PING_INTERVAL_MS = 15000;
-const PONG_TIMEOUT_MS = 5000;
+/** Generous: the probe runs on the page's main thread, and a TV app booting holds it for seconds. */
+const PONG_TIMEOUT_MS = 10000;
 /**
  * Ring-buffer eviction runs in batches: an overflowing buffer is cut back to its limit only
  * once it is this far over, so a chatty page pays one splice per batch instead of one per event.
@@ -71,8 +73,8 @@ export function isUnsupportedMethod(err) {
 export class CdpSession {
 	/**
 	 * @param {string} wsUrl
-	 * @param {{keepalive?: boolean}} [opts] keepalive=false: never send WebSocket pings (see
-	 *   PING_INTERVAL_MS — an endpoint behind ares-inspect dies on the first one)
+	 * @param {{keepalive?: boolean}} [opts] keepalive=false: no keepalive probe at all (see
+	 *   PING_INTERVAL_MS)
 	 */
 	constructor(wsUrl, opts = {}) {
 		this._wsUrl = wsUrl;
@@ -141,8 +143,8 @@ export class CdpSession {
 		/** Host clock at connect; console entries carry a timestamp relative to it. */
 		this.startedAt = 0;
 		this._pingTimer = null;
-		this._pongTimer = null;
-		this._pongSeen = false;
+		/** Host time of the last message from the inspector — anything it sends proves it alive. */
+		this._lastMessageAt = 0;
 	}
 
 	/** @return {boolean} */
@@ -196,7 +198,7 @@ export class CdpSession {
 			})
 			.catch(() => {});
 		if (this._keepalive) {
-			this._startKeepalive(ws);
+			this._startKeepalive();
 		}
 		// Last, so a socket that died during setup — including during the probe, whose own
 		// rejection is swallowed above — fails the connect instead of handing back a session
@@ -208,43 +210,30 @@ export class CdpSession {
 	}
 
 	/**
-	 * Protocol-level ping every 15s. A TV that went to sleep or lost Wi-Fi leaves the socket
+	 * Keepalive probe every 15s. A TV that went to sleep or lost Wi-Fi leaves the socket
 	 * half-open: without this the first tool call after the idle burns its full 8s timeout
 	 * before anyone learns the connection is gone.
 	 *
-	 * The pong deadline is only armed once this peer has answered a ping at all — an inspector
-	 * that never pongs (old WebKit builds are not verified either way) must not have a live
-	 * connection cut every 20s over a frame it does not implement.
-	 * @param {WebSocket} ws
+	 * No probe while a call is in flight — that call has its own timeout, and a long one (a heap
+	 * snapshot) keeps the inspector busy, so a probe would only queue behind it and time out.
+	 * No probe either if the inspector has spoken recently: events are proof enough.
 	 */
-	_startKeepalive(ws) {
-		ws.on('pong', () => {
-			this._pongSeen = true;
-			if (this._pongTimer) {
-				clearTimeout(this._pongTimer);
-				this._pongTimer = null;
-			}
-		});
+	_startKeepalive() {
 		this._pingTimer = setInterval(() => {
-			if (!this.isOpen) {
+			if (!this.isOpen || this._pending.size || Date.now() - this._lastMessageAt < PING_INTERVAL_MS) {
 				return;
 			}
-			try {
-				ws.ping();
-			} catch {
-				return;
-			}
-			if (this._pongSeen && !this._pongTimer) {
-				this._pongTimer = setTimeout(() => {
-					this._pongTimer = null;
-					this._disconnect(new Error(`CDP peer stopped answering pings (${PONG_TIMEOUT_MS}ms)`));
-					try {
-						ws.terminate();
-					} catch {
-						// ignore
-					}
-				}, PONG_TIMEOUT_MS);
-			}
+			this.call('Runtime.evaluate', {expression: '1'}, PONG_TIMEOUT_MS).catch((e) => {
+				if (!e.timedOut) {
+					return;
+				}
+				this._disconnect(new Error(`CDP peer stopped answering keepalive (${PONG_TIMEOUT_MS}ms)`));
+				try {
+					this._ws.terminate();
+				} catch {
+					// ignore
+				}
+			});
 		}, PING_INTERVAL_MS);
 		// Never hold the process open for a keepalive.
 		if (this._pingTimer.unref) {
@@ -265,10 +254,6 @@ export class CdpSession {
 			clearInterval(this._pingTimer);
 			this._pingTimer = null;
 		}
-		if (this._pongTimer) {
-			clearTimeout(this._pongTimer);
-			this._pongTimer = null;
-		}
 		for (const {reject, timer} of this._pending.values()) {
 			clearTimeout(timer);
 			reject(err);
@@ -281,6 +266,7 @@ export class CdpSession {
 	}
 
 	_onMessage(raw) {
+		this._lastMessageAt = Date.now();
 		let msg;
 		try {
 			msg = JSON.parse(raw.toString());

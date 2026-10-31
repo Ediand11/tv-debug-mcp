@@ -392,8 +392,8 @@ function heapChecks() {
 
 /**
  * Keepalive gating. A tiny local inspector answers every command, and counts ping frames:
- * a session opened with keepalive:false must never arm the ping timer (an endpoint behind
- * ares-inspect dies on the first ping), the default one must.
+ * a session opened with keepalive:false must never arm the keepalive timer, the default one
+ * must — and no session may ever send a WebSocket ping frame (Tizen 5.5 closes the socket on it).
  */
 async function keepaliveChecks() {
 	console.log('\n--- keepalive: off behind a proxy, on by default ---');
@@ -416,7 +416,14 @@ async function keepaliveChecks() {
 	await on.connect();
 	check('default — the ping timer is armed', on._pingTimer !== null);
 	await new Promise((r) => setTimeout(r, 50));
-	check('no ping frame is sent at connect (they start 15s in)', pings === 0, String(pings));
+	on._lastMessageAt = 0;
+	await new Promise((r) => setTimeout(r, 50));
+	const callsBefore = on.calls;
+	on._pingTimer._onTimeout();
+	await new Promise((r) => setTimeout(r, 50));
+	check('keepalive tick probes with a CDP call, the session stays open',
+		on.calls === callsBefore + 1 && on.isOpen, `calls +${on.calls - callsBefore}`);
+	check('no WebSocket ping frame is ever sent', pings === 0, String(pings));
 	off.close();
 	on.close();
 	await new Promise((r) => wss.close(r));
