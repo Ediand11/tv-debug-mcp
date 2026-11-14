@@ -1562,6 +1562,15 @@ async function main() {
 		JSON.stringify(heapDiff.delta || heapDiff.__error));
 	check('server survived a device-less tool call', s.alive());
 
+	// tv_trace: the analysis half needs no device either, and the actions have to be named.
+	const badTrace = await s.call('tv_trace', {action: 'record'});
+	check('tv_trace rejects an unknown action and names the real ones',
+		!!badTrace.__error && /"start", "stop" or "analyze"/.test(badTrace.__error), badTrace.__error);
+	const traceNoPath = await s.call('tv_trace', {action: 'analyze'});
+	check('tv_trace analyze without a path fails the call',
+		!!traceNoPath.__error && /needs `path`/.test(traceNoPath.__error), traceNoPath.__error);
+	check('server survived a second device-less tool call', s.alive());
+
 	// tv_resources: webOS and Tizen, and an ares failure fails the call. PATH is node's own bin dir,
 	// which may or may not hold the ares CLI — both an absent binary and an unknown ares device
 	// have to come back as an error naming the cause.

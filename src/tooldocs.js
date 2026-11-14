@@ -387,6 +387,47 @@ Answer of stop: \`{ok, path, bytes, durationMs, format, summary: {sampleCount, t
 topFiles, …}, metrics: {windowSec, values: {name: {before, after, diff}}}, warning?}\`.
 ${COMMON}`,
 
+	tv_trace: `# tv_trace
+
+Record a real Chrome trace on the device and read it back — the tool for "the first frame came
+late, and I do not know whether we waited or computed".
+
+* \`start\` — begin recording (\`categories\`, comma-separated CDP categories, default
+  devtools.timeline + the disabled-by-default timeline, user timing, loading, v8.execute;
+  \`bufferMb\`, default 40, ring buffer). Refused while a trace is already running.
+* \`stop\` — end the recording, write \`{traceEvents: […]}\` to \`path\` (or a scratch path; the file
+  opens in Chrome DevTools → Performance → Load) and answer with the path, event count, bytes and
+  recording time. The events never come back in the answer.
+* \`analyze\` — run \`trace-engine-cli\` over a saved file and return its summary. \`command\` is one of
+  overview (default), insights, tasks, profile, find, diff, scheduling, network, interactions,
+  shifts, events, navigations; \`timeRange\` narrows it to a window (\`"3031,3707"\` in ms from trace
+  start, or \`"3s,4.2s"\`); \`format\` is toon (default) or md. Works on a file from any machine, no
+  device needed — this is the step that runs the DevTools trace engine.
+
+The engine matters here. \`Tracing\` is there on PC, webOS 4+ and Tizen 5.5+; on Chrome 38 (webOS 3)
+and the WebKit Tizen 2.4 the domain does not exist and start fails with a message saying so — on
+those TVs \`tv_profile\` is the recording you have.
+
+What the trace cannot do, and why: a TV inspector exposes the page target only, so the trace has no
+browser-process events (\`TracingStartedInBrowser\`), and the DevTools trace engine needs them to
+build a navigation and an insight set. Consequences: \`insights\` answers \`navigationId: null\` with an
+empty \`lcpBreakdown\`, and \`tasks\` returns an empty list — no long-task tree, no LCP breakdown.
+Everything that reads the renderer timeline does work: \`profile\` per window, \`network\` with
+initiators, \`scheduling\`, \`shifts\` with culprit nodes, \`events\`, \`find\`, \`scan\`. For the CWV split
+use a desktop recording (Lighthouse or the DevTools panel), which traces the browser too.
+
+A 10-second recording is ~80 MB of JSON on a modern PC, and the buffer is a ring: overflow drops the
+oldest events. The file is for the disk and for DevTools, never for the answer.
+
+Typical run: \`start\` → \`tv_press\`/\`tv_goto\`/\`tv_sequence\` → \`stop\` → \`analyze\` with
+\`timeRange\` set to the window that matters (\`"load → LCP"\`, a stalled gesture). The CPU profile
+says which function burned time; the trace says what the renderer was waiting for — network,
+layout, paint, timers.
+
+\`analyze\` shells out to \`npx -y trace-engine-cli@latest\`, so the first call needs the npm
+registry; the answer is capped at 8 KB, narrow it with \`timeRange\` or a specific \`command\`.
+${COMMON}`,
+
 	tv_heap: `# tv_heap
 
 Take a heap snapshot on the device and/or compare two of them — the tool for "the heap grew and

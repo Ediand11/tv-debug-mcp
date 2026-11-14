@@ -25,6 +25,7 @@ import {resolve} from 'node:path';
 import {loadConfig, getDevice} from './config.js';
 import {DeviceSession, deviceCapabilities} from './session.js';
 import {diffHeapSummaries} from './heap.js';
+import {analyzeTrace} from './trace.js';
 import {resourcesStart, resourcesRead, resourcesStop, stopAllResourceMonitors} from './resources.js';
 import {knownKeys} from './keymaps.js';
 import {parseSdbDevices} from './adapters/tizen.js';
@@ -215,6 +216,18 @@ const TOOLS = [
 			topN: int(1, 200, 'stop: default 20.'),
 			collectGarbage: bool('GC first.'),
 			pressure: bool()
+		},
+		['action']),
+	tool('tv_trace',
+		'Chrome trace: start, act, stop (writes a .json of {traceEvents}) + trace-engine-cli over the saved file.',
+		{
+			action: en(['start', 'stop', 'analyze'], ''),
+			path: str('stop: output .json; analyze: the file to read.'),
+			categories: str('start: CDP categories, comma-separated.'),
+			bufferMb: int(1, 200, 'start: default 40.'),
+			command: str('analyze: overview|insights|tasks|profile|find|diff|scheduling|network|interactions|shifts|events|navigations.'),
+			timeRange: str('analyze: "3031,3707" (ms from trace start) or "3s,4.2s".'),
+			format: en(['toon', 'md'], 'analyze: default toon.')
 		},
 		['action']),
 	tool('tv_heap',
@@ -523,6 +536,26 @@ async function handleCall(name, args) {
 				return textResult(await s.metricsSnapshot({collectGarbage: args.collectGarbage, pressure: args.pressure}));
 			}
 			return errorResult(`tv_profile needs action "start", "stop" or "metrics", got ${JSON.stringify(args.action)}`);
+		}
+		case 'tv_trace': {
+			if (args.action === 'start') {
+				const s = sessionFor(args.device);
+				return textResult(await s.traceStart({categories: args.categories, bufferMb: args.bufferMb}));
+			}
+			if (args.action === 'stop') {
+				// Path and counts only: a trace is tens of megabytes of low-level events.
+				const s = sessionFor(args.device);
+				return textResult(await s.traceStop({path: args.path}));
+			}
+			if (args.action === 'analyze') {
+				if (!args.path) {
+					return errorResult('tv_trace action:"analyze" needs `path` — the .json written by action:"stop"');
+				}
+				return textResult(await analyzeTrace(args.path, {
+					command: args.command, timeRange: args.timeRange, format: args.format
+				}));
+			}
+			return errorResult(`tv_trace needs action "start", "stop" or "analyze", got ${JSON.stringify(args.action)}`);
 		}
 		case 'tv_heap': {
 			if (args.action === 'snapshot') {

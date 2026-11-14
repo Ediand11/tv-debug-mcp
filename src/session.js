@@ -20,6 +20,7 @@ import {PcAdapter} from './adapters/pc.js';
 import {SyntheticInput} from './input/synthetic.js';
 import {TrustedInput} from './input/trusted.js';
 import {CdpSession, resolvePageWs, sleep, isUnsupportedMethod, MAX_POSTDATA_BYTES} from './cdp.js';
+import {startTrace, stopTrace, isTracingUnsupported} from './trace.js';
 import {resolveKey} from './keymaps.js';
 import {pressJs, videoStateJs, videoSampleStartJs, videoSampleFinishJs, PAGE_SLOT_TTL_MS} from './inject.js';
 import {snapshotJs, focusIsRefBody, snapshotReleaseJs} from './snapshot.js';
@@ -219,6 +220,14 @@ export class DeviceSession {
 		/** Set when a recording died with its connection — kept only to explain the loss. */
 		this._profilingLost = false;
 		/**
+		 * Live Chrome trace recording, if any. Same rule as `_profiling`: the CdpSession is kept,
+		 * because `Tracing` state lives in the renderer we attached to.
+		 * @type {?{startedAt: number, cdp: CdpSession, state: object, unsubscribe: function()}}
+		 */
+		this._tracing = null;
+		/** Set when a trace died with its connection. */
+		this._tracingLost = false;
+		/**
 		 * The CdpSession `Performance.enable` was called on — not a boolean. A reattach gives a
 		 * new inspector session with the domain disabled again, and comparing instances re-enables
 		 * it without any extra bookkeeping.
@@ -401,6 +410,11 @@ export class DeviceSession {
 			if (this._profiling) {
 				this._profiling = null;
 				this._profilingLost = true;
+			}
+			if (this._tracing) {
+				this._tracing.unsubscribe();
+				this._tracing = null;
+				this._tracingLost = true;
 			}
 			this._metricsEnabledFor = null;
 		}
@@ -1253,6 +1267,91 @@ export class DeviceSession {
 			metrics,
 			...(warnings.length ? {warning: warnings.join('; ')} : {})
 		};
+	}
+
+	/**
+	 * Start a Chrome trace (tv_trace action:start).
+	 *
+	 * A trace is what a CPU profile is not: it carries the timeline — paint and layout, long tasks
+	 * with their call trees, request timing, layout shifts — so "the first frame came late" can be
+	 * split into "waited for the network" and "computed". `Tracing` is there on PC, webOS 4+ and
+	 * Tizen 5.5+; on Chrome 38 and the WebKit Tizen it does not exist, and the error says to use
+	 * tv_profile there instead.
+	 * @param {{categories?: string, bufferMb?: number}} [opts]
+	 */
+	async traceStart(opts = {}) {
+		if (this._tracing) {
+			const heldMs = Date.now() - this._tracing.startedAt;
+			throw new Error(`a trace is already recording (started ${heldMs}ms ago) — call tv_trace action:stop first`);
+		}
+		const cdp = await this._cdp();
+		this._tracingLost = false;
+
+		let state;
+		try {
+			state = await startTrace(cdp, opts);
+		} catch (e) {
+			if (isTracingUnsupported(e)) {
+				throw new Error(`tracing not supported on this engine (${this.cfg.engine || this.cfg.platform}): Tracing.start — ${e.message}. Use tv_profile there: it works down to Chrome 38`);
+			}
+			throw e;
+		}
+
+		// Registered before the recording fills, and kept per connection: chunks arrive while the
+		// app runs, and a handler installed at stop time would miss every one of them.
+		const unsubscribe = cdp.onEvent('Tracing.dataCollected', ({value}) => {
+			if (Array.isArray(value)) {
+				state.events.push(...value);
+			}
+		});
+		this._tracing = {startedAt: state.startedAt, cdp, state, unsubscribe};
+
+		return {
+			ok: true,
+			startedAt: state.startedAt,
+			categories: state.categories,
+			bufferMb: state.bufferMb,
+			hint: 'act now (tv_press / tv_goto / tv_sequence), then tv_trace action:stop'
+		};
+	}
+
+	/**
+	 * Stop the trace and write it as `{traceEvents: […]}` — the file the Performance panel and
+	 * trace-engine-cli read. The events never come back in the answer: tens of megabytes of
+	 * low-level records are for the disk, not for a context window.
+	 * @param {{path?: string}} [opts]
+	 */
+	async traceStop(opts = {}) {
+		if (!this._tracing) {
+			if (this._tracingLost) {
+				this._tracingLost = false;
+				throw new Error('the app was relaunched or the connection dropped during the trace, it was discarded — start again');
+			}
+			throw new Error('no trace in progress — call tv_trace action:start first');
+		}
+		const started = this._tracing;
+		const cdp = await this._cdp().catch((e) => {
+			started.unsubscribe();
+			this._tracing = null;
+			throw new Error(`connection lost during the trace, it was discarded — start again (${e.message})`);
+		});
+		if (cdp !== started.cdp) {
+			started.unsubscribe();
+			this._tracing = null;
+			throw new Error('connection lost during the trace, it was discarded — start again');
+		}
+
+		try {
+			return await stopTrace(cdp, started.state, {
+				path: opts.path,
+				deviceId: this.cfg.id,
+				now: Date.now(),
+				onCollect: (handler) => cdp.onEvent('Tracing.tracingComplete', handler)
+			});
+		} finally {
+			started.unsubscribe();
+			this._tracing = null;
+		}
 	}
 
 	/**
