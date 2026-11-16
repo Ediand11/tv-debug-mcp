@@ -140,7 +140,7 @@ npm link                       # из корня репозитория
 | `tv_network` | Полный лог запросов с момента launch: url, метод, статус, тело POST. Чтение тела ответа по `requestId`, экспорт в `curl` и HAR 1.2, ассерт `expectRequest` шагом кейса |
 | `tv_video_state` | Программный снимок `<video>`: тикает ли `currentTime` (два замера), readyState, размеры, MediaError. Если `<video>` на странице нет вообще — читает объектный плеер Tizen (`webapis.avplay`) теми же полями плюс `source: "avplay"`, кодек, битрейт и лестницу ABR |
 | `tv_evaluate` | Произвольный JS в странице (escape hatch). На старых ТВ — только ES5. Ответ режется на 16 КБ (`truncated`, `bytes`, подсказка сузить выражение) |
-| `tv_profile` | Запись JS CPU-профиля (`start` → действия → `stop`): файл `.cpuprofile` для DevTools + топ функций и файлов по self time. `sourceMap` деминифицирует топ на прод-сборке. Плюс метрики `Performance.getMetrics` (heap, DOM-узлы, слушатели, layout) — снимок на `start` и на `stop`, в ответе diff; `action:"metrics"` снимает их отдельно, без записи профиля |
+| `tv_profile` | Запись JS CPU-профиля (`start` → действия → `stop`): файл `.cpuprofile` для DevTools + топ функций и файлов по self time. `sourceMap` деминифицирует топ на прод-сборке. Плюс метрики `Performance.getMetrics` (heap, DOM-узлы, слушатели, layout) — снимок на `start` и на `stop`, в ответе diff; `action:"metrics"` снимает их отдельно, без записи профиля. `trace` / `traceStart` / `traceStop` — Chrome-трейс (таймлайн рендерера) в файл + сводка главного потока, long tasks, потоков растра/GPU и кадров |
 | `tv_heap` | Снапшот кучи на устройстве (`.heapsnapshot` для DevTools → Memory → Load) + сводка по конструкторам и счётчик detached-нод; `action:"diff"` сравнивает два файла, как Comparison view |
 | `tv_resources` | webOS и Tizen. CPU % и память **всего ТВ и процесса приложения (RSS)**, снятые на самом ТВ: на webOS через `ares-device --resource-monitor` (те же данные, что у LG Resource Monitor, CDP не нужен), на Tizen из `/proc` и Mali через страницу приложения (плюс PSS и GPU, нужен `tv_launch`). `start` → действия → `read`/`stop`, в ответе min/max/avg/delta по каждой серии |
 
@@ -395,6 +395,20 @@ tv_resources {"action": "stop"}                       # смотреть last у
 **Платформы**: tizen55 (Chromium 69) ✓ и pc ✓ — полный набор из `Performance.getMetrics`. Движок без этого домена (Chromium ≤ 53: webos4, tizen3, webos3) не падает, а переключается на `Memory.getDOMCounters`: `Nodes`, `Documents`, `JSEventListeners` и `Timestamp` из `performance.now()` — именно те счётчики, на которых держится охота за утечкой DOM. В ответе — `warning` о том, что это фолбэк. Чего в нём нет намеренно: `JSHeapUsedSize` (единственный источник — квантованный по 100 КБ `performance.memory`, то есть стабильная ложь вместо честного отсутствия) и layout/style-счётчики (их пришлось бы выводить из счёта событий `Tracing` — другое измерение под тем же именем). Если и `getDOMCounters` нет, `action:"metrics"` честно падает с сообщением, а `start`/`stop` возвращают `metrics: null` плюс `warning` — потерять CPU-профиль из-за отсутствующих метрик нельзя.
 
 В `tv_sequence` — шаг `{"metrics": true}`: им можно обрамить любой кусок сценария, не только тот, что покрыт записью профиля. Diff между двумя такими шагами считает вызывающий.
+
+### tv_profile trace — Chrome-трейс вокруг нажатия
+
+CPU-профиль отвечает, какая JS-функция сожгла время. Трейс отвечает, что делал рендерер между клавишей и кадром: style recalc, layout, layer tree, paint, composite, потоки растра и GPU.
+
+```
+tv_profile {"action": "trace", "key": "DOWN"}                    # старт → нажатие → 700 мс → стоп, одним вызовом
+tv_profile {"action": "traceStart"}                              # любое окно: запуск, сценарий
+tv_sequence {"steps": [{"traceStart": true}, {"press": "DOWN"}, {"traceStop": {"path": "/tmp/grid.json"}}]}
+```
+
+`windowMs` (по умолчанию 700) и `bufferMb` (по умолчанию 40, кольцевой буфер) принимаются, но в схеме тула их нет — лимит 10 КБ. Файл `{traceEvents: […]}` открывается в DevTools → Performance → Load и в ui.perfetto.dev. Сами события в ответ не попадают, только сводка: self time главного потока по корзинам (`script`, `style`, `layout`, `layerTree`, `paint`, `composite`, `gc`, `parse`, `other`), long tasks ≥ 50 мс с доминирующей корзиной, остальные потоки по занятости (пулы воркеров склеены), число кадров и худший промежуток между ними, `keydownAtMs`. Переполнение буфера и не пришедший `tracingComplete` уходят в `warning`.
+
+**Платформы**: два диалекта протокола. Свежий Chromium получает `traceConfig` (`dialect: "traceConfig"`). Протокол до M54 (Chrome 38/47/53: webos3, tizen3, webos4) про `traceConfig` не знает и молча берёт свои дефолтные категории, поэтому ему уходят старые `categories` + `options: "record-continuously"` (`dialect: "legacy"`, размер буфера не задаётся). Проверено на устройствах: webOS 3 / Chrome 38 (legacy, 36.7k событий за окно 1.5 с) и webOS 7 (traceConfig). Tizen 3 и Tizen 5.5 трейсили руками раньше, через тул не прогонялись. Инспектор ТВ трейсит только страницу, без браузерного процесса, поэтому навигацию и разбивку LCP снимайте на десктопе.
 
 ### tv_heap — снапшоты кучи и diff
 

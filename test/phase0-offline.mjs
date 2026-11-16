@@ -35,6 +35,7 @@ import {SourceMapGenerator} from 'source-map-js';
 
 import {summarizeProfile, applySourceMap} from '../src/profile.js';
 import {summarizeHeapSnapshot, diffHeapSummaries} from '../src/heap.js';
+import {startTrace, endTrace, saveTrace, summarizeTrace} from '../src/trace.js';
 import {metricsToMap, metricsDiff, windowSecondsOf, dropSessionCounters} from '../src/metrics.js';
 import {CdpSession} from '../src/cdp.js';
 import {WebSocketServer} from 'ws';
@@ -1536,7 +1537,81 @@ async function main() {
 
 	const badAction = await s.call('tv_profile', {action: 'heap'});
 	check('tv_profile rejects an unknown action and names the real ones',
-		!!badAction.__error && /"start", "stop" or "metrics"/.test(badAction.__error), badAction.__error);
+		!!badAction.__error && /"start", "stop", "metrics", "trace", "traceStart" or "traceStop"/.test(badAction.__error), badAction.__error);
+	const traceNoKey = await s.call('tv_profile', {action: 'trace'});
+	check('tv_profile trace without a key fails the call before touching a device',
+		!!traceNoKey.__error && /needs `key`/.test(traceNoKey.__error), traceNoKey.__error);
+
+	const ms = (v) => v * 1000;
+	const traceEvents = [
+		{ph: 'M', name: 'thread_name', pid: 1, tid: 10, args: {name: 'CrRendererMain'}},
+		{ph: 'M', name: 'thread_name', pid: 1, tid: 20, args: {name: 'Compositor'}},
+		{ph: 'M', name: 'thread_name', pid: 1, tid: 31, args: {name: 'CompositorTileWorker1'}},
+		{ph: 'M', name: 'thread_name', pid: 1, tid: 32, args: {name: 'CompositorTileWorker2/'}},
+		{ph: 'X', name: 'ThreadControllerImpl::RunTask', pid: 1, tid: 10, ts: ms(1000), dur: ms(80)},
+		{ph: 'X', name: 'EventDispatch', pid: 1, tid: 10, ts: ms(1000), dur: ms(30), args: {data: {type: 'keydown'}}},
+		{ph: 'X', name: 'Layout', pid: 1, tid: 10, ts: ms(1010), dur: ms(10)},
+		{ph: 'X', name: 'RecalculateStyles', pid: 1, tid: 10, ts: ms(1040), dur: ms(15)},
+		{ph: 'B', name: 'Paint', pid: 1, tid: 10, ts: ms(1060)},
+		{ph: 'E', name: 'Paint', pid: 1, tid: 10, ts: ms(1070)},
+		{ph: 'X', name: 'ThreadControllerImpl::RunTask', pid: 1, tid: 10, ts: ms(1100), dur: ms(5)},
+		{ph: 'X', name: 'MinorGC', pid: 1, tid: 10, ts: ms(1101), dur: ms(2)},
+		{ph: 'X', name: 'RasterTask', pid: 1, tid: 31, ts: ms(1070), dur: ms(40)},
+		{ph: 'X', name: 'RasterTask', pid: 1, tid: 32, ts: ms(1075), dur: ms(30)},
+		{ph: 'I', name: 'DrawFrame', pid: 1, tid: 20, ts: ms(1016)},
+		{ph: 'I', name: 'DrawFrame', pid: 1, tid: 20, ts: ms(1116)},
+		{ph: 'I', name: 'DrawFrame', pid: 1, tid: 20, ts: ms(1132)}
+	];
+	const ts = summarizeTrace(traceEvents);
+	check('trace summary: main-thread self time per bucket, nested spans not double-counted',
+		ts.main?.thread === 'CrRendererMain' && ts.main.busyMs === 85 && ts.main.ms.script === 20 && ts.main.ms.layout === 10 &&
+		ts.main.ms.style === 15 && ts.main.ms.paint === 10 && ts.main.ms.gc === 2 && ts.main.ms.other === 28,
+		JSON.stringify(ts.main));
+	check('trace summary: long tasks ≥ 50 ms with the bucket that dominated them',
+		ts.main?.longTasks.count === 1 && ts.main.longTasks.top[0].ms === 80 && ts.main.longTasks.top[0].atMs === 0 &&
+		ts.main.longTasks.top[0].mostly === 'script', JSON.stringify(ts.main?.longTasks));
+	check('trace summary: raster worker pool merged, frames and worst gap, keydown anchor',
+		ts.threads[0]?.name === 'CompositorTileWorker' && ts.threads[0].busyMs === 70 &&
+		ts.frames.drawn === 3 && ts.frames.worstGapMs === 100 && ts.keydownAtMs === 0 && ts.windowMs === 132,
+		JSON.stringify({threads: ts.threads, frames: ts.frames, k: ts.keydownAtMs, w: ts.windowMs}));
+	check('trace summary of an empty recording does not throw', summarizeTrace([]).main === null);
+
+	const traceCalls = [];
+	const traceHandlers = new Map();
+	const fakeTraceCdp = {
+		call: async (method, params) => {
+			traceCalls.push({method, params});
+			if (method === 'Tracing.end') {
+				setTimeout(() => (traceHandlers.get('Tracing.tracingComplete') || []).forEach((h) => h({dataLossOccurred: true})), 5);
+			}
+			return {};
+		},
+		onEvent: (method, h) => {
+			traceHandlers.set(method, [...(traceHandlers.get(method) || []), h]);
+			return () => traceHandlers.set(method, (traceHandlers.get(method) || []).filter((x) => x !== h));
+		}
+	};
+	await startTrace(fakeTraceCdp, {bufferMb: 500});
+	const modernStart = traceCalls[0].params;
+	check('Tracing.start on a modern engine: camelCase traceConfig, recordContinuously, buffer capped, no categories',
+		modernStart.traceConfig?.recordMode === 'recordContinuously' && Array.isArray(modernStart.traceConfig.includedCategories) &&
+		modernStart.traceConfig.traceBufferSizeInKb === 200 * 1024 && modernStart.categories === undefined &&
+		modernStart.transferMode === 'ReportEvents', JSON.stringify(modernStart));
+	await startTrace(fakeTraceCdp, {legacy: true});
+	const legacyStart = traceCalls[1].params;
+	check('Tracing.start on the pre-M54 protocol: categories + options strings, no traceConfig',
+		typeof legacyStart.categories === 'string' && /disabled-by-default-devtools\.timeline/.test(legacyStart.categories) &&
+		legacyStart.options === 'record-continuously' && legacyStart.traceConfig === undefined, JSON.stringify(legacyStart));
+	const ended = await endTrace(fakeTraceCdp, {events: []}, {timeoutMs: 2000});
+	check('Tracing.end waits for tracingComplete, reports data loss and drops its subscription',
+		ended.complete && ended.dataLoss && (traceHandlers.get('Tracing.tracingComplete') || []).length === 0, JSON.stringify(ended));
+	const traceDir = mkdtempSync(join(tmpdir(), 'tv-trace-'));
+	const manyEvents = Array.from({length: 4501}, (_, i) => ({ph: 'X', name: 'Layout', pid: 1, tid: 1, ts: i, dur: 1}));
+	const savedTrace = saveTrace(manyEvents, {path: join(traceDir, 't.json'), deviceId: 'x', now: 0});
+	const reread = JSON.parse(readFileSync(savedTrace.path, 'utf8'));
+	check('trace file written in batches is valid {traceEvents} JSON with every event and the byte count',
+		reread.traceEvents.length === 4501 && reread.traceEvents[4500].ts === 4500 &&
+		savedTrace.bytes === Buffer.byteLength(readFileSync(savedTrace.path)), `${reread.traceEvents?.length} events`);
 
 	const badNetwork = await s.call('tv_network', {action: 'dump'});
 	check('tv_network rejects an unknown action and names the real ones',

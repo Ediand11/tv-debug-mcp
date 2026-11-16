@@ -655,6 +655,32 @@ async function main() {
 		profSeq.steps?.[2]?.result?.path === seqProfPath && !!profSeq.steps?.[2]?.result?.summary,
 		JSON.stringify(profSeq.steps?.[2]?.result?.summary?.totalMs));
 
+	console.log('\n--- tv_profile trace: Chrome timeline around a key ---');
+	const tracePath = join(dir, 'press.trace.json');
+	const traced = await s.call('tv_profile', {device: 'pc-fixture', action: 'trace', key: 'RIGHT', path: tracePath, windowMs: 500});
+	const traceFile = existsSync(tracePath) ? JSON.parse(readFileSync(tracePath, 'utf8')) : null;
+	check('trace writes a {traceEvents} file DevTools can load', traced.ok === true && traced.dialect === 'traceConfig' &&
+		Array.isArray(traceFile?.traceEvents) && traceFile.traceEvents.length === traced.summary?.events && traced.bytes === statSync(tracePath).size,
+		traced.__error || `${traced.summary?.events} events, ${traced.bytes} bytes`);
+	check('the trace summary finds the renderer main thread and the key', traced.summary?.main?.thread === 'CrRendererMain' &&
+		traced.summary.main.busyMs > 0 && typeof traced.summary.keydownAtMs === 'number' && traced.key === 'RIGHT',
+		JSON.stringify({main: traced.summary?.main?.ms, k: traced.summary?.keydownAtMs}));
+	check('the trace answer carries no raw events', JSON.stringify(traced).length < 4000, `${JSON.stringify(traced).length} chars`);
+	const orphanTrace = await s.call('tv_profile', {device: 'pc-fixture', action: 'traceStop'});
+	check('a traceStop without a trace is refused', !!orphanTrace.__error && /no trace in progress/.test(orphanTrace.__error), orphanTrace.__error);
+	const seqTracePath = join(dir, 'seq.trace.json');
+	const traceSeq = await s.call('tv_sequence', {
+		device: 'pc-fixture',
+		steps: [
+			{traceStart: true},
+			{press: 'LEFT', repeat: 2, intervalMs: 100},
+			{traceStop: {path: seqTracePath}}
+		]
+	});
+	check('a sequence can trace the scenario it runs', traceSeq.ok && existsSync(seqTracePath) &&
+		traceSeq.steps?.[2]?.result?.summary?.frames?.drawn >= 0,
+		JSON.stringify((traceSeq.steps || []).map((x) => `${x.step}=${x.ok}`)));
+
 	console.log('\n--- tv_record: record with keys, compile, replay ---');
 	// Run on the PARITY device (inputMode: synthetic) on purpose: those presses are dispatched
 	// into `document`, exactly like a TV's, so a capture listener on `window` seeing them is

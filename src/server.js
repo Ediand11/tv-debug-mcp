@@ -194,7 +194,7 @@ const TOOLS = [
 			maxOpenPresses: int(1, 50, 'Default 20.')
 		}),
 	tool('tv_sequence',
-		'Run a whole case in one call under the device lock. Steps (one key each): launch, press, longpress, goto, menu, wait, expect, expectRequest, networkMark, eval, sleep, videoState, state, snapshot, profileStart, profileStop, metrics — see tv-debug://docs/tv_sequence.',
+		'Run a whole case in one call under the device lock. One key per step: launch, press, goto, menu, wait, expect, eval, sleep, profileStart, traceStart… — tv-debug://docs/tv_sequence.',
 		{
 			steps: {type: 'array', items: {type: 'object'}},
 			stopOnFail: bool('Default true.'),
@@ -206,11 +206,12 @@ const TOOLS = [
 		{expression: str(''), awaitPromise: bool('Default true.')},
 		['expression']),
 	tool('tv_profile',
-		'CPU profile: start, act, stop (.cpuprofile, top functions, metrics diff); metrics = one reading.',
+		'CPU profile (start/stop), metrics, Chrome trace (trace: around a key; traceStart/traceStop).',
 		{
-			action: en(['start', 'stop', 'metrics'], ''),
+			action: en(['start', 'stop', 'metrics', 'trace', 'traceStart', 'traceStop'], ''),
 			samplingIntervalUs: int(50, 1000000, 'start: default 1000.'),
-			path: str('stop: .cpuprofile path.'),
+			path: str('Output file.'),
+			key: str('trace: key.'),
 			sourceMap: str('stop: .map of the build.'),
 			topN: int(1, 200, 'stop: default 20.'),
 			collectGarbage: bool('GC first.'),
@@ -522,7 +523,20 @@ async function handleCall(name, args) {
 			if (args.action === 'metrics') {
 				return textResult(await s.metricsSnapshot({collectGarbage: args.collectGarbage, pressure: args.pressure}));
 			}
-			return errorResult(`tv_profile needs action "start", "stop" or "metrics", got ${JSON.stringify(args.action)}`);
+			const traceOpts = {path: args.path, topN: args.topN, bufferMb: args.bufferMb};
+			if (args.action === 'traceStart') {
+				return textResult(await s.traceStart(traceOpts));
+			}
+			if (args.action === 'traceStop') {
+				return textResult(await s.traceStop(traceOpts));
+			}
+			if (args.action === 'trace') {
+				if (args.key == null || args.key === '') {
+					return errorResult('tv_profile action:"trace" needs `key` — the remote key to record around; for any other window use traceStart / traceStop');
+				}
+				return textResult(await s.withOperationLock(() => s.traceAround(args.key, {...traceOpts, windowMs: args.windowMs})));
+			}
+			return errorResult(`tv_profile needs action "start", "stop", "metrics", "trace", "traceStart" or "traceStop", got ${JSON.stringify(args.action)}`);
 		}
 		case 'tv_heap': {
 			if (args.action === 'snapshot') {

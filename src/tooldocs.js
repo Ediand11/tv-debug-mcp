@@ -329,6 +329,8 @@ Steps are objects, one key each:
     {"snapshot": {"detail": "focus"}}
     {"profileStart": {"samplingIntervalUs": 1000}}
     {"profileStop": {"path": "…", "sourceMap": "…", "topN": 20}}
+    {"traceStart": {"bufferMb": 40}}               Chrome trace, see tv_profile
+    {"traceStop": {"path": "…", "topN": 5}}
     {"metrics": true}                              or {"collectGarbage": true} / {"pressure": true}
 
 \`wait\` / \`expect\` also take \`{"element": …}\` / \`{"elementGone": …}\` / \`{"sceneName": …}\` — names
@@ -385,6 +387,39 @@ missing, \`metrics\` fails with a clear message while start/stop still return th
 
 Answer of stop: \`{ok, path, bytes, durationMs, format, summary: {sampleCount, totalMs, topFunctions,
 topFiles, …}, metrics: {windowSec, values: {name: {before, after, diff}}}, warning?}\`.
+
+## Chrome trace — where the frame went, not which function
+
+The CPU profile says which JS burned time. A trace says what the renderer did between a key and
+the frame: style recalc, layout, layer tree, paint, composite, raster and GPU threads.
+
+* \`trace\` — one call: start tracing, press \`key\`, wait \`windowMs\` (default 700, max 60000),
+  stop. The grid-step question in one shot: \`{"action": "trace", "key": "DOWN"}\`. Runs under the
+  sequence lock, so nothing interleaves.
+* \`traceStart\` / \`traceStop\` — any window (a launch, a scenario in tv_sequence with the
+  \`traceStart\` / \`traceStop\` steps). \`bufferMb\` (start, default 40, max 200) sizes the ring
+  buffer; overflow drops the oldest events and stop says so in \`warning\`.
+
+stop writes \`{traceEvents: […]}\` to \`path\` (or a scratch path) — DevTools → Performance → Load,
+or ui.perfetto.dev. The events never come back in the answer, only the summary:
+
+\`{ok, path, bytes, durationMs, dialect, summary: {windowMs, events, keydownAtMs?, main: {thread,
+busyMs, ms: {script, style, layout, layerTree, paint, composite, gc, parse, other}, longTasks:
+{count, totalMs, top: [{atMs, ms, mostly}]}}, threads: [{name, busyMs}], frames: {drawn,
+worstGapMs}}, key?, windowMs?, warning?}\`
+
+\`ms\` is main-thread self time per bucket, \`other\` = busy time no bucket claims (task
+scheduling, unlisted events). Long tasks are top-level main-thread tasks ≥ 50 ms, \`mostly\` = the
+bucket that took most of each. \`threads\` are the other threads by busy time, numbered pools
+merged (\`CompositorTileWorker\` / \`CompositorRasterWorker\` = raster). \`atMs\` / \`keydownAtMs\` are from the first event.
+
+Engines: modern Chromium gets \`traceConfig\` (\`dialect: "traceConfig"\`); the pre-M54 protocol
+(Chrome 38/47/53 — webos3, tizen3, webos4) predates it and gets the old \`categories\` +
+\`record-continuously\` (\`dialect: "legacy"\`, no \`bufferMb\`). Checked on device: webOS 3
+(Chrome 38, legacy), webOS 7 (traceConfig); Tizen 3 (Chromium 47) and Tizen 5.5 traced by hand
+before. An engine without the domain (WebKit webOS 2) fails start with a message saying so —
+\`start\` (CPU) still works there. A TV inspector traces the page only: no browser process, so no
+navigation / LCP breakdown — take those on desktop.
 ${COMMON}`,
 
 	tv_heap: `# tv_heap

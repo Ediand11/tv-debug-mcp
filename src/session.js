@@ -31,6 +31,7 @@ import {stateJs, focusSignatureJs, focusMatchesBody, focusInMenuBody, sigAndMatc
 import {pollUntil, pollRequests, describeCondition} from './wait.js';
 import {selectRequests, toListEntry, buildCurl, buildHar, capBody, HAR_BODY_TOTAL_LIMIT} from './network.js';
 import {summarizeProfile, applySourceMap, saveProfile} from './profile.js';
+import {startTrace, endTrace, saveTrace, summarizeTrace} from './trace.js';
 import {summarizeHeapSnapshot} from './heap.js';
 import {metricsToMap, metricsDiff, windowSecondsOf, dropSessionCounters} from './metrics.js';
 import {capEvalValue} from './render.js';
@@ -38,6 +39,8 @@ import {PKG_VERSION} from './version.js';
 
 /** A big profile off a slow TV takes far longer to serialise than a normal CDP round-trip. */
 const PROFILE_STOP_TIMEOUT_MS = 60000;
+const TRACE_COMPLETE_TIMEOUT_MS = 60000;
+const TRACE_WINDOW_MS = 700;
 /** How often the host empties the page-side recorder buffer. */
 const RECORD_DRAIN_MS = 300;
 /** Page-side ring buffer size. Overflow is counted and reported, never hidden. */
@@ -75,7 +78,7 @@ const SETTLE_DEFAULTS = {
  * Sequence steps whose RESULT is the point (a reading, a file, a measured request): they keep
  * it in the compact report. Everything else is navigation and is reported as one line.
  */
-const READ_STEPS = ['eval', 'videoState', 'state', 'snapshot', 'profileStart', 'profileStop', 'metrics', 'expectRequest'];
+const READ_STEPS = ['eval', 'videoState', 'state', 'snapshot', 'profileStart', 'profileStop', 'traceStart', 'traceStop', 'metrics', 'expectRequest'];
 
 /**
  * Flush and close a write stream, waiting for the OS to really have the bytes — the summary
@@ -218,6 +221,8 @@ export class DeviceSession {
 		this._profiling = null;
 		/** Set when a recording died with its connection — kept only to explain the loss. */
 		this._profilingLost = false;
+		this._tracing = null;
+		this._tracingLost = false;
 		/**
 		 * The CdpSession `Performance.enable` was called on — not a boolean. A reattach gives a
 		 * new inspector session with the domain disabled again, and comparing instances re-enables
@@ -401,6 +406,11 @@ export class DeviceSession {
 			if (this._profiling) {
 				this._profiling = null;
 				this._profilingLost = true;
+			}
+			if (this._tracing) {
+				this._tracing.unsubscribe();
+				this._tracing = null;
+				this._tracingLost = true;
 			}
 			this._metricsEnabledFor = null;
 		}
@@ -1253,6 +1263,108 @@ export class DeviceSession {
 			metrics,
 			...(warnings.length ? {warning: warnings.join('; ')} : {})
 		};
+	}
+
+	async traceStart(opts = {}) {
+		if (this._tracing) {
+			throw new Error(`a trace is already recording (started ${Date.now() - this._tracing.state.startedAt}ms ago) — call tv_profile action:traceStop first`);
+		}
+		const cdp = await this._cdp();
+		this._tracingLost = false;
+		const events = [];
+		const unsubscribe = cdp.onEvent('Tracing.dataCollected', ({value}) => {
+			if (Array.isArray(value)) {
+				for (const e of value) {
+					events.push(e);
+				}
+			}
+		});
+		let state;
+		try {
+			state = await startTrace(cdp, {bufferMb: opts.bufferMb, legacy: cdp.legacyEvalDialect});
+		} catch (e) {
+			unsubscribe();
+			if (isUnsupportedMethod(e)) {
+				throw new Error(`tracing not supported on this engine (${this.cfg.engine || this.cfg.platform}): Tracing.start — ${e.message}. tv_profile action:start still works here`);
+			}
+			throw e;
+		}
+		state.events = events;
+		this._tracing = {cdp, state, unsubscribe};
+		return {
+			ok: true,
+			startedAt: state.startedAt,
+			dialect: state.legacy ? 'legacy' : 'traceConfig',
+			bufferMb: state.bufferMb
+		};
+	}
+
+	async traceStop(opts = {}) {
+		if (!this._tracing) {
+			if (this._tracingLost) {
+				this._tracingLost = false;
+				throw new Error('the app was relaunched or the connection dropped during the trace, it was discarded — start again');
+			}
+			throw new Error('no trace in progress — call tv_profile action:traceStart first');
+		}
+		const started = this._tracing;
+		const cdp = await this._cdp().catch((e) => {
+			started.unsubscribe();
+			this._tracing = null;
+			throw new Error(`connection lost during the trace, it was discarded — start again (${e.message})`);
+		});
+		if (cdp !== started.cdp) {
+			started.unsubscribe();
+			this._tracing = null;
+			throw new Error('connection lost during the trace, it was discarded — start again');
+		}
+		let end;
+		try {
+			end = await endTrace(cdp, started.state, {timeoutMs: TRACE_COMPLETE_TIMEOUT_MS});
+		} finally {
+			started.unsubscribe();
+			this._tracing = null;
+		}
+		const {events} = started.state;
+		const warnings = [];
+		if (!end.complete) {
+			warnings.push(`Tracing.tracingComplete did not arrive in ${TRACE_COMPLETE_TIMEOUT_MS}ms — the trace may be cut short`);
+		}
+		if (end.dataLoss) {
+			warnings.push('the trace buffer overflowed and the oldest events were dropped — record a shorter window or raise bufferMb');
+		}
+		if (!events.length) {
+			warnings.push('the recording contains no events');
+		}
+		const saved = saveTrace(events, {path: opts.path, deviceId: this.cfg.id, now: Date.now()});
+		const summary = summarizeTrace(events, {topN: opts.topN});
+		if (events.length && !summary.main) {
+			warnings.push('no renderer main thread found in the trace');
+		}
+		return {
+			ok: true,
+			path: saved.path,
+			bytes: saved.bytes,
+			durationMs: Date.now() - started.state.startedAt,
+			dialect: started.state.legacy ? 'legacy' : 'traceConfig',
+			summary,
+			...(warnings.length ? {warning: warnings.join('; ')} : {})
+		};
+	}
+
+	async traceAround(key, opts = {}) {
+		const windowMs = Math.min(60000, Math.max(100, Math.floor(opts.windowMs || TRACE_WINDOW_MS)));
+		await this.traceStart(opts);
+		let pressed;
+		try {
+			pressed = await this.press(key, {settle: false});
+			await sleep(windowMs);
+		} catch (e) {
+			await this.traceStop(opts).catch(() => {});
+			throw e;
+		}
+		const out = await this.traceStop(opts);
+		return {...out, key: pressed.key, windowMs};
 	}
 
 	/**
@@ -2234,6 +2346,12 @@ export class DeviceSession {
 		if (step.profileStop !== undefined) {
 			return this.profileStopAndSave(step.profileStop === true ? {} : step.profileStop);
 		}
+		if (step.traceStart !== undefined) {
+			return this.traceStart(step.traceStart === true ? {} : step.traceStart);
+		}
+		if (step.traceStop !== undefined) {
+			return this.traceStop(step.traceStop === true ? {} : step.traceStop);
+		}
 		if (step.metrics !== undefined) {
 			// A bare snapshot step, so a scenario can bracket ANY part of itself — not just the
 			// part a CPU recording covers. Diffing two of them is the caller's job.
@@ -2243,7 +2361,7 @@ export class DeviceSession {
 		throw new Error(
 			`unknown step ${JSON.stringify(step).slice(0, 120)} — expected one of: ` +
 			'launch, press, longpress, goto, menu, wait, expect, expectRequest, networkMark, eval, ' +
-			'sleep, videoState, state, snapshot, profileStart, profileStop, metrics'
+			'sleep, videoState, state, snapshot, profileStart, profileStop, traceStart, traceStop, metrics'
 		);
 	}
 
